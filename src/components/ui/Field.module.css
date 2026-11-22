@@ -1,0 +1,100 @@
+.wrapper {
+  display: flex;
+  flex-direction: column;
+  gap: 0.45rem;
+}
+
+.label {
+  font-family: var(--font-mono);
+  font-size: var(--fs-micro);
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+  color: var(--text-tertiary);
+  font-weight: 500;
+}
+
+.control {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: 0.55rem;
+  padding: 0 0.85rem;
+  border-radius: var(--r-md);
+  border: 1px solid var(--line-2);
+  background: rgba(9, 10, 20, 0.72);
+  transition:
+    border-color var(--dur-base) var(--ease-out),
+    box-shadow var(--dur-base) var(--ease-out),
+    background-color var(--dur-base) var(--ease-out);
+}
+
+.control:focus-within {
+  border-color: rgba(148, 139, 255, 0.62);
+  box-shadow: 0 0 0 3px rgba(120, 107, 255, 0.16);
+  background: rgba(13, 14, 28, 0.9);
+}
+
+.searchIcon {
+  flex: none;
+  color: var(--text-quaternary);
+  transition: color var(--dur-base) var(--ease-out);
+}
+
+.control:focus-within .searchIcon {
+  color: var(--violet-bright);
+}
+
+.input {
+  flex: 1;
+  min-width: 0;
+  padding: 0.62rem 0;
+  background: transparent;
+  border: none;
+  color: var(--text-primary);
+  font-size: var(--fs-sm);
+  outline: none;
+}
+
+.input::placeholder {
+  color: var(--text-quaternary);
+}
+
+/* Remove the native search cancel affordance; we render our own. */
+.input::-webkit-search-cancel-button,
+.input::-webkit-search-decoration {
+  -webkit-appearance: none;
+  appearance: none;
+}
+
+.clear {
+  flex: none;
+  display: grid;
+  place-items: center;
+  width: 22px;
+  height: 22px;
+  border-radius: 50%;
+  color: var(--text-tertiary);
+  background: rgba(255, 255, 255, 0.06);
+  transition: background-color var(--dur-fast) var(--ease-out), color var(--dur-fast) var(--ease-out);
+}
+
+.clear:hover {
+  background: rgba(255, 255, 255, 0.13);
+  color: var(--text-primary);
+}
+
+.hint {
+  font-size: var(--fs-xs);
+  color: var(--text-tertiary);
+  line-height: 1.55;
+}
+
+.summary {
+  font-size: var(--fs-xs);
+  color: var(--text-tertiary);
+  min-height: 1em;
+}
+
+.summary:empty {
+  display: none;
+}

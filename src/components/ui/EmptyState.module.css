@@ -1,0 +1,58 @@
+.empty {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 0.7rem;
+  padding: clamp(2.5rem, 6vw, 4.5rem) 1.5rem;
+  text-align: center;
+  border: 1px dashed var(--line-2);
+  border-radius: var(--r-lg);
+  background:
+    radial-gradient(circle at 50% 0%, rgba(120, 107, 255, 0.07), transparent 62%),
+    rgba(255, 255, 255, 0.012);
+}
+
+.compact {
+  padding: 2rem 1.25rem;
+}
+
+.icon {
+  display: grid;
+  place-items: center;
+  width: 44px;
+  height: 44px;
+  margin-bottom: 0.2rem;
+  border-radius: 50%;
+  border: 1px solid var(--line-2);
+  color: var(--violet-bright);
+  background: rgba(120, 107, 255, 0.08);
+}
+
+.icon svg {
+  width: 19px;
+  height: 19px;
+  stroke-width: 1.6;
+}
+
+.title {
+  font-family: var(--font-display);
+  font-size: clamp(1.3rem, 2.2vw, 1.6rem);
+  font-weight: 400;
+  letter-spacing: -0.01em;
+  color: var(--text-primary);
+}
+
+.body {
+  max-width: 46ch;
+  font-size: var(--fs-sm);
+  color: var(--text-tertiary);
+  line-height: 1.65;
+}
+
+.actions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  gap: 0.6rem;
+  margin-top: 0.5rem;
+}

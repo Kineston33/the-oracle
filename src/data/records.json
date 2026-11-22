@@ -1,0 +1,504 @@
+[
+  {
+    "id": "ORC-2025-0001",
+    "title": "Global battery storage passes 1,200 GW",
+    "canonicalQuestion": "Will global installed battery energy storage capacity exceed 1,200 gigawatts before 31 December 2028?",
+    "category": "climate",
+    "publishedAt": "2025-11-04T09:00:00.000Z",
+    "probability": 0.62,
+    "horizon": {
+      "startsAt": "2025-11-04T09:00:00.000Z",
+      "endsAt": "2028-12-31T23:59:59.000Z",
+      "label": "Through 2028"
+    },
+    "resolutionCriteria": {
+      "resolveOn": "2029-01-31T23:59:59.000Z",
+      "rule": "Resolves YES if cumulative installed battery storage capacity worldwide, as reported in the reference dataset's annual update, exceeds 1,200 GW by the stated date. Capacity under construction does not count.",
+      "authority": "Annual global capacity update from the reference dataset named in evidence.",
+      "edgeCases": [
+        "If the annual update is delayed beyond 90 days, the prior year's figure plus audited additions is used.",
+        "Behind-the-meter installations are included only where the dataset reports them separately.",
+        "A figure exactly equal to 1,200 GW resolves NO; the question requires exceeding it."
+      ]
+    },
+    "evidence": [
+      {
+        "id": "E-0001-A",
+        "title": "Cumulative grid-scale storage capacity, 2015–2024",
+        "publisher": "Illustrative reference dataset",
+        "publishedAt": "2025-10-12T00:00:00.000Z",
+        "kind": "dataset",
+        "note": "Baseline series used to fit the growth band. Fabricated for demonstration."
+      },
+      {
+        "id": "E-0001-B",
+        "title": "Announced manufacturing capacity for storage cells",
+        "publisher": "Illustrative market filing set",
+        "publishedAt": "2025-09-28T00:00:00.000Z",
+        "kind": "filing",
+        "note": "Used to constrain plausible supply, not demand. Fabricated for demonstration."
+      },
+      {
+        "id": "E-0001-C",
+        "title": "Policy inventory of national storage targets",
+        "publisher": "Illustrative policy inventory",
+        "publishedAt": "2025-08-19T00:00:00.000Z",
+        "kind": "report",
+        "note": "Identifies the jurisdictions that would need to overperform. Fabricated for demonstration."
+      }
+    ],
+    "status": "open",
+    "integrity": {
+      "algorithm": "SHA-256",
+      "digest": "2c3c0206265888468d5ce4dc253351c2f2d5703e1d26ab067b36183fac2340e1",
+      "revision": 1,
+      "channel": "public-archive",
+      "anchored": false
+    },
+    "demo": true
+  },
+  {
+    "id": "ORC-2025-0002",
+    "title": "Frontier training run crosses 10²⁷ FLOP",
+    "canonicalQuestion": "Will any publicly disclosed frontier model be trained on more than 10^27 total floating-point operations before 1 July 2027?",
+    "category": "technology",
+    "publishedAt": "2025-10-21T14:30:00.000Z",
+    "probability": 0.41,
+    "horizon": {
+      "startsAt": "2025-10-21T14:30:00.000Z",
+      "endsAt": "2027-07-01T00:00:00.000Z",
+      "label": "By mid-2027"
+    },
+    "resolutionCriteria": {
+      "resolveOn": "2027-07-31T23:59:59.000Z",
+      "rule": "Resolves YES only if a training compute figure above 10^27 FLOP is disclosed in a model card, technical report, or regulatory filing attributable to the developer. Leaked or estimated figures do not count.",
+      "authority": "Primary developer disclosure or an official regulatory filing.",
+      "edgeCases": [
+        "A disclosed range resolves on its lower bound.",
+        "Post-training compute is excluded; pre-training compute is counted.",
+        "If a developer discloses only that a threshold was 'exceeded', the question resolves YES only if the threshold exceeds 10^27."
+      ]
+    },
+    "evidence": [
+      {
+        "id": "E-0002-A",
+        "title": "Disclosed training compute of frontier models, 2020–2025",
+        "publisher": "Illustrative compute registry",
+        "publishedAt": "2025-10-02T00:00:00.000Z",
+        "kind": "dataset",
+        "note": "Fabricated series used to anchor a doubling-time model."
+      },
+      {
+        "id": "E-0002-B",
+        "title": "Accelerator allocation announcements",
+        "publisher": "Illustrative procurement tracker",
+        "publishedAt": "2025-09-11T00:00:00.000Z",
+        "kind": "report",
+        "note": "Upper-bound check on plausible cluster scale. Fabricated for demonstration."
+      }
+    ],
+    "status": "open",
+    "integrity": {
+      "algorithm": "SHA-256",
+      "digest": "ef3a72926fec5d04bf488c226f8a2ea52ee1b1618d49ac251cf83b85085c660c",
+      "revision": 1,
+      "channel": "public-archive",
+      "anchored": false
+    },
+    "demo": true
+  },
+  {
+    "id": "ORC-2025-0003",
+    "title": "More than 40 national AI safety bodies",
+    "canonicalQuestion": "Will more than 40 sovereign states have established a standing national AI safety or evaluation body by 31 December 2027?",
+    "category": "geopolitics",
+    "publishedAt": "2025-09-15T08:15:00.000Z",
+    "probability": 0.55,
+    "horizon": {
+      "startsAt": "2025-09-15T08:15:00.000Z",
+      "endsAt": "2027-12-31T23:59:59.000Z",
+      "label": "Through 2027"
+    },
+    "resolutionCriteria": {
+      "resolveOn": "2028-02-15T23:59:59.000Z",
+      "rule": "Resolves YES if more than 40 sovereign states have, by the stated date, a publicly identifiable standing body with a mandate covering AI safety evaluation. A body must have a budget line or published mandate to count.",
+      "authority": "Official government publications, cross-checked against a maintained public inventory.",
+      "edgeCases": [
+        "Announced-but-unfunded bodies do not count.",
+        "Supranational bodies count toward no individual state.",
+        "A body that exists only as an advisory committee without evaluation staff does not count."
+      ]
+    },
+    "evidence": [
+      {
+        "id": "E-0003-A",
+        "title": "Inventory of national AI governance bodies",
+        "publisher": "Illustrative governance inventory",
+        "publishedAt": "2025-08-30T00:00:00.000Z",
+        "kind": "official-record",
+        "note": "Baseline count of 17 standing bodies. Fabricated for demonstration."
+      },
+      {
+        "id": "E-0003-B",
+        "title": "Legislative pipeline for AI oversight agencies",
+        "publisher": "Illustrative legislative tracker",
+        "publishedAt": "2025-07-14T00:00:00.000Z",
+        "kind": "report",
+        "note": "Used to estimate how many bills historically reach funded status. Fabricated for demonstration."
+      }
+    ],
+    "status": "open",
+    "integrity": {
+      "algorithm": "SHA-256",
+      "digest": "bbf8f62996189aa828f2edd19100e5b24ae7385119df91f331722aecd912a546",
+      "revision": 1,
+      "channel": "public-archive",
+      "anchored": false
+    },
+    "demo": true
+  },
+  {
+    "id": "ORC-2025-0004",
+    "title": "Lunar south pole sample return before 2030",
+    "canonicalQuestion": "Will a commercial mission return at least 100 grams of material from the lunar south polar region to Earth before 1 January 2030?",
+    "category": "space",
+    "publishedAt": "2025-08-02T16:45:00.000Z",
+    "probability": 0.28,
+    "horizon": {
+      "startsAt": "2025-08-02T16:45:00.000Z",
+      "endsAt": "2029-12-31T23:59:59.000Z",
+      "label": "Before 2030"
+    },
+    "resolutionCriteria": {
+      "resolveOn": "2030-02-28T23:59:59.000Z",
+      "rule": "Resolves YES if a commercially led mission delivers at least 100 grams of lunar material from within 10 degrees of the south pole to Earth before the stated date. 'Commercially led' means a private operator is the prime contractor and majority funder.",
+      "authority": "Mission operator's published sample catalog plus an independent laboratory's mass verification.",
+      "edgeCases": [
+        "State-led missions with commercial partners do not count.",
+        "Samples returned by a lander that crashed are excluded unless a recoverable sample is documented.",
+        "Mass is measured after recovery, not at launch."
+      ]
+    },
+    "evidence": [
+      {
+        "id": "E-0004-A",
+        "title": "Manifest of announced commercial lunar missions",
+        "publisher": "Illustrative launch manifest",
+        "publishedAt": "2025-07-20T00:00:00.000Z",
+        "kind": "dataset",
+        "note": "Schedule and funding status per mission. Fabricated for demonstration."
+      },
+      {
+        "id": "E-0004-B",
+        "title": "Historical slip rates for first-of-kind landers",
+        "publisher": "Illustrative programme review",
+        "publishedAt": "2025-06-08T00:00:00.000Z",
+        "kind": "paper",
+        "note": "Informs the schedule-risk discount. Fabricated for demonstration."
+      }
+    ],
+    "status": "open",
+    "integrity": {
+      "algorithm": "SHA-256",
+      "digest": "4efacfd19030cd04e7bde1dfa539b89835bbaff14766dd1c79fcefa2fdbe63c7",
+      "revision": 1,
+      "channel": "public-archive",
+      "anchored": false
+    },
+    "demo": true
+  },
+  {
+    "id": "ORC-2025-0005",
+    "title": "Global EV sales exceed 30 million",
+    "canonicalQuestion": "Will annual global sales of battery-electric and plug-in hybrid passenger vehicles exceed 30 million units before 1 January 2030?",
+    "category": "economy",
+    "publishedAt": "2025-07-11T11:00:00.000Z",
+    "probability": 0.58,
+    "horizon": {
+      "startsAt": "2025-07-11T11:00:00.000Z",
+      "endsAt": "2029-12-31T23:59:59.000Z",
+      "label": "Before 2030"
+    },
+    "resolutionCriteria": {
+      "resolveOn": "2030-03-31T23:59:59.000Z",
+      "rule": "Resolves YES if full-year global sales of battery-electric and plug-in hybrid passenger vehicles exceed 30 million units for any calendar year before the stated date, as reported in the reference dataset.",
+      "authority": "Annual global vehicle sales update from the reference dataset named in evidence.",
+      "edgeCases": [
+        "Commercial fleets of light trucks are excluded unless the dataset classifies them as passenger vehicles.",
+        "A restatement after the resolution window does not reopen the question.",
+        "A figure exactly equal to 30 million resolves NO."
+      ]
+    },
+    "evidence": [
+      {
+        "id": "E-0005-A",
+        "title": "Global passenger vehicle registrations by drivetrain",
+        "publisher": "Illustrative registrations dataset",
+        "publishedAt": "2025-06-30T00:00:00.000Z",
+        "kind": "dataset",
+        "note": "Primary series for the trajectory fit. Fabricated for demonstration."
+      },
+      {
+        "id": "E-0005-B",
+        "title": "Model launch and price parity schedule",
+        "publisher": "Illustrative product tracker",
+        "publishedAt": "2025-05-16T00:00:00.000Z",
+        "kind": "report",
+        "note": "Used to model the 2027–2029 replacement wave. Fabricated for demonstration."
+      }
+    ],
+    "status": "open",
+    "integrity": {
+      "algorithm": "SHA-256",
+      "digest": "cd89e5cc9446767284d146c3801ccceb49aaac80597f6f2bc520f37f441e09b3",
+      "revision": 1,
+      "channel": "public-archive",
+      "anchored": false
+    },
+    "demo": true
+  },
+  {
+    "id": "ORC-2025-0006",
+    "title": "CRISPR therapy approved for a common heart condition",
+    "canonicalQuestion": "Will a national medicines regulator approve a CRISPR-based therapy for a condition affecting more than 1% of adults in its jurisdiction before 1 January 2029?",
+    "category": "health",
+    "publishedAt": "2025-06-24T10:20:00.000Z",
+    "probability": 0.33,
+    "horizon": {
+      "startsAt": "2025-06-24T10:20:00.000Z",
+      "endsAt": "2028-12-31T23:59:59.000Z",
+      "label": "Before 2029"
+    },
+    "resolutionCriteria": {
+      "resolveOn": "2029-02-28T23:59:59.000Z",
+      "rule": "Resolves YES if a regulator grants marketing authorisation to a therapy that uses a CRISPR-derived editing mechanism for a condition with a prevalence above 1% of adults in that jurisdiction. Rare-disease indications do not count.",
+      "authority": "Published approval decision from a national medicines regulator.",
+      "edgeCases": [
+        "Conditional or accelerated approvals count if marketing authorisation is granted.",
+        "A therapy withdrawn within 90 days of approval still resolves YES.",
+        "Base editing and prime editing count as CRISPR-derived for this question."
+      ]
+    },
+    "evidence": [
+      {
+        "id": "E-0006-A",
+        "title": "Clinical-stage CRISPR programmes by indication",
+        "publisher": "Illustrative trials registry extract",
+        "publishedAt": "2025-06-02T00:00:00.000Z",
+        "kind": "dataset",
+        "note": "Programmes in Phase 2 or later. Fabricated for demonstration."
+      },
+      {
+        "id": "E-0006-B",
+        "title": "Review timelines for advanced therapy approvals",
+        "publisher": "Illustrative regulatory review",
+        "publishedAt": "2025-04-18T00:00:00.000Z",
+        "kind": "paper",
+        "note": "Median and tail review durations. Fabricated for demonstration."
+      }
+    ],
+    "status": "open",
+    "integrity": {
+      "algorithm": "SHA-256",
+      "digest": "75065f05a0087da606e9550e663e03a3a113d4d2036a31ccfb1b20219122c832",
+      "revision": 1,
+      "channel": "public-archive",
+      "anchored": false
+    },
+    "demo": true
+  },
+  {
+    "id": "ORC-2025-0007",
+    "title": "Mauna Loa CO₂ above 430 ppm",
+    "canonicalQuestion": "Will the annual mean atmospheric CO₂ concentration at Mauna Loa exceed 430 parts per million before 1 January 2029?",
+    "category": "climate",
+    "publishedAt": "2025-05-19T07:00:00.000Z",
+    "probability": 0.71,
+    "horizon": {
+      "startsAt": "2025-05-19T07:00:00.000Z",
+      "endsAt": "2028-12-31T23:59:59.000Z",
+      "label": "Through 2028"
+    },
+    "resolutionCriteria": {
+      "resolveOn": "2029-06-30T23:59:59.000Z",
+      "rule": "Resolves YES if any annual mean CO₂ concentration at the Mauna Loa observatory above 430 ppm is published for a calendar year before the stated date. The first published annual mean for that year is binding.",
+      "authority": "The observatory's official annual mean series.",
+      "edgeCases": [
+        "Seasonal or monthly peaks do not count; only the annual mean applies.",
+        "If observations are interrupted, the published annual mean with the observatory's own gap-filling method is used.",
+        "A restatement after the resolution window does not reopen the question."
+      ]
+    },
+    "evidence": [
+      {
+        "id": "E-0007-A",
+        "title": "Annual mean CO₂ series, 1958–2024",
+        "publisher": "Illustrative observatory series",
+        "publishedAt": "2025-05-06T00:00:00.000Z",
+        "kind": "dataset",
+        "note": "Baseline growth estimate. Fabricated for demonstration."
+      }
+    ],
+    "status": "resolved",
+    "resolution": {
+      "resolvedAt": "2026-06-18T12:00:00.000Z",
+      "outcome": "yes",
+      "basis": "Illustrative annual mean of 431.2 ppm reported for calendar year 2025 in the demo observatory series.",
+      "note": "Demo resolution recorded to demonstrate how outcomes attach to a sealed record. The figures are fabricated."
+    },
+    "integrity": {
+      "algorithm": "SHA-256",
+      "digest": "52c940f249d805fe61bb1bd381cae7ae0c45f03b454264da0ff0bf28f43c45bc",
+      "revision": 1,
+      "channel": "public-archive",
+      "anchored": false
+    },
+    "demo": true
+  },
+  {
+    "id": "ORC-2025-0008",
+    "title": "A quarter of new software AI-generated",
+    "canonicalQuestion": "Will more than 25% of newly produced software be primarily generated by AI systems before 1 January 2028?",
+    "category": "technology",
+    "publishedAt": "2025-04-30T13:10:00.000Z",
+    "probability": 0.47,
+    "horizon": {
+      "startsAt": "2025-04-30T13:10:00.000Z",
+      "endsAt": "2027-12-31T23:59:59.000Z",
+      "label": "Through 2027"
+    },
+    "resolutionCriteria": {
+      "resolveOn": "2028-03-31T23:59:59.000Z",
+      "rule": "Resolves YES if a published measurement using the declared method finds that more than 25% of newly produced software, weighted by code volume committed, was primarily generated by AI systems in any full year before the stated date.",
+      "authority": "The method and dataset declared in the record's evidence bundle.",
+      "edgeCases": [
+        "AI-assisted autocomplete does not count; the threshold requires primarily generated output.",
+        "Private repositories are excluded unless the method covers them symmetrically.",
+        "If no qualifying measurement is published, the question resolves INDETERMINATE."
+      ]
+    },
+    "evidence": [
+      {
+        "id": "E-0008-A",
+        "title": "Declared measurement method for AI-generated code share",
+        "publisher": "Illustrative methodology note",
+        "publishedAt": "2025-04-30T13:10:00.000Z",
+        "kind": "paper",
+        "note": "Published with the question so the test is fixed in advance. Fabricated for demonstration."
+      },
+      {
+        "id": "E-0008-B",
+        "title": "Longitudinal commit composition sample",
+        "publisher": "Illustrative sample cohort",
+        "publishedAt": "2025-03-22T00:00:00.000Z",
+        "kind": "dataset",
+        "note": "Pilot cohort used to test method sensitivity. Fabricated for demonstration."
+      }
+    ],
+    "status": "open",
+    "integrity": {
+      "algorithm": "SHA-256",
+      "digest": "8dee59310bcd60ee848816e62e1f2e6b1b3ae17db5664f9d8422ccea35bd52ac",
+      "revision": 1,
+      "channel": "public-archive",
+      "anchored": false
+    },
+    "demo": true
+  },
+  {
+    "id": "ORC-2025-0009",
+    "title": "AI-assisted ballot adjudication in a national election",
+    "canonicalQuestion": "Will a national election use AI-assisted adjudication of disputed ballots before 1 January 2028?",
+    "category": "society",
+    "publishedAt": "2025-03-12T09:40:00.000Z",
+    "probability": 0.19,
+    "horizon": {
+      "startsAt": "2025-03-12T09:40:00.000Z",
+      "endsAt": "2027-12-31T23:59:59.000Z",
+      "label": "Through 2027"
+    },
+    "resolutionCriteria": {
+      "resolveOn": "2028-03-31T23:59:59.000Z",
+      "rule": "Resolves YES if a national electoral authority certifies an election in which an automated system materially contributed to adjudicating disputed ballots. 'Materially contributed' was not operationally defined before publication.",
+      "authority": "The certifying electoral authority's published record.",
+      "edgeCases": [
+        "The original phrasing left 'materially contributed' and 'AI-assisted' undefined.",
+        "No pre-registered threshold existed for how much assistance counts.",
+        "A post-hoc definition would change the question after publication."
+      ]
+    },
+    "evidence": [
+      {
+        "id": "E-0009-A",
+        "title": "Survey of election technology procurement",
+        "publisher": "Illustrative procurement survey",
+        "publishedAt": "2025-02-27T00:00:00.000Z",
+        "kind": "report",
+        "note": "Background only; no operational test could be fixed. Fabricated for demonstration."
+      }
+    ],
+    "status": "annulled",
+    "resolution": {
+      "resolvedAt": "2025-04-02T10:00:00.000Z",
+      "outcome": "indeterminate",
+      "basis": "Annulled before its horizon ended because the resolution rule could not be applied consistently by two independent reviewers using the published text.",
+      "note": "Annulled records stay public with their original probability and full revision history. This is how the archive is designed to handle a badly specified question."
+    },
+    "integrity": {
+      "algorithm": "SHA-256",
+      "digest": "94946e6d44fc4fa05f3ff64ee0c4e2c63cf371891fa89efc557a2f3eb8ad8db7",
+      "revision": 1,
+      "channel": "public-archive",
+      "anchored": false
+    },
+    "demo": true
+  },
+  {
+    "id": "ORC-2024-0010",
+    "title": "Room-temperature superconductor replication",
+    "canonicalQuestion": "Will an independent laboratory replicate a room-temperature, ambient-pressure superconducting claim before 1 January 2026?",
+    "category": "science",
+    "publishedAt": "2024-12-18T15:00:00.000Z",
+    "probability": 0.07,
+    "horizon": {
+      "startsAt": "2024-12-18T15:00:00.000Z",
+      "endsAt": "2025-12-31T23:59:59.000Z",
+      "label": "Through 2025"
+    },
+    "resolutionCriteria": {
+      "resolveOn": "2026-02-28T23:59:59.000Z",
+      "rule": "Resolves YES if at least two independent laboratories, with no shared authorship or funding with the original claimants, report reproducible zero-resistance and Meissner-effect measurements at ambient pressure and above 273 K.",
+      "authority": "Peer-reviewed reports from independent laboratories.",
+      "edgeCases": [
+        "Preprints do not count until peer reviewed.",
+        "A replication at high pressure does not count; the question requires ambient pressure.",
+        "Partial replication of only one signature does not count."
+      ]
+    },
+    "evidence": [
+      {
+        "id": "E-0010-A",
+        "title": "Prior replication attempts of ambient-pressure claims",
+        "publisher": "Illustrative literature review",
+        "publishedAt": "2024-12-02T00:00:00.000Z",
+        "kind": "paper",
+        "note": "Base rate of successful replication in this literature. Fabricated for demonstration."
+      }
+    ],
+    "status": "resolved",
+    "resolution": {
+      "resolvedAt": "2026-01-12T09:00:00.000Z",
+      "outcome": "no",
+      "basis": "No qualifying independent replication was reported before the horizon ended.",
+      "note": "Demo resolution. The literature review behind this base rate is fabricated."
+    },
+    "integrity": {
+      "algorithm": "SHA-256",
+      "digest": "4f35f6b8cc69e5f473562184f323810315cc8e30f9a7210b4296d440a8818f51",
+      "revision": 1,
+      "channel": "public-archive",
+      "anchored": false
+    },
+    "demo": true
+  }
+]

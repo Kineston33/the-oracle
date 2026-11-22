@@ -1,0 +1,122 @@
+import { Link } from 'react-router-dom';
+import { ArrowUpRight, LockKeyhole } from 'lucide-react';
+import { predictionRecords, summarizeArchive } from '@/data/records';
+import { formatDate, formatPercent } from '@/lib/format';
+import { SectionHeader } from '@/components/ui/SectionHeader';
+import { Callout } from '@/components/ui/Callout';
+import styles from './ArchiveSection.module.css';
+
+/**
+ * A ledger-style preview of the archive: dense, monospaced, and oriented around
+ * what a record *is* rather than how it looks in a marketing card.
+ */
+export function ArchiveSection() {
+  const records = [...predictionRecords]
+    .sort((a, b) => Date.parse(b.publishedAt) - Date.parse(a.publishedAt))
+    .slice(0, 5);
+  const summary = summarizeArchive(predictionRecords);
+
+  return (
+    <section className={styles.section} aria-labelledby="archive-title">
+      <div className={styles.inner}>
+        <SectionHeader
+          index="02"
+          eyebrow="The official archive"
+          title={<span id="archive-title">Published once. Read forever.</span>}
+          description={
+            <>
+              Every official prediction is a permanent public record: a canonical
+              question, a probability fixed at publication, the test that will
+              decide it, and the evidence it rested on.
+            </>
+          }
+          action={{ to: '/predictions', label: 'Enter the archive' }}
+        />
+
+        <div className={styles.layout}>
+          <div className={styles.ledger}>
+            <div className={styles.ledgerHead} aria-hidden="true">
+              <span>Record</span>
+              <span>Question</span>
+              <span className={styles.alignRight}>Published</span>
+              <span className={styles.alignRight}>P</span>
+              <span className={styles.alignRight}>Status</span>
+            </div>
+            <ul className={styles.rows}>
+              {records.map((record) => (
+                <li key={record.id}>
+                  <Link to={`/predictions/${record.id}`} className={styles.row}>
+                    <span className={`${styles.cellId} mono`}>{record.id}</span>
+                    <span className={styles.cellQuestion}>
+                      {record.title}
+                      <span className={styles.cellQuestionSub}>
+                        {record.horizon.label}
+                      </span>
+                    </span>
+                    <span className={`${styles.cellDate} mono`}>{formatDate(record.publishedAt)}</span>
+                    <span className={`${styles.cellProb} mono`}>{formatPercent(record.probability)}</span>
+                    <span className={styles.cellStatus}>
+                      <span
+                        className={[styles.statusPill, styles[record.status]].join(' ')}
+                      >
+                        {record.status}
+                      </span>
+                    </span>
+                  </Link>
+                </li>
+              ))}
+            </ul>
+            <div className={styles.ledgerFoot}>
+              <span>
+                Showing {records.length} of {summary.published} illustrative records
+              </span>
+              <Link to="/predictions" className={styles.ledgerLink}>
+                View all <ArrowUpRight size={12} aria-hidden="true" />
+              </Link>
+            </div>
+          </div>
+
+          <aside className={styles.aside} aria-label="Archive integrity notes">
+            <div className={styles.integrity}>
+              <span className={styles.integrityIcon}>
+                <LockKeyhole size={16} strokeWidth={1.6} aria-hidden="true" />
+              </span>
+              <h3 className={styles.integrityTitle}>What is sealed today</h3>
+              <ul className={styles.integrityList}>
+                <li>
+                  <strong>Digest present.</strong> Each record's exact payload hashes
+                  to a SHA-256 digest stored with it.
+                </li>
+                <li>
+                  <strong>Verifiable locally.</strong> The digest is recomputed in your
+                  browser when you open a record, so a silent edit would show.
+                </li>
+                <li>
+                  <strong>Not yet anchored.</strong> No external witness has attested
+                  these digests. That layer is future work.
+                </li>
+              </ul>
+            </div>
+
+            <Callout tone="integrity" title="Integrity is not the same as accuracy">
+              A sealed record proves what was said and when. It does not prove the
+              forecast was right. Resolution status is tracked separately, and losing
+              forecasts stay in the archive.
+            </Callout>
+
+            <div className={styles.rateBlock}>
+              <p className={styles.rateLabel}>Illustrative resolved hit rate</p>
+              <p className={styles.rateValue}>
+                {summary.hitRate === null ? '—' : formatPercent(summary.hitRate)}
+              </p>
+              <p className={styles.rateNote}>
+                Computed from {summary.resolved} demo records. Far too small to mean
+                anything, and shown only to demonstrate the metric's structure.
+              </p>
+            </div>
+          </aside>
+        </div>
+      </div>
+    </section>
+  );
+}

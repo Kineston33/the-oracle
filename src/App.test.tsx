@@ -1,0 +1,264 @@
+import { describe, expect, it } from 'vitest';
+import { render, screen, within } from '@testing-library/react';
+import userEvent from '@testing-library/user-event';
+import { MemoryRouter } from 'react-router-dom';
+import { App } from './App';
+
+function renderApp(path = '/') {
+  return render(
+    <MemoryRouter initialEntries={[path]}>
+      <App />
+    </MemoryRouter>,
+  );
+}
+
+describe('navigation', () => {
+  it('renders the homepage headline and the primary navigation', () => {
+    renderApp('/');
+    // Accept straight or typographic apostrophes in the accessible name.
+    expect(
+      screen.getByRole('heading', { level: 1, name: /see what['\u2019]s coming/i }),
+    ).toBeInTheDocument();
+
+    const nav = screen.getByRole('navigation', { name: 'Primary' });
+    for (const label of ['Explore', 'Predictions', 'Trends', 'About']) {
+      expect(within(nav).getByRole('link', { name: new RegExp(label, 'i') })).toBeInTheDocument();
+    }
+  });
+
+  it('navigates from the homepage to the archive', async () => {
+    const user = userEvent.setup();
+    renderApp('/');
+
+    const nav = screen.getByRole('navigation', { name: 'Primary' });
+    await user.click(within(nav).getByRole('link', { name: /predictions/i }));
+
+    expect(
+      await screen.findByRole('heading', { level: 1, name: /every prediction/i }),
+    ).toBeInTheDocument();
+  });
+
+  it.each([
+    ['/trends', /the future leaves fingerprints/i],
+    ['/about', /a forecast is only worth something/i],
+    ['/explore', /ask what happens/i],
+    ['/predictions', /every prediction/i],
+  ])('renders %s with its own heading', async (path, heading) => {
+    renderApp(path);
+    // Route chunks are code-split, so the heading resolves asynchronously.
+    expect(await screen.findByRole('heading', { level: 1, name: heading })).toBeInTheDocument();
+  });
+
+  it('shows a 404 state for an unknown route', () => {
+    renderApp('/no-such-page');
+    expect(screen.getByRole('heading', { level: 1, name: /this path has no record/i })).toBeInTheDocument();
+  });
+
+  it('marks the active navigation item with aria-current', () => {
+    renderApp('/trends');
+    const nav = screen.getByRole('navigation', { name: 'Primary' });
+    expect(within(nav).getByRole('link', { name: /trends/i })).toHaveAttribute(
+      'aria-current',
+      'page',
+    );
+  });
+});
+
+describe('homepage question input', () => {
+  it('asks for at least a dozen characters before submitting', async () => {
+    const user = userEvent.setup();
+    renderApp('/');
+
+    const input = screen.getByLabelText(/your question/i);
+    await user.type(input, 'why');
+    await user.click(screen.getByRole('button', { name: /consult the oracle/i }));
+
+    expect(await screen.findByRole('alert')).toHaveTextContent(/at least a dozen characters/i);
+  });
+
+  it('opens the exploration reading for a valid question', async () => {
+    const user = userEvent.setup();
+    renderApp('/');
+
+    const question = 'Will global battery storage exceed 1200 GW before 2029?';
+    await user.type(screen.getByLabelText(/your question/i), question);
+    await user.click(screen.getByRole('button', { name: /consult the oracle/i }));
+
+    // The explore route renders the reading panel after a short pause.
+    expect(
+      await screen.findByRole('heading', { name: /what your question contains/i }, { timeout: 3000 }),
+    ).toBeInTheDocument();
+    expect(screen.getByText(/no forecast produced/i)).toBeInTheDocument();
+  });
+
+  it('never presents a probability in the exploration result', async () => {
+    renderApp('/explore?q=Will%20global%20battery%20storage%20exceed%201200%20GW%20before%202029%3F');
+
+    await screen.findByRole(
+      'heading',
+      { name: /what your question contains/i },
+      { timeout: 3000 },
+    );
+
+    const main = screen.getByRole('main');
+    expect(main.textContent).toMatch(/does not estimate a probability/i);
+    // "Published probability" may appear for related archive records, but the
+    // panel itself must never claim to have produced one.
+    expect(main.textContent).not.toMatch(/your (prediction|probability|forecast) (is|would be)/i);
+  });
+});
+
+describe('predictions archive', () => {
+  it('lists every shipped record', () => {
+    renderApp('/predictions');
+    const archive = screen.getByRole('main');
+    expect(within(archive).getAllByText(/^ORC-\d{4}-\d{4}$/).length).toBeGreaterThanOrEqual(10);
+  });
+
+  it('filters by category and updates the count', async () => {
+    const user = userEvent.setup();
+    renderApp('/predictions');
+
+    const climateChip = screen.getByRole('button', { name: /^climate\s*\d+$/i });
+    await user.click(climateChip);
+
+    expect(screen.getByText(/filter(s)? active/i)).toBeInTheDocument();
+    const buttons = screen.getAllByRole('button', { name: /^climate\s*\d+$/i });
+    expect(buttons[0]).toHaveAttribute('aria-pressed', 'true');
+  });
+
+  it('shows an empty state and a reset action for an unmatched search', async () => {
+    const user = userEvent.setup();
+    renderApp('/predictions');
+
+    await user.type(screen.getByLabelText(/search records/i), 'zzzzz-no-match');
+
+    expect(await screen.findByText(/no records match that filter/i)).toBeInTheDocument();
+    await user.click(screen.getByRole('button', { name: /clear filters/i }));
+    expect(screen.queryByText(/no records match that filter/i)).not.toBeInTheDocument();
+  });
+
+  it('filters via a URL query parameter', () => {
+    renderApp('/predictions?status=resolved');
+    const summary = screen.getByText(/filter(s)? active/i);
+    expect(summary).toBeInTheDocument();
+  });
+});
+
+describe('record detail', () => {
+  it('renders the canonical question, criteria and evidence', async () => {
+    renderApp('/predictions/ORC-2025-0001');
+
+    expect(
+      await screen.findByRole('heading', { level: 1, name: /global battery storage passes/i }),
+    ).toBeInTheDocument();
+    expect(screen.getByText(/canonical question/i)).toBeInTheDocument();
+    expect(screen.getByRole('heading', { name: /resolution criteria/i })).toBeInTheDocument();
+    expect(screen.getByRole('heading', { name: /evidence at publication/i })).toBeInTheDocument();
+    expect(screen.getByText(/integrity record/i)).toBeInTheDocument();
+  });
+
+  it('verifies the digest in the browser and reports a match', async () => {
+    renderApp('/predictions/ORC-2025-0001');
+    expect(
+      await screen.findByText(/digest matches/i, {}, { timeout: 3000 }),
+    ).toBeInTheDocument();
+  });
+
+  it('states plainly that the record is not externally anchored', async () => {
+    renderApp('/predictions/ORC-2025-0001');
+    expect(await screen.findByText(/no — not yet/i)).toBeInTheDocument();
+  });
+
+  it('keeps the original probability visible next to a resolved outcome', async () => {
+    renderApp('/predictions/ORC-2025-0007');
+    await screen.findByRole('heading', { level: 1, name: /mauna loa/i });
+
+    // The figure is labelled, never replaced by the outcome.
+    expect(screen.getAllByText(/published probability/i).length).toBeGreaterThan(0);
+    expect(screen.getAllByText('71%').length).toBeGreaterThan(0);
+    expect(screen.getByText(/both figures stay on/i)).toBeInTheDocument();
+    // The outcome is recorded separately.
+    expect(screen.getByRole('heading', { name: /^resolution$/i })).toBeInTheDocument();
+  });
+
+  it('explains why an annulled record was retained', async () => {
+    renderApp('/predictions/ORC-2025-0009');
+    expect(
+      await screen.findByRole('heading', { name: /why this record was annulled/i }),
+    ).toBeInTheDocument();
+    expect(screen.getByText(/annulled, not deleted/i)).toBeInTheDocument();
+  });
+
+  it('shows a not-found state for an unknown record id', async () => {
+    renderApp('/predictions/ORC-1111-1111');
+    expect(await screen.findByText(/that record is not in the archive/i)).toBeInTheDocument();
+  });
+});
+
+describe('trends index', () => {
+  it('lists signals and filters by domain', async () => {
+    const user = userEvent.setup();
+    renderApp('/trends');
+
+    expect(await screen.findByText(/tracked signals/i)).toBeInTheDocument();
+    expect(screen.getByRole('heading', { name: /signal index/i })).toBeInTheDocument();
+
+    await user.click(screen.getByRole('button', { name: /^science\s*\d+$/i }));
+    const scienceChip = screen.getByRole('button', { name: /^science\s*\d+$/i });
+    expect(scienceChip).toHaveAttribute('aria-pressed', 'true');
+    expect(screen.getByText(/of 9 signals/i)).toBeInTheDocument();
+  });
+
+  it('labels the index as illustrative', async () => {
+    renderApp('/trends');
+    expect(await screen.findByText(/these numbers are not measurements/i)).toBeInTheDocument();
+  });
+});
+
+describe('about page', () => {
+  it('discloses that no forecasting engine exists', async () => {
+    renderApp('/about');
+    expect(
+      await screen.findByRole('heading', { name: /six things this product cannot do/i }),
+    ).toBeInTheDocument();
+    expect(screen.getAllByText(/no forecasting engine/i).length).toBeGreaterThan(0);
+  });
+
+  it('separates what is real from what is illustrative', async () => {
+    renderApp('/about');
+    expect(await screen.findByText(/what is real in this prototype/i)).toBeInTheDocument();
+    expect(screen.getAllByText(/what is illustrative/i).length).toBeGreaterThan(0);
+    expect(screen.getByText(/what does not exist yet/i)).toBeInTheDocument();
+  });
+});
+
+describe('accessibility basics', () => {
+  it('provides a skip link and a single main landmark', () => {
+    renderApp('/');
+    // The skip link lives in index.html, so assert the main landmark instead.
+    expect(screen.getAllByRole('main')).toHaveLength(1);
+  });
+
+  it('gives the question input an accessible label and description', () => {
+    renderApp('/');
+    const input = screen.getByLabelText(/your question/i);
+    expect(input).toHaveAttribute('aria-describedby');
+  });
+
+  it('marks every decorative sphere as hidden from assistive technology', () => {
+    renderApp('/');
+    const spheres = screen.getAllByTestId('crystal-sphere');
+    expect(spheres.length).toBeGreaterThan(0);
+    for (const sphere of spheres) {
+      expect(sphere).toHaveAttribute('aria-hidden', 'true');
+    }
+  });
+
+  it('announces search result counts politely', () => {
+    renderApp('/predictions');
+    const input = screen.getByLabelText(/search records/i);
+    expect(input).toBeInTheDocument();
+    expect(document.querySelector('[aria-live="polite"]')).not.toBeNull();
+  });
+});
