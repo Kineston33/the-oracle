@@ -139,8 +139,11 @@ accountable forecasting should not begin with an inflated account of itself.
 
 7. **The digest verifies consistency, not authorship.** A SHA-256 hash is not a signature.
    Public keys and signed records are not implemented.
-8. **Client-side only.** No SSR or prerendering, so link previews show generic metadata and
-   the archive is not crawlable without JavaScript execution.
+8. **Client-side only, with per-route metadata.** Each route now sets its own title,
+   description, canonical URL and Open Graph title, so tabs and shared links are accurate.
+   There is still no SSR or prerendering: social crawlers that do not execute JavaScript read
+   the static defaults in `index.html`, and a record-specific preview is not possible yet.
+   The site ships `noindex` until real records exist.
 9. **`localStorage` capacity.** Drafts are capped at 24 entries (roughly 20 KB of text) and
    are pruned oldest-last; there is no quota handling beyond silent failure.
 10. **The question parser is shallow.** Keyword lexicons and token overlap misclassify
@@ -183,3 +186,21 @@ accountable forecasting should not begin with an inflated account of itself.
 4. Publish the raw archive as a static JSON endpoint so readers can verify offline.
 5. Only then start the forecasting work: reference classes, structured elicitation,
    aggregation and Brier-scored calibration.
+
+### Deployment readiness
+
+19. **The canonical origin is a placeholder.** `https://the-oracle.example` appears in
+    `index.html` (canonical, `og:url`, `og:image`) and in
+    `src/components/layout/RouteMetadata.tsx`. Open Graph images must be absolute URLs, so
+    previews will not render until this is replaced with the real origin.
+20. **Indexing is switched off on purpose.** `index.html` carries
+    `<meta name="robots" content="noindex, nofollow">` because the archive is demonstration
+    data. Removing it before real records exist would put illustrative probabilities into
+    search results.
+21. **SPA fallback is configured, not proven.** `public/_redirects` (Netlify, Cloudflare
+    Pages) and `public/vercel.json` (Vercel) are committed and the build serves correctly
+    under `vite preview`, but no host has been exercised. Every route must be reloaded
+    directly against the deployed origin before launch.
+22. **No consent, analytics or privacy policy.** Nothing is tracked and nothing is sent
+    anywhere, which makes this easy to disclose honestly — but a public deployment still
+    needs that disclosure written somewhere a visitor can find it.

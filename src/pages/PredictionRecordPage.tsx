@@ -1,4 +1,3 @@
-import { useEffect } from 'react';
 import { Link, useParams } from 'react-router-dom';
 import {
   ArrowLeft,
@@ -41,6 +40,7 @@ function RecordNotFound({ id }: { id?: string }) {
   return (
     <div className={styles.notFound}>
       <EmptyState
+        headingLevel={1}
         icon={<FileText aria-hidden="true" />}
         title="That record is not in the archive"
         actions={
@@ -65,13 +65,6 @@ function RecordNotFound({ id }: { id?: string }) {
 export function PredictionRecordPage() {
   const { id } = useParams<{ id: string }>();
   const record = id ? findRecord(id) : undefined;
-
-  useEffect(() => {
-    if (record) document.title = `${record.id} — ${record.title} · THE ORACLE`;
-    return () => {
-      document.title = "THE ORACLE — See what's coming.";
-    };
-  }, [record]);
 
   if (!record) return <RecordNotFound id={id} />;
 

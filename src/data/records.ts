@@ -142,6 +142,62 @@ export function summarizeArchive(records: readonly PredictionRecord[]): ArchiveS
  * expected shape. It deliberately does not verify the hash — that is async
  * and lives in `lib/integrity.ts`.
  */
+/**
+ * A comparison form for a canonical question: case, punctuation, quotes and
+ * whitespace are folded, so two records that ask the same thing in different
+ * typography are recognised as the same question.
+ *
+ * This is deliberately *not* a semantic comparison. Two genuinely different
+ * questions can never collide through it (it only removes surface noise), but
+ * it also cannot prove that two differently-worded questions mean the same
+ * thing. Detection of paraphrase is a stated limitation, not something this
+ * function pretends to do.
+ */
+export function canonicalKey(question: string): string {
+  return question
+    .normalize('NFKC')
+    .toLowerCase()
+    .replace(/[\u2018\u2019\u02bc]/g, "'")
+    .replace(/[\u201c\u201d]/g, '"')
+    .replace(/[^a-z0-9]+/g, ' ')
+    .trim();
+}
+
+export interface QuestionCollision {
+  key: string;
+  ids: string[];
+}
+
+/**
+ * Finds canonical questions that appear on more than one record.
+ *
+ * The product rule is that one canonical question maps to exactly one official
+ * prediction. Revisions live *on* a record (`integrity.revision`), so a second
+ * record carrying the same canonical question is never a legitimate revision —
+ * it is a fork, and two true answers to the same question would then exist.
+ *
+ * This compares wording, not meaning. Two paraphrase-equivalent questions can
+ * slip past it; that detection gap is a stated limitation, not something this
+ * function pretends to solve.
+ */
+export function findCanonicalCollisions(
+  records: readonly PredictionRecord[],
+): QuestionCollision[] {
+  const byKey = new Map<string, string[]>();
+  for (const record of records) {
+    const key = canonicalKey(record.canonicalQuestion);
+    const bucket = byKey.get(key);
+    if (bucket) bucket.push(record.id);
+    else byKey.set(key, [record.id]);
+  }
+
+  const collisions: QuestionCollision[] = [];
+  for (const [key, ids] of byKey) {
+    if (ids.length > 1) collisions.push({ key, ids });
+  }
+  return collisions;
+}
+
 export function assertArchiveShape(records: readonly PredictionRecord[]): string[] {
   const problems: string[] = [];
   const ids = new Set<string>();
@@ -169,5 +225,13 @@ export function assertArchiveShape(records: readonly PredictionRecord[]): string
       problems.push(`Record ${record.id} is resolved with an indeterminate outcome`);
     }
   }
+
+  // One canonical question, one official prediction.
+  for (const collision of findCanonicalCollisions(records)) {
+    problems.push(
+      `Canonical question claimed by more than one record without supersession: ${collision.ids.join(', ')}`,
+    );
+  }
+
   return problems;
 }

@@ -70,7 +70,7 @@ Checks:
 
 ```bash
 npm run typecheck # strict tsc for the app, the tests and the audit harness
-npm test          # Vitest: 139 tests across 7 files
+npm test          # Vitest: 170 tests across 9 files
 npm run seal      # recompute the SHA-256 digest of every record (see below)
 ```
 
@@ -90,7 +90,8 @@ the-oracle/
 ├── scripts/
 │   └── seal-records.mjs         # computes and writes record digests
 ├── docs/
-│   └── FEATURES-AND-LIMITATIONS.md
+│   ├── FEATURES-AND-LIMITATIONS.md
+│   └── DEPLOYMENT.md         # host config, placeholders, pre-launch checklist
 └── src/
     ├── main.tsx                 # fonts + global styles + router mount
     ├── App.tsx                  # shell, route table, focus/scroll management
@@ -205,7 +206,7 @@ entirely, including ambient drift).
 
 ## Testing
 
-139 tests across seven files:
+170 tests across nine files:
 
 - `lib/question.test.ts` — normalisation, category detection, horizon parsing, archive
   matching, canonical draft generation, and the invariant that a reading never contains a
@@ -217,6 +218,11 @@ entirely, including ambient drift).
   rule that demo content is always flagged.
 - `test/contrast.test.ts` — reads `tokens.css` and asserts every text token clears WCAG AA
   against every surface token, and that the text hierarchy stays monotonic.
+- `data/records.test.ts` — includes the canonical-question rule: every record asks a
+  distinct question, a duplicate is reported as a fork, and the probability is never
+  mutated by any read helper.
+- `components/layout/RouteMetadata.test.tsx` — each route carries its own title,
+  description, canonical URL and Open Graph title.
 - `App.test.tsx` — navigation, mobile/desktop routes, question submission and validation,
   archive filtering and empty states, record detail rendering, digest verification in the
   DOM, and the honesty requirements (a record never loses its original probability; the
@@ -258,4 +264,5 @@ third-party witnesses and independent re-resolution.
 
 ## Licence
 
-MIT.
+No explicit licence is granted at this stage. The repository is public for review,
+all rights reserved, until a licensing decision is made.

@@ -1,0 +1,5 @@
+# SPA fallback for Netlify and Cloudflare Pages.
+# Any path that is not a real file is served index.html, so a deep link such as
+# /predictions/ORC-2025-0007 resolves on reload instead of 404ing at the host.
+/*
+  /index.html  200

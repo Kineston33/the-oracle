@@ -6,6 +6,7 @@ import { NavBar } from '@/components/layout/NavBar';
 import { Footer } from '@/components/layout/Footer';
 import { RouteFallback } from '@/components/layout/RouteFallback';
 import { ErrorBoundary } from '@/components/layout/ErrorBoundary';
+import { RouteMetadata } from '@/components/layout/RouteMetadata';
 import { NotFound } from '@/pages/NotFound';
 import { Home } from '@/pages/Home';
 
@@ -40,6 +41,7 @@ export function App() {
     <>
       <Atmosphere />
       <RouteEffects />
+      <RouteMetadata />
       <NavBar />
       <main id="main" className="main" tabIndex={-1}>
         <ErrorBoundary>
