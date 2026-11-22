@@ -152,8 +152,10 @@ export function IntegrityPanel({ record }: { record: PredictionRecord }) {
         </div>
         <div className={styles.field}>
           <dt>Externally anchored</dt>
-          <dd className={styles.unanchored}>
-            {record.integrity.anchored ? 'Yes' : 'No — not yet'}
+          <dd className={record.integrity.anchored ? styles.mismatch : styles.unanchored}>
+            {record.integrity.anchored
+              ? 'Claimed, but rejected — no verifiable proof'
+              : 'No — not yet'}
           </dd>
         </div>
         <div className={styles.field}>
@@ -214,11 +216,19 @@ export function IntegrityPanel({ record }: { record: PredictionRecord }) {
             */}
             <p className={[styles.verifyLine, styles.checking].join(' ')}>
               <Minus size={13} aria-hidden="true" />
-              Provenance is <strong>declared</strong>, not demonstrated. An event marked{' '}
-              <em>observed</em> says it was written while the thing happened; nothing here
-              can prove that, because no external witness has countersigned it. A migrated
-              event makes the weaker, verifiable claim that it was written later than the
-              dates it records.
+              Three different things are in play, and only the first is available here:
+              <br />
+              <strong>Internal consistency</strong> — the fields and their hashes agree.
+              That is what the checks above measure.{' '}
+              <strong>Declared provenance</strong> — the event says it is{' '}
+              <em>migrated</em> or <em>observed</em>.{' '}
+              <strong>Demonstrated anteriority</strong> — evidence that the bytes existed at
+              a given moment. <strong>Not available</strong>: no external witness has
+              countersigned any of this. A full reconstruction could invent{' '}
+              <code className="mono">occurredAt</code> and{' '}
+              <code className="mono">recordedAt</code> together and recompute every digest, so
+              the ordering between those two fields is a consistency property of the record,
+              not independent proof of when it was written.
             </p>
 
             {result.ok ? (
@@ -254,18 +264,23 @@ export function IntegrityPanel({ record }: { record: PredictionRecord }) {
       <p className={styles.caveat}>
         {record.integrity.payloadScope === 'legacy-record' ? (
           <>
-            This record was sealed before the payload/event split, so its digest covers the
-            outcome as well. A matching digest proves the record is unchanged since it was
-            sealed — it does <strong>not</strong> prove the probability was fixed before the
-            outcome was known.
+            The content currently shipped reproduces the digest declared in the record. That
+            shows the bytes and the stored digest are consistent with each other. It does{' '}
+            <strong>not</strong> show when that digest came to exist, and it cannot rule out
+            a full reconstruction. This record was sealed before the payload/event split, so
+            its digest covers the outcome as well — which means it also does not show the
+            probability was fixed before the outcome was known.
           </>
         ) : (
           <>
-            A matching digest proves the published content has not changed since sealing.
-            Resolutions and annulments are appended as separate events and never alter it.
+            The content currently shipped reproduces the digest declared in the record. That
+            shows the bytes and the stored digest are consistent with each other. It does{' '}
+            <strong>not</strong> show when that digest came to exist, and it cannot rule out
+            a full reconstruction. Resolutions and annulments are appended as separate
+            events and never alter the sealed payload.
           </>
         )}{' '}
-        Neither case proves the forecast was correct, and neither is yet a public
+        None of this proves the forecast was correct, and none of it is yet a public
         attestation: no external witness or transparency log has countersigned this hash.
         {chainIntact === false
           ? ' The event chain failed verification, so the record is not shown as intact.'

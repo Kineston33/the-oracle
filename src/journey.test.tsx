@@ -107,7 +107,10 @@ describe('journey: verifying a record', () => {
     expect(text).toMatch(/Event chain verified/);
 
     // The panel must not overclaim: it says what the digest does not prove.
-    expect(text).toMatch(/neither case proves the forecast was correct/i);
+    // Point 2: the digest shows consistency, never when it existed.
+    expect(text).toMatch(/reproduces the digest declared in the record/i);
+    expect(text).toMatch(/does not show when that digest came to exist/i);
+    expect(text).toMatch(/proves the forecast was correct/i);
     expect(text).toMatch(/no external witness or transparency log has countersigned/i);
     // And it names which payload definition the digest actually covers.
     expect(text).toMatch(/whole record, outcome included/i);

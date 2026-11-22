@@ -140,8 +140,11 @@ describe('the panel never overstates integrity', () => {
     const text = panelText(container);
 
     expect(text).toMatch(/Declared observed, not proven/i);
-    expect(text).toMatch(/Provenance is declared, not demonstrated/i);
-    expect(text).toMatch(/nothing here\s+can prove that/i);
+    // Point 1: the three levels are named, and anteriority is explicitly missing.
+    expect(text).toMatch(/Internal consistency/i);
+    expect(text).toMatch(/Declared provenance/i);
+    expect(text).toMatch(/Demonstrated anteriority/i);
+    expect(text).toMatch(/Not available/i);
     // It must never state that the event is proven to predate anything.
     expect(text).not.toMatch(/proven contemporaneous/i);
     expect(text).not.toMatch(/witnessed at/i);
@@ -150,6 +153,46 @@ describe('the panel never overstates integrity', () => {
   it('keeps the full-rebuild warning visible', async () => {
     const { container } = await renderPanel(open);
     expect(panelText(container)).toMatch(/rebuild every payload digest, the publication event and the\s+whole chain/i);
+  });
+
+  it('4. labels a rejected anchoring claim instead of saying Yes', async () => {
+    const claiming: PredictionRecord = {
+      ...open,
+      integrity: { ...open.integrity, anchored: true },
+    };
+    const { container } = await renderPanel(claiming);
+    const text = panelText(container);
+
+    // The metadata field must not read as a satisfied claim.
+    expect(text).toMatch(/Claimed, but rejected/i);
+    expect(text).toMatch(/no verifiable proof/i);
+    expect(text).not.toMatch(/Externally anchoredYes/);
+  });
+
+  it('4b. says "No — not yet" for an honest record', async () => {
+    const { container } = await renderPanel(open);
+    expect(panelText(container)).toMatch(/No — not yet/);
+  });
+
+  it('1. never calls recordedAt ordering independent proof', async () => {
+    const { container } = await renderPanel(open);
+    const text = panelText(container);
+
+    expect(text).not.toMatch(/verifiable claim/i);
+    expect(text).not.toMatch(/proves? .* written later/i);
+    expect(text).toMatch(/not independent proof of when it was written/i);
+  });
+
+  it('2. never claims a digest proves when sealing happened', async () => {
+    const closed = predictionRecords.find((r) => r.id === 'ORC-2025-0007')!;
+    const { container } = await renderPanel(closed);
+    const text = panelText(container);
+
+    expect(text).not.toMatch(/unchanged since it was sealed/i);
+    expect(text).not.toMatch(/has not changed since sealing/i);
+    expect(text).toMatch(/reproduces the digest declared in the record/i);
+    expect(text).toMatch(/does not show when that digest came to exist/i);
+    expect(text).toMatch(/cannot rule out\s+a full reconstruction/i);
   });
 
   it('keeps the migration caveat visible with a closed record', async () => {

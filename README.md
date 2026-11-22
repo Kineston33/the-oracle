@@ -70,8 +70,8 @@ Checks:
 
 ```bash
 npm run typecheck # strict tsc for the app, the tests and the audit harness
-npm test          # Vitest: 228 tests across 10 files
-npm run seal      # recompute the SHA-256 digest of every record (see below)
+npm test          # Vitest: full suite
+npm run seal      # verify every digest; seal only records never sealed (see below)
 ```
 
 No API keys, accounts, paid services or environment variables are required. The
@@ -206,7 +206,8 @@ entirely, including ambient drift).
 
 ## Testing
 
-228 tests across ten files:
+The suite covers twelve files. Run `npm test` for the current count — this line is
+deliberately not a number that goes stale after every change:
 
 - `lib/question.test.ts` — normalisation, category detection, horizon parsing, archive
   matching, canonical draft generation, and the invariant that a reading never contains a
@@ -435,3 +436,22 @@ public panel reports anchoring as *not verified* for every record, and never as 
 `npm run seal` exits non-zero and writes nothing if any published record no longer matches its
 own digest, or if any publication link or event chain is inconsistent. There is no `--force`.
 Verified by tampering with a copy: exit 1, file untouched, offending id named.
+
+### What a matching digest does and does not show
+
+A digest establishes **consistency**: the bytes shipped reproduce the digest stored beside
+them, and the chain links up. It does **not** establish **when** those bytes existed. Anyone
+with write access to this repository could rebuild the payload, the digest, the publication
+event and the entire chain, and the result would verify.
+
+Three things are therefore kept apart, in the interface and in this document:
+
+| | What it means | Available? |
+|---|---|---|
+| Internal consistency | fields and hashes agree | Yes, computed in your browser |
+| Declared provenance | the event says `migrated` or `observed` | Yes, protected by its own digest |
+| Demonstrated anteriority | evidence the bytes existed at a moment | **No** — needs an external witness |
+
+`recordedAt > occurredAt` is a consistency rule checked by the validator. It is not
+independent proof of when an event was written, because a full reconstruction can invent both
+fields together.

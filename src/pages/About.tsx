@@ -28,7 +28,7 @@ const PRINCIPLES = [
   {
     icon: Fingerprint,
     title: 'Sealed, not edited',
-    body: 'A probability is fixed at publication and carries a digest of its exact payload. Corrections append a revision. Nothing is silently rewritten, and a withdrawn prediction stays visible as annulled.',
+    body: 'A probability is fixed at publication and carries a digest of its exact payload. A withdrawn prediction stays visible as annulled rather than disappearing. Nothing is silently rewritten, though a digest alone cannot prove that — see the limits below.',
   },
   {
     icon: Eye,
@@ -64,7 +64,7 @@ const METHOD_STEPS = [
   {
     step: '04',
     title: 'Probability, then seal',
-    body: 'A single number is recorded. The payload is canonically serialized and hashed. The digest is stored with the record; from this point the figure is a historical fact rather than a current opinion.',
+    body: 'A single number is recorded. The payload is canonically serialized and hashed, and the digest is stored with the record. The figure stops being a current opinion and becomes a fixed commitment — one whose date only external evidence could prove.',
     detail: 'Output: sealed record',
   },
   {
@@ -356,18 +356,21 @@ export function About() {
                 <div>
                   <h3 className={styles.integrityTitle}>How the digest works, precisely</h3>
                   <p className={styles.integrityText}>
-                    Each record is serialized with recursively sorted keys and no
-                    whitespace, the <code className="mono">integrity</code> field is
-                    removed, and the resulting UTF-8 bytes are hashed with SHA-256. The
-                    digest is written back into the record. When you open a record, your
-                    browser recomputes that hash from the payload it received and compares
-                    the two.
+                    Each record's sealed payload is serialized with recursively sorted keys,
+                    and the resulting UTF-8 bytes are hashed with SHA-256. Each event in the
+                    chain carries its own digest over the schema-2 envelope plus the previous
+                    event's digest. The digest is written back into the record. When you open
+                    a record, your browser recomputes all of it from the bytes it received
+                    and compares the result.
                   </p>
                   <p className={styles.integrityText}>
-                    This detects any change to the record after sealing. It does not
-                    detect a coordinated rewrite in which both the payload and the stored
-                    digest are replaced — which is precisely why external anchoring is
-                    the next milestone rather than a nice-to-have.
+                    What that establishes is <strong>consistency</strong>: the bytes shipped
+                    reproduce the digest stored beside them, and the chain links up. What it
+                    does not establish is <strong>when</strong> any of those bytes existed.
+                    Anyone with write access could rebuild the payload, the digest, the
+                    publication event and the whole chain, and the result would verify. That
+                    is why external anchoring is the next milestone rather than a nice-to-have
+                    — and why nothing here should be read as proof of prior existence.
                   </p>
                   <div className={styles.integrityChips}>
                     <Badge tone="gold" mono>
