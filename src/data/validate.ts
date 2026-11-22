@@ -18,8 +18,8 @@ import { deriveLifecycle } from './lifecycle.ts';
 import {
   CHAINED_SCOPE,
   EVENT_ALGORITHM,
-  EVENT_SCHEMA_VERSION,
   PUBLISHED_SCOPE,
+  SUPPORTED_SCHEMA_VERSIONS,
   canonicalize,
   eventEnvelope as eventEnvelopeOf,
   expectedScope,
@@ -178,9 +178,12 @@ export async function validateArchive(
     for (const event of record.events) {
       if (
         event.algorithm !== EVENT_ALGORITHM ||
-        event.schemaVersion !== EVENT_SCHEMA_VERSION
+        !(SUPPORTED_SCHEMA_VERSIONS as readonly number[]).includes(event.schemaVersion)
       ) {
-        continue; // already reported structurally
+        // Already reported structurally. An unimplemented version is a failure,
+        // never a skip: skipping would let a forger downgrade an event's
+        // declared scheme to escape verification.
+        continue;
       }
       const recomputedEvent = await sha256Hex(canonicalize(eventEnvelopeOf(event)));
       if (recomputedEvent !== event.digest) {
@@ -237,9 +240,9 @@ export function eventChainProblems(record: PredictionRecord): string[] {
         `Record ${id} event ${event.seq} declares unknown algorithm '${String(event.algorithm)}'`,
       );
     }
-    if (event.schemaVersion !== EVENT_SCHEMA_VERSION) {
+    if (!(SUPPORTED_SCHEMA_VERSIONS as readonly number[]).includes(event.schemaVersion)) {
       problems.push(
-        `Record ${id} event ${event.seq} declares unknown schema version '${String(event.schemaVersion)}'`,
+        `Record ${id} event ${event.seq} declares schema version '${String(event.schemaVersion)}', which this build cannot verify`,
       );
     }
     const scope = event.scope as EventDigestScope | undefined;
@@ -306,11 +309,15 @@ export function temporalProblems(record: PredictionRecord): string[] {
     .filter((time) => !Number.isNaN(time));
   if (recordedTimes.length !== events.length) return problems;
 
+  // The per-event rule below already forces recordedAt > occurredAt for every
+  // event. A record-wide version of the same inequality would wrongly reject a
+  // legitimate mixed chain, where a migrated event dated in the past sits next
+  // to an observed event recorded today.
   const latestOccurrence = Math.max(...events.map((event) => Date.parse(event.occurredAt)));
-  const earliestRecording = Math.min(...recordedTimes);
-  if (earliestRecording <= latestOccurrence) {
+  const latestRecording = Math.max(...recordedTimes);
+  if (latestRecording <= latestOccurrence) {
     problems.push(
-      `Record ${id} claims an event was recorded at or before the latest moment it records`,
+      `Record ${id} claims its chain was recorded at or before the latest moment it records`,
     );
   }
 
@@ -331,10 +338,11 @@ export function temporalProblems(record: PredictionRecord): string[] {
     }
   }
 
-  const migrated = events.filter((event) => (event as { origin?: unknown }).origin === 'migrated');
-  if (migrated.length > 0 && migrated.length !== events.length) {
-    problems.push(`Record ${id} mixes migrated and observed events in one chain`);
-  }
+  // Mixed chains are allowed on purpose. A migrated record that is genuinely
+  // resolved later must be able to record that resolution as `observed`; forcing
+  // it to stay `migrated` would require mislabelling a contemporaneous event,
+  // which is the dishonesty this field exists to prevent. Each event declares its
+  // own origin, and each declaration is covered by that event's digest.
 
   return problems;
 }

@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { predictionRecords } from './records';
 import {
+  appendEvent,
   canonicalize,
   eventEnvelope,
   legacyPayloadShape,
@@ -170,9 +171,89 @@ describe('the publication link is mandatory', () => {
     };
     expect(
       (await validateArchive(archiveWith(wrongSchema))).some((p) =>
-        p.includes('unknown schema version'),
+        p.includes('cannot verify'),
       ),
     ).toBe(true);
+  });
+});
+
+describe('appending to a valid chain', () => {
+  it('5. adds an event without altering the payload or earlier events', async () => {
+    // Use a record sealed under the modern scope: its digest covers only the
+    // sealed payload, so a resolution cannot move it. See the known limitation
+    // below for why a `legacy-record` record cannot do this.
+    const open = predictionRecords.find((record) => record.id === 'ORC-2025-0001')!;
+    // Build a coherent modern record: payload scope, payload digest and the
+    // publication event that names it must all agree before anything is appended.
+    const seeded: PredictionRecord = {
+      ...open,
+      integrity: { ...open.integrity, payloadScope: 'sealed-payload' },
+    };
+    seeded.integrity.digest = await recompute(seeded);
+    const modern = await rebuildChain({
+      ...seeded,
+      events: seeded.events.map((event) => ({
+        ...event,
+        body: { ...event.body, payloadDigest: seeded.integrity.digest, payloadScope: 'sealed-payload' as const },
+      })),
+    });
+
+    const payloadBefore = canonicalize(sealedPayload(modern));
+    const eventBefore = JSON.stringify(modern.events[0]);
+    const digestBefore = modern.integrity.digest;
+
+    const draft: RecordEvent = {
+      seq: 'e1',
+      kind: 'resolved',
+      occurredAt: '2029-01-01T00:00:00.000Z',
+      body: { outcome: 'yes', basis: 'fixture', note: 'fixture', evidenceIds: [] },
+      recordedAt: '2029-01-02T00:00:00.000Z',
+      origin: 'observed',
+      algorithm: 'sha256',
+      schemaVersion: 2,
+      scope: 'event-envelope',
+      digest: '0'.repeat(64),
+      prevDigest: modern.events[0].digest,
+    };
+    draft.digest = await sha256Hex(canonicalize(eventEnvelope(draft)));
+
+    const appended = appendEvent(modern, draft);
+
+    expect(canonicalize(sealedPayload(appended))).toBe(payloadBefore);
+    expect(appended.integrity.digest).toBe(digestBefore);
+    expect(JSON.stringify(appended.events[0])).toBe(eventBefore);
+    expect(appended.events[0].digest).toBe(modern.events[0].digest);
+    expect(appended.events).toHaveLength(2);
+    expect(await validateArchive(archiveWith(appended))).toEqual([]);
+  });
+
+  it('5b. a legacy-record digest moves when a resolution is appended, by construction', async () => {
+    // Honest assertion of a real limit rather than a silent gap. The legacy
+    // digest covers status and resolution, so recording an outcome changes the
+    // bytes it was computed over. No migration can undo that without either
+    // re-sealing (forbidden) or rewriting history (dishonest).
+    const open = predictionRecords.find((record) => record.id === 'ORC-2025-0001')!;
+    expect(open.integrity.payloadScope).toBe('legacy-record');
+
+    const withResolution: PredictionRecord = {
+      ...open,
+      events: [
+        ...open.events,
+        {
+          ...open.events[0],
+          seq: 'e1',
+          kind: 'resolved',
+          body: { outcome: 'yes', basis: 'x', note: 'x', evidenceIds: [] },
+        },
+      ],
+    };
+
+    // The sealed payload is untouched...
+    expect(canonicalize(sealedPayload(withResolution))).toBe(
+      canonicalize(sealedPayload(open)),
+    );
+    // ...but the legacy digest it declares can no longer reproduce.
+    expect(await recompute(withResolution)).not.toBe(withResolution.integrity.digest);
   });
 });
 

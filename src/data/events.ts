@@ -142,25 +142,47 @@ function legacyLifecycle(record: PredictionRecord): {
    Event envelope and chain
    ------------------------------------------------------------------------- */
 
-/** The scheme version this build writes and accepts. */
-export const EVENT_SCHEMA_VERSION = 1 as const;
+/**
+ * The scheme version this build writes and accepts.
+ *
+ * v2 moved `recordedAt` and `origin` *inside* the hashed envelope. Under v1 they
+ * sat outside it, which meant an event could be relabelled from `migrated` to
+ * `observed` — or given a different recording date — without changing its
+ * digest. That is a provenance claim, and an unprotected provenance claim is
+ * worse than none: it looks like evidence.
+ *
+ * Bumping the version was the only honest way to close this. v1 digests are not
+ * silently reinterpreted as v2: the version is part of the hashed envelope, so a
+ * v1 event verifies under v1 rules and a v2 event under v2 rules, and the
+ * validator rejects any version it does not implement.
+ */
+export const EVENT_SCHEMA_VERSION = 2 as const;
+
+/** Every schema version this build can verify. */
+export const SUPPORTED_SCHEMA_VERSIONS = [2] as const;
 
 /** The only digest algorithm this build writes and accepts. */
 export const EVENT_ALGORITHM = 'sha256' as const;
 
 /**
- * The part of an event that its digest covers, declarations included.
+ * The part of an event that its digest covers.
  *
- * `schema` and `algorithm` are inside the hash on purpose: a verifier does not
- * have to guess which scheme produced a digest, and it cannot be silently
- * reinterpreted under a different one. `scope` is there for the same reason —
- * it states which bytes were hashed instead of leaving it to convention.
+ * Everything that is a *claim* is inside the hash, including the two fields that
+ * describe how the event came to be here:
  *
- * `recordedAt` and `origin` are deliberately *outside* the envelope. They
- * describe the archive's handling of an event, not the occurrence it records. A
- * migrated event whose `recordedAt` was later established more precisely would
- * otherwise force every digest in the chain to be rebuilt, which is exactly the
- * rewrite this model forbids.
+ * - `recordedAt` — when this event was written into the archive;
+ * - `origin`    — whether it was observed while it happened or migrated later.
+ *
+ * They were outside the envelope in schema 1, on the argument that they describe
+ * the archive's handling of an event rather than the occurrence. That argument
+ * was wrong: `origin: 'observed'` is precisely a claim that the hash existed
+ * while the thing happened, so leaving it editable let an attacker convert a
+ * migrated chain into an apparently contemporaneous one without changing a
+ * single digest.
+ *
+ * `schema` and `algorithm` are inside for a related reason: a verifier must not
+ * have to guess which rules produced a digest, and cannot reinterpret one scheme
+ * as another.
  */
 export interface EventEnvelope {
   schema: string;
@@ -169,6 +191,8 @@ export interface EventEnvelope {
   seq: string;
   kind: RecordEventKind;
   occurredAt: string;
+  recordedAt: string;
+  origin: EventOrigin;
   body: RecordEventBody;
   prevDigest: string | null;
 }
@@ -181,6 +205,8 @@ export function eventEnvelope(event: RecordEvent): EventEnvelope {
     seq: event.seq,
     kind: event.kind,
     occurredAt: event.occurredAt,
+    recordedAt: event.recordedAt,
+    origin: event.origin,
     body: event.body,
     prevDigest: event.prevDigest,
   };
@@ -189,7 +215,7 @@ export function eventEnvelope(event: RecordEvent): EventEnvelope {
 /**
  * Bytes the event digest covers.
  *
- * The envelope already contains `body.payloadDigest`, so the `published`
+ * The envelope contains `body.payloadDigest`, so the `published`
  * event's digest commits to the payload transitively: altering the payload
  * alters the digest the event names, which is inside a hash that cannot change
  * without rebuilding the whole chain. That is why its declared scope is
@@ -252,9 +278,17 @@ export function nextEvent(
 
   assertTransitionAllowed(events, kind);
 
+  const previousEvent = events[events.length - 1];
   if (Date.parse(recordedAt) <= Date.parse(occurredAt)) {
     throw new AppendError(
       'An event cannot be recorded at or before the moment it records.',
+    );
+  }
+  // recordedAt must not go backwards along the chain, or the archive would
+  // claim to have written a later event before an earlier one.
+  if (previousEvent && Date.parse(recordedAt) < Date.parse(previousEvent.recordedAt)) {
+    throw new AppendError(
+      'An event cannot be recorded before the event that precedes it.',
     );
   }
   if (Date.parse(occurredAt) < Date.parse(record.publishedAt)) {

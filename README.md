@@ -336,16 +336,27 @@ An event digest is never interpreted by convention. Each event states:
 | Field | Meaning |
 |---|---|
 | `algorithm` | `sha256` — the only value accepted |
-| `schemaVersion` | `1` — bumping it changes every event digest |
+| `schemaVersion` | `2` — bumping it changes every event digest |
 | `scope` | `event-envelope`, or `event-envelope+published-payload` for `e0` |
 | `origin` | `observed` or `migrated` |
 | `occurredAt` | the date the event is *declared* to have happened |
 | `recordedAt` | when the event was written into this archive |
 
 An unknown algorithm, schema version or scope is a validation failure, not a fallback.
-`recordedAt` and `origin` sit deliberately *outside* the hashed envelope: they describe the
-archive's handling of an event, not the thing it records, and a more precise `recordedAt`
-must not force a chain rebuild.
+
+**Everything in that table is inside the hash, including provenance.** Schema 1 left
+`recordedAt` and `origin` outside the envelope, on the argument that they describe the
+archive's handling of an event rather than the occurrence. That was wrong: `origin:
+'observed'` is precisely a claim that the hash existed while the thing happened, so leaving
+it editable let a migrated chain be relabelled as a contemporaneous one without changing a
+single digest. In schema 2, changing either field — or both — breaks the event's digest and
+the chain, and `npm run validate` rejects it.
+
+The version had to move for this to be honest. v1 digests are not silently reinterpreted as
+v2: the version is part of the hashed envelope, so a verifier must implement the version an
+event declares, and the validator rejects anything it cannot implement rather than skipping
+it. Payload digests are unaffected — they never covered events — so all ten remain byte for
+byte identical.
 
 ### Migrated versus observed
 
@@ -356,10 +367,15 @@ Every event in this repository is `origin: 'migrated'`. The chains were construc
 - `recordedAt` is the moment the restatement was written;
 - neither is a timestamp proving the hashes existed at `occurredAt`.
 
-The validator enforces that inequality per record: a chain must be recorded strictly later
-than the latest moment it records. That is provable from the data without inventing a
-timestamp. A migrated event is never presented as a temporal proof, and the record page
-says so explicitly.
+The validator enforces the inequality per event: each was recorded strictly later than the
+moment it records, and `recordedAt` never goes backwards along a chain. That is provable
+from the data without inventing a timestamp. A migrated event is never presented as a
+temporal proof, and the record page says so explicitly.
+
+Mixed chains are allowed. A migrated record resolved *later*, for real, must record that
+resolution as `observed`; forcing the whole chain to stay `migrated` would mean mislabelling
+a contemporaneous event, which is the dishonesty this field exists to prevent. Each event
+declares its own provenance and that declaration is covered by its own digest.
 
 ```bash
 npm run validate   # shape, uniqueness, and event-chain continuity

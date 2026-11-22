@@ -75,9 +75,12 @@ describe('journey: reading the archive', () => {
     // The original probability survives the resolution.
     expect(screen.getAllByText('71%').length).toBeGreaterThan(0);
     expect(screen.getByRole('heading', { name: /^resolution$/i })).toBeInTheDocument();
-    expect(
-      await screen.findByText(/digest matches/i, {}, { timeout: 3000 }),
-    ).toBeInTheDocument();
+    // The payload, the link and the chain all verify for this record.
+    await screen.findByText(/reproduces the digest the record declares/i, {}, { timeout: 3000 });
+    const panel = screen.getByRole('region', { name: /integrity record/i });
+    const text = panel.textContent ?? '';
+    expect(text).toMatch(/Sealed payload verified/);
+    expect(text).toMatch(/Event chain verified/);
   });
 
   it('tells a visitor plainly when a record is illustrative', async () => {
@@ -95,15 +98,21 @@ describe('journey: verifying a record', () => {
     launch('/predictions/ORC-2025-0004');
     await screen.findByRole('heading', { level: 1, name: /lunar south pole/i });
 
-    expect(await screen.findByText(/digest matches/i, {}, { timeout: 3000 })).toBeInTheDocument();
-    // The panel must not overclaim.
+    // Verification is reported per layer, never as one undifferentiated pass.
+    await screen.findByText(/reproduces the digest the record declares/i, {}, { timeout: 3000 });
+    const panel = screen.getByRole('region', { name: /integrity record/i });
+    const text = panel.textContent ?? '';
+    expect(text).toMatch(/Sealed payload verified/);
+    expect(text).toMatch(/Publication event verified/);
+    expect(text).toMatch(/Event chain verified/);
+
     // The panel must not overclaim: it says what the digest does not prove.
-    expect(screen.getByText(/neither case proves the forecast was correct/i)).toBeInTheDocument();
-    expect(
-      screen.getByText(/no external witness or transparency log has countersigned/i),
-    ).toBeInTheDocument();
+    expect(text).toMatch(/neither case proves the forecast was correct/i);
+    expect(text).toMatch(/no external witness or transparency log has countersigned/i);
     // And it names which payload definition the digest actually covers.
-    expect(screen.getByText(/whole record, outcome included/i)).toBeInTheDocument();
+    expect(text).toMatch(/whole record, outcome included/i);
+    // Consistency is explicitly distinguished from third-party attestation.
+    expect(text).toMatch(/not third-party attestation/i);
   });
 });
 

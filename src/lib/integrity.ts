@@ -30,7 +30,7 @@ import {
 import { hasWebCrypto, sha256Hex } from '@/data/hash';
 import {
   EVENT_ALGORITHM,
-  EVENT_SCHEMA_VERSION,
+  SUPPORTED_SCHEMA_VERSIONS,
 } from '@/data/events';
 import { eventChainProblems, publishedLinkProblems } from '@/data/validate';
 
@@ -120,7 +120,7 @@ export async function verifyEventChain(record: PredictionRecord): Promise<ChainV
       broken.push(event.seq);
       continue;
     }
-    if (event.schemaVersion !== EVENT_SCHEMA_VERSION) {
+    if (!(SUPPORTED_SCHEMA_VERSIONS as readonly number[]).includes(event.schemaVersion)) {
       broken.push(event.seq);
       continue;
     }
@@ -139,7 +139,22 @@ export async function verifyEventChain(record: PredictionRecord): Promise<ChainV
    Full verification
    ------------------------------------------------------------------------- */
 
+/**
+ * Outcome of one check.
+ *
+ * `unavailable` is a distinct state on purpose. Three states would tempt a
+ * caller to map "could not run" onto "passed"; four make that a deliberate act.
+ */
+export type CheckStatus = 'pass' | 'fail' | 'unavailable';
+
+export interface CheckResult {
+  status: CheckStatus;
+  /** What was compared, in words. Always present. */
+  detail: string;
+}
+
 export interface RecordVerification {
+  /** True only when every check passed. */
   ok: boolean;
   /** Human-readable failures, empty when `ok`. */
   problems: string[];
@@ -147,6 +162,13 @@ export interface RecordVerification {
   computedDigest: string | null;
   /** Whether the recomputed digest equals `integrity.digest`. */
   digestMatches: boolean;
+  /** The four checks, reported separately so a UI cannot collapse them. */
+  checks: {
+    payload: CheckResult;
+    publicationLink: CheckResult;
+    eventChain: CheckResult;
+    anchoring: CheckResult;
+  };
 }
 
 /**
@@ -172,11 +194,21 @@ export async function verifyRecordCompletely(
   let computedDigest: string | null = null;
 
   if (!hasWebCrypto()) {
+    const unavailable: CheckResult = {
+      status: 'unavailable',
+      detail: 'Web Crypto is unavailable in this browser, so no digest could be recomputed.',
+    };
     return {
       ok: false,
       problems: ['Web Crypto is unavailable, so nothing could be verified.'],
       computedDigest: null,
       digestMatches: false,
+      checks: {
+        payload: unavailable,
+        publicationLink: unavailable,
+        eventChain: unavailable,
+        anchoring: unavailable,
+      },
     };
   }
 
@@ -193,8 +225,13 @@ export async function verifyRecordCompletely(
     );
   }
 
-  problems.push(...publishedLinkProblems(record, digestMatches, computedDigest));
-  problems.push(...eventChainProblems(record));
+  const linkProblems = [
+    ...publishedLinkProblems(record, digestMatches, computedDigest),
+  ];
+  problems.push(...linkProblems);
+
+  const structuralProblems = eventChainProblems(record);
+  problems.push(...structuralProblems);
 
   const chain = await verifyEventChain(record);
   if (!chain.ok) {
@@ -210,5 +247,63 @@ export async function verifyRecordCompletely(
     }
   }
 
-  return { ok: problems.length === 0, problems, computedDigest, digestMatches };
+  const payloadCheck: CheckResult =
+    computedDigest === null
+      ? { status: 'unavailable', detail: 'The payload digest could not be recomputed.' }
+      : digestMatches
+        ? {
+            status: 'pass',
+            detail: 'The sealed payload reproduces the digest the record declares.',
+          }
+        : {
+            status: 'fail',
+            detail: 'The sealed payload does not reproduce the digest the record declares.',
+          };
+
+  const publicationCheck: CheckResult =
+    linkProblems.length === 0
+      ? {
+          status: 'pass',
+          detail: 'The publication event names the digest of the shipped payload.',
+        }
+      : {
+          status: 'fail',
+          detail: linkProblems[0],
+        };
+
+  const chainFailed = !chain.ok || structuralProblems.length > 0;
+  const eventChainCheck: CheckResult = chainFailed
+    ? {
+        status: 'fail',
+        detail:
+          [...structuralProblems, ...chain.broken.map((seq) => `event ${seq} digest does not reproduce`), ...chain.mislinked.map((seq) => `event ${seq} link is wrong`)][0] ??
+          'The event chain is not consistent.',
+      }
+    : {
+        status: 'pass',
+        detail: `All ${record.events.length} event digest(s) and link(s) reproduce.`,
+      };
+
+  // Anchoring is not a pass/fail check: no external witness exists yet, so a
+  // false value is the honest state rather than a failure. It is separate so a
+  // reader cannot mistake internal consistency for third-party attestation.
+  const anchoringCheck: CheckResult = record.integrity.anchored
+    ? { status: 'pass', detail: 'An external witness has countersigned this digest.' }
+    : {
+        status: 'unavailable',
+        detail: 'No external witness or transparency log has countersigned this digest.',
+      };
+
+  return {
+    ok: problems.length === 0,
+    problems,
+    computedDigest,
+    digestMatches,
+    checks: {
+      payload: payloadCheck,
+      publicationLink: publicationCheck,
+      eventChain: eventChainCheck,
+      anchoring: anchoringCheck,
+    },
+  };
 }

@@ -183,7 +183,7 @@ describe('sealed payload is frozen at publication', () => {
           recordedAt: '2029-01-02T00:00:00.000Z',
           origin: 'observed' as const,
           algorithm: 'sha256' as const,
-          schemaVersion: 1 as const,
+          schemaVersion: 2 as const,
           scope: 'event-envelope' as const,
           digest: 'f'.repeat(64),
           prevDigest: record.events[0].digest,

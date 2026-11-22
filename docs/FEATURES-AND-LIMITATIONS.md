@@ -253,3 +253,15 @@ accountable forecasting should not begin with an inflated account of itself.
 30. **`recordedAt` is per record, not per event.** All events of one record share the migration
     timestamp in the current data. The validator checks the ordering inequality, not an exact
     per-event time, because no such precision was ever recorded.
+31. **A `legacy-record` record that is still open cannot be resolved.** Its digest covers
+    `status` and `resolution`, so recording an outcome changes the bytes it was computed over
+    and the stored digest stops reproducing. Seven shipped records are in this state
+    (0001–0006, 0008). This is not a bug introduced by the event model — it is the original
+    sealing defect, and no migration can undo it without either re-sealing (forbidden) or
+    rewriting history (dishonest). The available paths are: (a) publish a resolution as a new
+    revision, sealed under the modern scope; (b) document the record as closed-by-migration
+    and never resolve it; (c) treat the legacy digest as historical and rely on the event
+    chain alone. This needs a product decision, not a code change.
+32. **`npm run validate` cannot detect a full internal rebuild.** Recomputing every payload
+    digest, the publication event and the whole chain produces a consistent archive that
+    passes. Only the git history contradicts it. Closing this needs an external anchor.

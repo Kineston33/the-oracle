@@ -158,11 +158,26 @@ describe('record detail', () => {
     expect(screen.getByText(/integrity record/i)).toBeInTheDocument();
   });
 
-  it('verifies the digest in the browser and reports a match', async () => {
+  it('verifies the payload, the publication link and the event chain separately', async () => {
     renderApp('/predictions/ORC-2025-0001');
-    expect(
-      await screen.findByText(/digest matches/i, {}, { timeout: 3000 }),
-    ).toBeInTheDocument();
+
+    // Four checks, each reported on its own — the panel is not allowed to
+    // collapse them into a single badge.
+    await screen.findByText(/reproduces the digest the record declares/i, {}, { timeout: 3000 });
+    const panel = await screen.findByRole('region', { name: /integrity record/i });
+    const text = panel.textContent ?? '';
+    for (const label of ['Sealed payload', 'Publication event', 'Event chain', 'External anchoring']) {
+      expect(text).toContain(label);
+    }
+    // Each one states its own outcome rather than a shared verdict.
+    expect(text).toMatch(/Sealed payload verified/);
+    expect(text).toMatch(/Publication event verified/);
+    expect(text).toMatch(/Event chain verified/);
+    expect(text).toMatch(/External anchoring not verified/);
+
+    // And the verdict must stay qualified: consistency is not attestation.
+    expect(text).toMatch(/all verify against the shipped bytes/i);
+    expect(text).toMatch(/not third-party attestation/i);
   });
 
   it('states plainly that the record is not externally anchored', async () => {

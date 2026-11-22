@@ -1,14 +1,18 @@
 import { useEffect, useState } from 'react';
-import { Check, CircleAlert, Copy, Fingerprint, Loader } from 'lucide-react';
+import { Check, CircleAlert, Copy, Fingerprint, Loader, Minus } from 'lucide-react';
 import type { PredictionRecord } from '@/data/types';
-import { shortDigest, verifyRecordDigest } from '@/lib/integrity';
 import { formatDate } from '@/lib/format';
+import {
+  shortDigest,
+  verifyRecordCompletely,
+  type CheckResult,
+  type RecordVerification,
+} from '@/lib/integrity';
 import styles from './IntegrityPanel.module.css';
 
 type VerificationState =
   | { status: 'checking' }
-  | { status: 'match' }
-  | { status: 'mismatch'; computed: string }
+  | { status: 'done'; result: RecordVerification }
   | { status: 'error'; message: string };
 
 /** What the stored digest actually covers, in words a reader can act on. */
@@ -17,11 +21,55 @@ const SCOPE_LABEL: Record<PredictionRecord['integrity']['payloadScope'], string>
   'legacy-record': 'Whole record, outcome included',
 };
 
+interface CheckRowProps {
+  label: string;
+  check: CheckResult;
+  /** Anchoring is reported separately: not-yet-anchored is a state, not a fault. */
+  neutralWhenUnavailable?: boolean;
+}
+
+function CheckRow({ label, check, neutralWhenUnavailable = false }: CheckRowProps) {
+  const tone =
+    check.status === 'pass'
+      ? styles.match
+      : check.status === 'fail'
+        ? styles.mismatch
+        : neutralWhenUnavailable
+          ? styles.checking
+          : styles.mismatch;
+
+  return (
+    <li className={[styles.checkRow, tone].join(' ')}>
+      <span className={styles.checkIcon} aria-hidden="true">
+        {check.status === 'pass' ? (
+          <Check size={13} />
+        ) : check.status === 'fail' ? (
+          <CircleAlert size={13} />
+        ) : (
+          <Minus size={13} />
+        )}
+      </span>
+      <span>
+        <span className={styles.checkLabel}>{label}</span>{' '}
+        {check.status === 'pass' ? 'verified' : check.status === 'fail' ? 'failed' : 'not verified'}
+        {' — '}
+        {check.detail}
+      </span>
+    </li>
+  );
+}
+
 /**
- * Recomputes the record's SHA-256 digest in the browser and compares it with the
- * digest shipped in the record. This proves the payload has not changed since it
- * was sealed in the repository. It does NOT prove any external party witnessed
- * the seal, and the panel says so.
+ * Public verification panel.
+ *
+ * Verification goes through `verifyRecordCompletely`, not a payload-only check,
+ * so the panel can never report integrity while the event chain or the
+ * publication link is broken. The four checks are shown separately and no
+ * overall "verified" badge appears unless all of them that *can* pass, do.
+ *
+ * Anchoring is deliberately not folded into the verdict. Nothing in this build is
+ * externally witnessed, so claiming an overall pass would imply a third-party
+ * attestation that does not exist.
  */
 export function IntegrityPanel({ record }: { record: PredictionRecord }) {
   const [state, setState] = useState<VerificationState>({ status: 'checking' });
@@ -39,20 +87,15 @@ export function IntegrityPanel({ record }: { record: PredictionRecord }) {
     let cancelled = false;
     setState({ status: 'checking' });
 
-    verifyRecordDigest(record)
-      .then((computed) => {
-        if (cancelled) return;
-        setState(
-          computed === record.integrity.digest
-            ? { status: 'match' }
-            : { status: 'mismatch', computed },
-        );
+    verifyRecordCompletely(record)
+      .then((result) => {
+        if (!cancelled) setState({ status: 'done', result });
       })
       .catch((error: unknown) => {
         if (cancelled) return;
         setState({
           status: 'error',
-          message: error instanceof Error ? error.message : 'Digest unavailable',
+          message: error instanceof Error ? error.message : 'Verification unavailable',
         });
       });
 
@@ -71,6 +114,9 @@ export function IntegrityPanel({ record }: { record: PredictionRecord }) {
     }
   };
 
+  const result = state.status === 'done' ? state.result : null;
+  const chainIntact = result?.checks.eventChain.status === 'pass';
+
   return (
     <section className={styles.panel} aria-labelledby="integrity-title">
       <div className={styles.head}>
@@ -81,7 +127,9 @@ export function IntegrityPanel({ record }: { record: PredictionRecord }) {
           <h2 id="integrity-title" className={styles.title}>
             Integrity record
           </h2>
-          <p className={styles.subtitle}>SHA-256 over the canonical payload</p>
+          <p className={styles.subtitle}>
+            SHA-256 over the canonical payload, plus a hash-linked event chain
+          </p>
         </div>
       </div>
 
@@ -138,62 +186,76 @@ export function IntegrityPanel({ record }: { record: PredictionRecord }) {
         {state.status === 'checking' ? (
           <p className={[styles.verifyLine, styles.checking].join(' ')}>
             <Loader size={13} className={styles.spin} aria-hidden="true" />
-            Recomputing the digest in your browser…
-          </p>
-        ) : null}
-
-        {state.status === 'match' ? (
-          <p className={[styles.verifyLine, styles.match].join(' ')}>
-            <Check size={13} aria-hidden="true" />
-            Digest matches. This payload is unchanged since it was sealed.
-          </p>
-        ) : null}
-
-        {state.status === 'mismatch' ? (
-          <p className={[styles.verifyLine, styles.mismatch].join(' ')}>
-            <CircleAlert size={13} aria-hidden="true" />
-            Digest does not match the record. Computed{' '}
-            <code className="mono">{shortDigest(state.computed)}</code>.
+            Recomputing the payload digest and every event digest in your browser…
           </p>
         ) : null}
 
         {state.status === 'error' ? (
           <p className={[styles.verifyLine, styles.error].join(' ')}>
             <CircleAlert size={13} aria-hidden="true" />
-            Verification unavailable in this browser: {state.message}
+            Verification unavailable in this browser: {state.message}. Nothing has been
+            verified.
           </p>
+        ) : null}
+
+        {result ? (
+          <>
+            <ul className={styles.checks}>
+              <CheckRow label="Sealed payload" check={result.checks.payload} />
+              <CheckRow label="Publication event" check={result.checks.publicationLink} />
+              <CheckRow label="Event chain" check={result.checks.eventChain} />
+              <CheckRow label="External anchoring" check={result.checks.anchoring} neutralWhenUnavailable />
+            </ul>
+
+            {result.ok ? (
+              <p className={[styles.verifyLine, styles.match].join(' ')}>
+                <Check size={13} aria-hidden="true" />
+                Payload, publication link and event chain all verify against the shipped
+                bytes. This is internal consistency; it is{' '}
+                <strong>not</strong> third-party attestation.
+              </p>
+            ) : (
+              <p className={[styles.verifyLine, styles.mismatch].join(' ')}>
+                <CircleAlert size={13} aria-hidden="true" />
+                Verification failed. This record is not internally consistent, so nothing
+                here can be relied on as a seal.
+              </p>
+            )}
+          </>
         ) : null}
       </div>
 
       {chainOrigin !== 'observed' && migratedAt ? (
         <p className={styles.caveat}>
-          <strong>Event chain migration.</strong> The events below record dates this
+          <strong>Event chain migration.</strong> The events above record dates this
           archive already held. They were written into this event model on{' '}
-          {formatDate(migratedAt)}, not on the dates they describe, so they are
-          declared <em>migrated</em>. A migrated event is a faithful restatement of a
-          recorded date, <strong>not</strong> a witness that anything happened on it,
-          and not a timestamp proving when these hashes existed.
+          {formatDate(migratedAt)}, not on the dates they describe, so they are declared{' '}
+          <em>migrated</em>. A migrated event is a faithful restatement of a recorded
+          date, <strong>not</strong> a witness that anything happened on it, and not a
+          timestamp proving when these hashes existed. Both fields are covered by each
+          event&apos;s digest, so neither can be changed without breaking the chain.
         </p>
       ) : null}
 
       <p className={styles.caveat}>
         {record.integrity.payloadScope === 'legacy-record' ? (
           <>
-            This record was sealed before the payload/event split, so its digest
-            covers the outcome as well. A matching digest proves the record is
-            unchanged since it was sealed — it does <strong>not</strong> prove the
-            probability was fixed before the outcome was known.
+            This record was sealed before the payload/event split, so its digest covers the
+            outcome as well. A matching digest proves the record is unchanged since it was
+            sealed — it does <strong>not</strong> prove the probability was fixed before the
+            outcome was known.
           </>
         ) : (
           <>
-            A matching digest proves the published content has not changed since
-            sealing. Resolutions and annulments are appended as separate events and
-            never alter it.
+            A matching digest proves the published content has not changed since sealing.
+            Resolutions and annulments are appended as separate events and never alter it.
           </>
         )}{' '}
         Neither case proves the forecast was correct, and neither is yet a public
-        attestation: no external witness or transparency log has countersigned this
-        hash.
+        attestation: no external witness or transparency log has countersigned this hash.
+        {chainIntact === false
+          ? ' The event chain failed verification, so the record is not shown as intact.'
+          : ''}
       </p>
     </section>
   );

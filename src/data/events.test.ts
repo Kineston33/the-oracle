@@ -13,6 +13,7 @@ import {
   recomputeDeclaredDigest,
 } from './validate';
 import { deriveLifecycle } from './lifecycle';
+import { validateArchive } from './validate';
 import { predictionRecords } from './records';
 import { digestPayload, digestEvent, verifyEventChain } from '@/lib/integrity';
 import type { PredictionRecord, RecordEvent } from './types';
@@ -39,7 +40,7 @@ function resolutionEvent(prevDigest: string): RecordEvent {
     recordedAt: '2029-01-02T00:00:00.000Z',
     origin: 'observed',
     algorithm: 'sha256',
-    schemaVersion: 1,
+    schemaVersion: 2,
     scope: 'event-envelope',
     digest: 'a'.repeat(64),
     prevDigest,
@@ -300,8 +301,69 @@ describe('terminal transitions are final', () => {
     expect(event.origin).toBe('observed');
     expect(event.scope).toBe('event-envelope');
     expect(event.algorithm).toBe('sha256');
-    expect(event.schemaVersion).toBe(1);
+    expect(event.schemaVersion).toBe(2);
   });
+});
+
+describe('provenance is protected by the digest', () => {
+  const record = predictionRecords.find((r) => r.id === 'ORC-2025-0007')!;
+  const event = record.events[0];
+
+  it('covers origin, so migrated cannot be relabelled as observed', async () => {
+    const relabelled: RecordEvent = { ...event, origin: 'observed' };
+    expect(await digestEvent(relabelled)).not.toBe(event.digest);
+  });
+
+  it('covers recordedAt, so the recording date cannot be moved', async () => {
+    const moved: RecordEvent = { ...event, recordedAt: '2026-01-01T00:00:00.000Z' };
+    expect(await digestEvent(moved)).not.toBe(event.digest);
+  });
+
+  it('covers both at once', async () => {
+    const both: RecordEvent = {
+      ...event,
+      origin: 'observed',
+      recordedAt: '2026-01-01T00:00:00.000Z',
+    };
+    expect(await digestEvent(both)).not.toBe(event.digest);
+  });
+
+  it('is rejected by full validation, not only by the digest', async () => {
+    for (const tampered of [
+      { ...event, origin: 'observed' as const },
+      { ...event, recordedAt: '2026-01-01T00:00:00.000Z' },
+      { ...event, origin: 'observed' as const, recordedAt: '2026-01-01T00:00:00.000Z' },
+    ]) {
+      const poisoned: PredictionRecord = {
+        ...record,
+        events: record.events.map((existing, index) =>
+          index === 0 ? (tampered as RecordEvent) : existing,
+        ),
+      };
+      const problems = await validateArchive(
+        [poisoned, ...predictionRecords.filter((r) => r.id !== record.id)],
+      );
+      expect(problems.some((p) => p.includes('does not reproduce'))).toBe(true);
+    }
+  });
+
+  it('keeps every shipped event marked migrated', () => {
+    for (const r of predictionRecords) {
+      for (const e of r.events) expect(e.origin, `${r.id}/${e.seq}`).toBe('migrated');
+    }
+  });
+
+  it('does not let a migrated event be recorded when it happened', () => {
+    // The inequality that makes the migration honest: the chain is provably
+    // later than the dates it restates.
+    for (const e of eventChainOf(record)) {
+      expect(Date.parse(e.recordedAt)).toBeGreaterThan(Date.parse(e.occurredAt));
+    }
+  });
+
+  function eventChainOf(r: PredictionRecord) {
+    return r.events;
+  }
 });
 
 describe('event digests', () => {

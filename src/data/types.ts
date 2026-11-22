@@ -258,8 +258,14 @@ export interface RecordEvent {
    * value is a validation failure, not a fallback.
    */
   algorithm: 'sha256';
-  /** Scheme version of this envelope. Bumping it changes every event digest. */
-  schemaVersion: 1;
+  /**
+   * Scheme version of this envelope. Bumping it changes every event digest.
+   *
+   * Version 2 moved `recordedAt` and `origin` inside the hash. A verifier must
+   * implement the version an event declares; an unknown version is a failure,
+   * never a silent skip.
+   */
+  schemaVersion: 2;
   /**
    * Exactly what `digest` covers.
    *
