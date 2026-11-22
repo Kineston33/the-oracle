@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react';
 import { Check, CircleAlert, Copy, Fingerprint, Loader } from 'lucide-react';
 import type { PredictionRecord } from '@/data/types';
-import { digestRecord, shortDigest } from '@/lib/integrity';
+import { shortDigest, verifyRecordDigest } from '@/lib/integrity';
 import styles from './IntegrityPanel.module.css';
 
 type VerificationState =
@@ -9,6 +9,12 @@ type VerificationState =
   | { status: 'match' }
   | { status: 'mismatch'; computed: string }
   | { status: 'error'; message: string };
+
+/** What the stored digest actually covers, in words a reader can act on. */
+const SCOPE_LABEL: Record<PredictionRecord['integrity']['payloadScope'], string> = {
+  'sealed-payload': 'Content fixed at publication',
+  'legacy-record': 'Whole record, outcome included',
+};
 
 /**
  * Recomputes the record's SHA-256 digest in the browser and compares it with the
@@ -24,7 +30,7 @@ export function IntegrityPanel({ record }: { record: PredictionRecord }) {
     let cancelled = false;
     setState({ status: 'checking' });
 
-    digestRecord(record)
+    verifyRecordDigest(record)
       .then((computed) => {
         if (cancelled) return;
         setState(
@@ -84,6 +90,10 @@ export function IntegrityPanel({ record }: { record: PredictionRecord }) {
           <dd className="mono">{record.integrity.channel}</dd>
         </div>
         <div className={styles.field}>
+          <dt>Digest covers</dt>
+          <dd className="mono">{SCOPE_LABEL[record.integrity.payloadScope]}</dd>
+        </div>
+        <div className={styles.field}>
           <dt>Externally anchored</dt>
           <dd className={styles.unanchored}>
             {record.integrity.anchored ? 'Yes' : 'No — not yet'}
@@ -137,9 +147,23 @@ export function IntegrityPanel({ record }: { record: PredictionRecord }) {
       </div>
 
       <p className={styles.caveat}>
-        A matching digest proves the record was not altered after sealing. It does
-        not prove the forecast was correct, and it is not yet a public attestation:
-        no external witness or transparency log has countersigned this hash.
+        {record.integrity.payloadScope === 'legacy-record' ? (
+          <>
+            This record was sealed before the payload/event split, so its digest
+            covers the outcome as well. A matching digest proves the record is
+            unchanged since it was sealed — it does <strong>not</strong> prove the
+            probability was fixed before the outcome was known.
+          </>
+        ) : (
+          <>
+            A matching digest proves the published content has not changed since
+            sealing. Resolutions and annulments are appended as separate events and
+            never alter it.
+          </>
+        )}{' '}
+        Neither case proves the forecast was correct, and neither is yet a public
+        attestation: no external witness or transparency log has countersigned this
+        hash.
       </p>
     </section>
   );

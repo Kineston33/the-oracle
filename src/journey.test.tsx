@@ -97,8 +97,13 @@ describe('journey: verifying a record', () => {
 
     expect(await screen.findByText(/digest matches/i, {}, { timeout: 3000 })).toBeInTheDocument();
     // The panel must not overclaim.
-    expect(screen.getByText(/does not prove the forecast was correct/i)).toBeInTheDocument();
-    expect(screen.getByText(/no external witness or transparency log/i)).toBeInTheDocument();
+    // The panel must not overclaim: it says what the digest does not prove.
+    expect(screen.getByText(/neither case proves the forecast was correct/i)).toBeInTheDocument();
+    expect(
+      screen.getByText(/no external witness or transparency log has countersigned/i),
+    ).toBeInTheDocument();
+    // And it names which payload definition the digest actually covers.
+    expect(screen.getByText(/whole record, outcome included/i)).toBeInTheDocument();
   });
 });
 

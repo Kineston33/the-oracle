@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'vitest';
+import { deriveLifecycle } from './lifecycle';
 import {
   adjacentRecords,
   assertArchiveShape,
@@ -26,7 +27,8 @@ describe('filterRecords', () => {
 
   it('filters by status', () => {
     const resolved = filterRecords(predictionRecords, { status: 'resolved' });
-    expect(resolved.every((record) => record.status === 'resolved')).toBe(true);
+    expect(resolved.length).toBeGreaterThan(0);
+    expect(resolved.every((record) => deriveLifecycle(record).status === 'resolved')).toBe(true);
   });
 
   it('searches question text case-insensitively', () => {
@@ -45,7 +47,10 @@ describe('filterRecords', () => {
 
   it('combines category and status filters', () => {
     const both = filterRecords(predictionRecords, { category: 'science', status: 'resolved' });
-    expect(both.every((r) => r.category === 'science' && r.status === 'resolved')).toBe(true);
+    expect(both.length).toBeGreaterThan(0);
+    expect(
+      both.every((r) => r.category === 'science' && deriveLifecycle(r).status === 'resolved'),
+    ).toBe(true);
   });
 
   it('returns an empty array rather than throwing on no match', () => {
@@ -201,12 +206,16 @@ describe('published probability is frozen', () => {
   });
 
   it('leaves the published probability untouched once a record resolves', () => {
-    const resolved = predictionRecords.filter((record) => record.status === 'resolved');
+    const resolved = predictionRecords.filter(
+      (record) => deriveLifecycle(record).status === 'resolved',
+    );
     expect(resolved.length).toBeGreaterThan(0);
     for (const record of resolved) {
-      // The outcome exists beside the probability; it never replaces it.
-      expect(record.resolution).toBeDefined();
+      // The outcome exists beside the probability; it never replaces it, and it
+      // lives in the event chain rather than on the sealed payload.
+      expect(deriveLifecycle(record).resolution).toBeDefined();
       expect(typeof record.probability).toBe('number');
+      expect(record.events.some((event) => event.kind === 'resolved')).toBe(true);
     }
   });
 
@@ -342,15 +351,25 @@ describe('canonicalKey across scripts', () => {
 describe('validation module stays importable outside the bundle', () => {
   const source = readFileSync(resolve(process.cwd(), 'src/data/validate.ts'), 'utf8');
 
-  it('declares no runtime imports', () => {
+  it('declares no runtime dependency beyond the domain-free lifecycle module', () => {
     const runtimeImports = source
       .split('\n')
-      .filter((line) => /^import (?!type )/.test(line.trim()));
+      .filter((line) => /^import (?!type )/.test(line.trim()))
+      // lifecycle.ts is itself JSON-free and DOM-free; it is what makes derived
+      // status available to validation without pulling in the archive.
+      .filter((line) => !line.includes("'./lifecycle.ts'"));
+
     expect(runtimeImports).toEqual([]);
   });
 
   it('imports types only from the domain module', () => {
-    expect(source).toMatch(/import type \{ PredictionRecord \} from '\.\/types'/);
+    expect(source).toMatch(/import type \{[^}]*PredictionRecord[^}]*\} from '\.\/types\.ts'/);
+  });
+
+  it('keeps the lifecycle module free of JSON and the DOM', () => {
+    const lifecycle = readFileSync(resolve(process.cwd(), 'src/data/lifecycle.ts'), 'utf8');
+    expect(lifecycle).not.toMatch(/records\.json/);
+    expect(lifecycle).not.toMatch(/\bdocument\.|\bwindow\./);
   });
 
   it('does not reach for JSON data or the DOM', () => {

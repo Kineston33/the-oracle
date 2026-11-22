@@ -1,6 +1,7 @@
 import type { PredictionRecord } from '@/data/types';
 import { formatPercent } from '@/lib/format';
 import { STATUS_LABELS } from './Badge';
+import { deriveLifecycle } from '@/data/lifecycle';
 import styles from './ProbabilityDisplay.module.css';
 
 interface ProbabilityDisplayProps {
@@ -20,7 +21,8 @@ export function ProbabilityDisplay({
   size = 'md',
   showOutcome = true,
 }: ProbabilityDisplayProps) {
-  const { resolution, probability, status } = record;
+  const { probability } = record;
+  const { resolution, status } = deriveLifecycle(record);
   const corrected = resolution && status === 'resolved';
   const wasCorrect =
     corrected && resolution.outcome !== 'indeterminate'

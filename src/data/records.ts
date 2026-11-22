@@ -10,6 +10,8 @@
 
 import raw from './records.json';
 import type { ArchiveSummary, PredictionCategory, PredictionRecord } from './types';
+import type { PredictionStatus as PredictionLifecycleStatus } from './types';
+import { deriveLifecycle } from './lifecycle';
 
 export const predictionRecords = raw as PredictionRecord[];
 
@@ -40,7 +42,7 @@ export const CATEGORY_ORDER: PredictionCategory[] = [
 
 export interface RecordFilter {
   category?: PredictionCategory | 'all';
-  status?: PredictionRecord['status'] | 'all';
+  status?: PredictionLifecycleStatus | 'all';
   query?: string;
 }
 
@@ -65,7 +67,7 @@ export function filterRecords(
   const needle = query.trim().toLowerCase();
   return records.filter((record) => {
     if (category !== 'all' && record.category !== category) return false;
-    if (status !== 'all' && record.status !== status) return false;
+    if (status !== 'all' && deriveLifecycle(record).status !== status) return false;
     if (needle && !searchable(record).includes(needle)) return false;
     return true;
   });
@@ -113,11 +115,12 @@ export function summarizeArchive(records: readonly PredictionRecord[]): ArchiveS
   let correct = 0;
 
   for (const record of records) {
-    if (record.status === 'open') open += 1;
-    if (record.status === 'resolved') resolved += 1;
-    if (record.status === 'annulled') annulled += 1;
-    if (record.status === 'resolved' && record.resolution) {
-      const { outcome } = record.resolution;
+    const { status, resolution } = deriveLifecycle(record);
+    if (status === 'open') open += 1;
+    if (status === 'resolved') resolved += 1;
+    if (status === 'annulled') annulled += 1;
+    if (status === 'resolved' && resolution) {
+      const { outcome } = resolution;
       if (outcome === 'yes' || outcome === 'no') {
         decisive += 1;
         const wentYes = outcome === 'yes';

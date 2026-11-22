@@ -224,3 +224,22 @@ accountable forecasting should not begin with an inflated account of itself.
     dataset. There is no server that can reject a record at publish time, because there is
     no publishing pipeline yet. Anyone who edits `records.json` locally and runs `dev`
     bypasses the gate entirely; the `build` and `seal` scripts are the enforced paths.
+
+### Integrity model (payload/event split)
+
+25. **No shipped record can claim publication-before-outcome.** All ten demo records were
+    sealed before the split, when the digest covered status and resolution. Their digests are
+    preserved and verified under `payloadScope: 'legacy-record'`, and every one carries
+    `sealClaim: 'self-consistent'`. The claim that a probability was fixed *before* the
+    outcome existed is only available to records sealed from now on, and only becomes
+    *demonstrable* once an external anchor exists (§6 of the architecture proposal).
+26. **`status` is derived, not stored.** It is folded from the event chain by
+    `deriveLifecycle`. This is a real improvement — a status cannot be edited into place — but
+    it means the archive JSON no longer contains a `status` field. Anything reading
+    `records.json` directly must fold the events.
+27. **Revisions are still records, not chains.** `integrity.revision` exists, but a revision
+    is a separate record. The event chain models state transitions within one revision, not
+    the relationship between revisions.
+28. **The chain is local tamper-evidence.** Recomputing it proves internal consistency. It does
+    not prove the chain was not rebuilt from scratch by someone with write access, because
+    nothing anchors it externally yet.

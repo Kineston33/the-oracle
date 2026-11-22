@@ -1,6 +1,7 @@
 import { useEffect } from 'react';
 import { useLocation } from 'react-router-dom';
 import { findRecord } from '@/data/records';
+import { deriveLifecycle } from '@/data/lifecycle';
 
 /**
  * Per-route document metadata.
@@ -72,7 +73,7 @@ function metaFor(pathname: string): Meta {
         title: `${record.id} — ${record.title} · ${SITE}`,
         description: `Published ${record.publishedAt.slice(0, 10)} at ${Math.round(
           record.probability * 100,
-        )}%. Status: ${record.status}. Read the question, its resolution criteria and the evidence it was sealed with.`,
+        )}%. Status: ${deriveLifecycle(record).status}. Read the question, its resolution criteria and the evidence it was sealed with.`,
       };
     }
     return NOT_FOUND_META;

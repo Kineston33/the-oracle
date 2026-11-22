@@ -13,7 +13,8 @@
  * one official prediction.
  */
 
-import type { PredictionRecord } from './types';
+import type { PredictionRecord, RecordEvent } from './types.ts';
+import { deriveLifecycle } from './lifecycle.ts';
 
 /**
  * A comparison form for a canonical question: case, punctuation, quotes and
@@ -109,12 +110,20 @@ export function assertArchiveShape(records: readonly PredictionRecord[]): string
     if (Date.parse(record.resolutionCriteria.resolveOn) < Date.parse(record.horizon.endsAt)) {
       problems.push(`Record ${record.id} resolves before its horizon ends`);
     }
-    if (record.status === 'resolved' && record.resolution?.outcome === 'indeterminate') {
+    const lifecycle = deriveLifecycle(record);
+    if (lifecycle.status === 'resolved' && lifecycle.resolution?.outcome === 'indeterminate') {
       problems.push(`Record ${record.id} is resolved with an indeterminate outcome`);
     }
     if (!canonicalKey(record.canonicalQuestion)) {
       problems.push(`Record ${record.id} has an empty canonical question`);
     }
+    if (!record.integrity.payloadScope) {
+      problems.push(`Record ${record.id} does not declare which payload its digest covers`);
+    }
+    if (!record.sealClaim) {
+      problems.push(`Record ${record.id} does not declare what its seal demonstrates`);
+    }
+    problems.push(...eventChainProblems(record));
   }
 
   // One canonical question, one official prediction.
@@ -125,4 +134,94 @@ export function assertArchiveShape(records: readonly PredictionRecord[]): string
   }
 
   return problems;
+}
+
+/**
+ * Structural checks on a record's append-only event chain.
+ *
+ * These are the rules that make the chain meaningful, and they are checked
+ * without hashing (which is async and lives in `lib/integrity.ts`):
+ * the chain starts with exactly one publication, positions are consecutive,
+ * links point backwards correctly, and at most one terminal event exists.
+ */
+export function eventChainProblems(record: PredictionRecord): string[] {
+  const problems: string[] = [];
+  const { events } = record;
+  const id = record.id;
+
+  if (events.length === 0) {
+    return [`Record ${id} has no events; every record must begin with a publication`];
+  }
+
+  if (events[0].kind !== 'published') {
+    problems.push(`Record ${id} does not begin with a publication event`);
+  }
+  if (events[0].prevDigest !== null) {
+    problems.push(`Record ${id} has a publication event that points at a predecessor`);
+  }
+  if (events.filter((event) => event.kind === 'published').length > 1) {
+    problems.push(`Record ${id} is published more than once`);
+  }
+
+  const terminal = events.filter(
+    (event) => event.kind === 'resolved' || event.kind === 'annulled',
+  );
+  if (terminal.length > 1) {
+    problems.push(`Record ${id} has more than one terminal event`);
+  }
+
+  events.forEach((event, index) => {
+    if (event.seq !== `e${index}`) {
+      problems.push(
+        `Record ${id} event ${index} is labelled ${event.seq}, expected e${index}`,
+      );
+    }
+    if (!/^[0-9a-f]{64}$/.test(event.digest)) {
+      problems.push(`Record ${id} event ${event.seq} has no valid digest`);
+    }
+    const previous = events[index - 1];
+    const expectedPrev = previous ? previous.digest : null;
+    if (event.prevDigest !== expectedPrev) {
+      problems.push(`Record ${id} event ${event.seq} does not link to its predecessor`);
+    }
+    if (index > 0 && event.kind === 'published') {
+      problems.push(`Record ${id} has a publication after ${events[index - 1].seq}`);
+    }
+    if (index > 0 && events[index - 1].kind !== 'published') {
+      problems.push(`Record ${id} appends ${event.seq} after the record was already closed`);
+    }
+  });
+
+  return problems;
+}
+
+/**
+ * Assert that a record's sealed payload has not been reopened.
+ *
+ * Compares the payload digest recomputed now against the digest recorded in the
+ * `published` event. A mismatch means the content was edited after publication,
+ * which no operation in this codebase is allowed to do.
+ */
+export function payloadMatchesPublishedEvent(
+  record: PredictionRecord,
+  recomputedPayloadDigest: string,
+): boolean {
+  const published = record.events.find((event) => event.kind === 'published');
+  if (!published) return false;
+  const body = published.body as { payloadDigest?: string; payloadScope?: string };
+  // The digest to compare against depends on which definition it was issued
+  // under. Comparing a legacy digest with a modern payload digest would fail for
+  // every legacy record and prove nothing.
+  if (body.payloadScope !== record.integrity.payloadScope) return false;
+  return body.payloadDigest === recomputedPayloadDigest;
+}
+
+/** Type guard used by callers that already narrowed a chain. */
+export function isRecordEvent(value: unknown): value is RecordEvent {
+  return (
+    typeof value === 'object' &&
+    value !== null &&
+    typeof (value as RecordEvent).seq === 'string' &&
+    typeof (value as RecordEvent).digest === 'string'
+  );
 }

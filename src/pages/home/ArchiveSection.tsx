@@ -1,5 +1,6 @@
 import { Link } from 'react-router-dom';
 import { ArrowUpRight, LockKeyhole } from 'lucide-react';
+import { deriveLifecycle } from '@/data/lifecycle';
 import { predictionRecords, summarizeArchive } from '@/data/records';
 import { formatDate, formatPercent } from '@/lib/format';
 import { SectionHeader } from '@/components/ui/SectionHeader';
@@ -57,9 +58,9 @@ export function ArchiveSection() {
                     <span className={`${styles.cellProb} mono`}>{formatPercent(record.probability)}</span>
                     <span className={styles.cellStatus}>
                       <span
-                        className={[styles.statusPill, styles[record.status]].join(' ')}
+                        className={[styles.statusPill, styles[deriveLifecycle(record).status]].join(' ')}
                       >
-                        {record.status}
+                        {deriveLifecycle(record).status}
                       </span>
                     </span>
                   </Link>

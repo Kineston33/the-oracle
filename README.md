@@ -70,7 +70,7 @@ Checks:
 
 ```bash
 npm run typecheck # strict tsc for the app, the tests and the audit harness
-npm test          # Vitest: 191 tests across 9 files
+npm test          # Vitest: 228 tests across 10 files
 npm run seal      # recompute the SHA-256 digest of every record (see below)
 ```
 
@@ -206,7 +206,7 @@ entirely, including ambient drift).
 
 ## Testing
 
-191 tests across nine files:
+228 tests across ten files:
 
 - `lib/question.test.ts` — normalisation, category detection, horizon parsing, archive
   matching, canonical draft generation, and the invariant that a reading never contains a
@@ -291,3 +291,45 @@ corrupted copy of the archive.
 `canonicalKey` is Unicode-aware (`\p{L}`, `\p{N}`, `\p{M}`), so accented Latin, Cyrillic,
 Greek, Arabic, Hebrew and CJK are all preserved rather than deleted. It compares wording,
 not meaning; paraphrase detection is a stated limitation.
+
+## Integrity model: sealed payload and append-only events
+
+A published record has two parts that are deliberately kept apart.
+
+**The sealed payload** — exactly the content fixed at publication: question, category,
+`publishedAt`, probability, horizon, resolution criteria, evidence, and the demo flag. Its
+SHA-256 digest never moves once the record is published.
+
+**The event chain** — everything that happens afterwards, appended and never edited:
+
+```
+e0 published  →  e1 resolved | annulled  →  …
+```
+
+Each event hashes its own envelope plus the previous event's digest, so the chain is both
+ordered and tamper-evident. Resolving or annulling a record appends a link; it cannot touch
+the payload, the probability, the publication date, or the payload digest.
+
+```bash
+npm run validate   # shape, uniqueness, and event-chain continuity
+npm run seal       # seals unsealed records; refuses to re-seal a published one
+```
+
+### What the shipped records actually claim
+
+Every record in this repository was sealed before the payload/event split existed, when the
+digest covered the outcome too. Those digests are **preserved verbatim** and verified against
+the shape they were actually computed over (`payloadScope: 'legacy-record'`). They are
+declared `sealClaim: 'self-consistent'`, which means exactly one thing:
+
+> the shipped bytes match the sealed digest — not that the payload existed before the outcome.
+
+Recomputing them under the new definition would have produced digests that never existed and
+presented them as original seals. That was rejected: it would assert a provenance nobody
+witnessed. Any record sealed from now on uses `payloadScope: 'sealed-payload'` and
+`sealClaim: 'published-before-outcome'`, which *is* true by construction.
+
+### Re-sealing is refused
+
+`npm run seal` exits non-zero and writes nothing if any published record no longer matches its
+own digest. Verified by tampering with a copy: exit 1, file untouched, offending id named.

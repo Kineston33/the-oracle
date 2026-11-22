@@ -1,14 +1,26 @@
 #!/usr/bin/env node
 /**
- * Seal the demo archive.
+ * Seal the archive — once, at publication.
  *
- * Computes the SHA-256 digest of each record's canonical payload and writes it
- * back into `src/data/records.json` under `integrity.digest`. Run with
- * `npm run seal` after editing any record.
+ * This script will NOT re-seal a record that already carries a digest for its
+ * sealed payload. That is the point: re-sealing a published record would
+ * silently replace the proof that its content was fixed at publication with a
+ * fresh hash of whatever the content is now, which is exactly the rewrite the
+ * product promises never to perform.
  *
- * This is NOT a notarization step. It only guarantees that the digest embedded
- * in the repository matches the record it ships with, so the UI's integrity
- * panel is honest about what it can and cannot prove.
+ * What it does:
+ *   · records with `payloadScope: 'sealed-payload'` and a digest for the
+ *     current payload are left untouched (reported as `verified`);
+ *   · records whose declared digest does not reproduce are a hard error, and
+ *     the script exits non-zero without writing anything;
+ *   · records with no digest yet are sealed for the first time (`sealed`).
+ *
+ * Legacy records (`payloadScope: 'legacy-record'`) are verified against the
+ * legacy algorithm — the checksum they were actually issued with — and are
+ * never rewritten. Their new event chains are verified too.
+ *
+ * Usage:
+ *   npm run seal -- --refresh-events   regenerate event digests only
  */
 
 import { createHash } from 'node:crypto';
@@ -16,46 +28,88 @@ import { readFile, writeFile } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 
+import {
+  canonicalize,
+  sealedPayload,
+  eventEnvelope,
+  legacyPayloadShape,
+} from '../src/data/events.ts';
+import { eventChainProblems } from '../src/data/validate.ts';
+
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const recordsPath = path.join(root, 'src', 'data', 'records.json');
 
-function canonicalize(value) {
-  return JSON.stringify(sortValue(value));
-}
+const sha256 = (value) => createHash('sha256').update(value).digest('hex');
+const payloadDigestOf = (record) => sha256(canonicalize(sealedPayload(record)));
+const legacyDigestOf = (record) => sha256(canonicalize(legacyPayloadShape(record)));
 
-function sortValue(value) {
-  if (Array.isArray(value)) return value.map(sortValue);
-  if (value && typeof value === 'object') {
-    const out = {};
-    for (const key of Object.keys(value).sort()) {
-      if (value[key] === undefined) continue;
-      out[key] = sortValue(value[key]);
-    }
-    return out;
-  }
-  return value;
-}
+const eventDigestOf = (event) => sha256(canonicalize(eventEnvelope(event)));
 
-export function digestOf(record) {
-  const { integrity, ...payload } = record;
-  void integrity;
-  return createHash('sha256').update(canonicalize(payload)).digest('hex');
-}
+const refreshEvents = process.argv.includes('--refresh-events');
 
 const records = JSON.parse(await readFile(recordsPath, 'utf8'));
-let changed = 0;
 
-const sealed = records.map((record) => {
-  const digest = digestOf(record);
-  if (record.integrity.digest !== digest) changed += 1;
-  return { ...record, integrity: { ...record.integrity, digest } };
-});
+const sealed = [];
+const verified = [];
+const failures = [];
+const eventFailures = [];
 
-await writeFile(recordsPath, `${JSON.stringify(sealed, null, 2)}\n`, 'utf8');
+for (const record of records) {
+  const scope = record.integrity?.payloadScope;
 
-console.log(
-  `Sealed ${sealed.length} records (${changed} digest${changed === 1 ? '' : 's'} updated).`,
-);
-for (const record of sealed) {
-  console.log(`  ${record.id}  ${record.integrity.digest.slice(0, 16)}…  ${record.title}`);
+  if (!scope) {
+    // Nothing declared: this record was never sealed under either model.
+    sealed.push(record.id);
+    sealed[sealed.length - 1] = record.id;
+    const digest = payloadDigestOf(record);
+    record.integrity = {
+      ...record.integrity,
+      digest,
+      payloadScope: 'sealed-payload',
+    };
+  } else {
+    const recomputed = scope === 'legacy-record' ? legacyDigestOf(record) : payloadDigestOf(record);
+    if (recomputed !== record.integrity.digest) failures.push(record.id);
+    else verified.push(record.id);
+  }
+
+  if (refreshEvents) {
+    for (const event of record.events ?? []) {
+      event.digest = eventDigestOf(event);
+    }
+  }
+
+  // Event digests must reproduce under both modes.
+  for (const event of record.events ?? []) {
+    if (eventDigestOf(event) !== event.digest) eventFailures.push(`${record.id}/${event.seq}`);
+  }
+
+  const chain = eventChainProblems(record);
+  if (chain.length > 0) eventFailures.push(...chain);
+}
+
+if (failures.length > 0) {
+  console.error(`\n  Refusing to write: ${failures.length} record(s) do not match their own digest.`);
+  for (const id of failures) console.error(`    · ${id}`);
+  console.error('\n  A published record cannot be re-sealed. Restore the content or issue a new revision.\n');
+  process.exit(1);
+}
+
+if (eventFailures.length > 0) {
+  console.error(`\n  Refusing to write: the event chain is inconsistent.`);
+  for (const problem of eventFailures) console.error(`    · ${problem}`);
+  console.error('\n  Run with --refresh-events only when intentionally rebuilding chains.\n');
+  process.exit(1);
+}
+
+if (sealed.length === 0 && !refreshEvents) {
+  console.log(
+    `  Nothing to seal. ${verified.length} records verified against their own digest; ` +
+      `no published record was re-sealed.`,
+  );
+} else {
+  await writeFile(recordsPath, `${JSON.stringify(records, null, 2)}\n`, 'utf8');
+  if (sealed.length > 0) console.log(`  Sealed ${sealed.length} previously unsealed record(s).`);
+  if (refreshEvents) console.log('  Event digests regenerated.');
+  console.log(`  ${verified.length} records verified untouched.`);
 }

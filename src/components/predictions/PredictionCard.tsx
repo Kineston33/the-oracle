@@ -3,6 +3,7 @@ import { ArrowUpRight, Clock } from 'lucide-react';
 import type { PredictionRecord } from '@/data/types';
 import { CATEGORY_LABELS } from '@/data/records';
 import { formatDate, formatPercent, relativeDays } from '@/lib/format';
+import { deriveLifecycle } from '@/data/lifecycle';
 import { Badge, StatusBadge } from '@/components/ui/Badge';
 import { ProbabilityBar } from './ProbabilityBar';
 import styles from './PredictionCard.module.css';
@@ -19,12 +20,13 @@ export function PredictionCard({
   variant = 'default',
   showDemoBadge = true,
 }: PredictionCardProps) {
-  const isOpen = record.status === 'open';
+  const { status, resolution } = deriveLifecycle(record);
+  const isOpen = status === 'open';
   const horizonText = isOpen
     ? `Closes ${relativeDays(record.horizon.endsAt)}`
-    : record.status === 'resolved' && record.resolution
-      ? `Resolved ${formatDate(record.resolution.resolvedAt)}`
-      : `Annulled ${record.resolution ? formatDate(record.resolution.resolvedAt) : ''}`;
+    : status === 'resolved' && resolution
+      ? `Resolved ${formatDate(resolution.resolvedAt)}`
+      : `Annulled ${resolution ? formatDate(resolution.resolvedAt) : ''}`;
 
   return (
     <article
@@ -33,7 +35,7 @@ export function PredictionCard({
     >
       <div className={styles.top}>
         <div className={styles.badges}>
-          <StatusBadge status={record.status} />
+          <StatusBadge status={status} />
           <Badge tone="violet">{CATEGORY_LABELS[record.category]}</Badge>
           {showDemoBadge ? <Badge tone="gold" mono>Demo</Badge> : null}
         </div>
