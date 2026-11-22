@@ -10,7 +10,7 @@ import {
   sortByPublication,
   summarizeArchive,
 } from '@/data/records';
-import type { PredictionCategory, PredictionRecord } from '@/data/types';
+import type { PredictionCategory } from '@/data/types';
 import { formatInteger, formatPercent } from '@/lib/format';
 import { PageHeader } from '@/components/layout/PageHeader';
 import { SearchField } from '@/components/ui/Field';
@@ -19,9 +19,10 @@ import { Callout } from '@/components/ui/Callout';
 import { EmptyState } from '@/components/ui/EmptyState';
 import { Button } from '@/components/ui/Button';
 import { PredictionCard } from '@/components/predictions/PredictionCard';
+import type { PredictionStatus } from '@/data/types';
 import styles from './Predictions.module.css';
 
-type StatusFilter = PredictionRecord['status'] | 'all';
+type StatusFilter = PredictionStatus | 'all';
 
 const STATUS_OPTIONS: Array<{ value: StatusFilter; label: string }> = [
   { value: 'all', label: 'All records' },

@@ -1,61 +1,135 @@
 #!/usr/bin/env node
 /**
- * Seal the demo archive.
+ * Seal the archive — once, at publication.
  *
- * Computes the SHA-256 digest of each record's canonical payload and writes it
- * back into `src/data/records.json` under `integrity.digest`. Run with
- * `npm run seal` after editing any record.
+ * This script will NOT re-seal a record that already carries a digest. That is
+ * the point: re-sealing a published record would silently replace the proof that
+ * its content was fixed at publication with a fresh hash of whatever the content
+ * is now, which is the rewrite the product promises never to perform.
  *
- * This is NOT a notarization step. It only guarantees that the digest embedded
- * in the repository matches the record it ships with, so the UI's integrity
- * panel is honest about what it can and cannot prove.
+ * What it does:
+ *   · verifies every record against the digest it declares, using the payload
+ *     definition it declares (`sealed-payload` or `legacy-record`);
+ *   · verifies every event digest and every link, exactly as the build gate does;
+ *   · seals, for the first time, records that carry no digest at all;
+ *   · exits non-zero without writing anything if any check fails.
+ *
+ * `--refresh-events` exists for building chains deliberately during a migration.
+ * It regenerates event digests only; it never touches a payload digest.
+ *
+ * There is no `--force`. A published record cannot be re-sealed.
+ *
+ * Usage:
+ *   npm run seal
+ *   npm run seal -- --refresh-events
  */
 
-import { createHash } from 'node:crypto';
 import { readFile, writeFile } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 
+import {
+  canonicalize,
+  eventEnvelope,
+  legacyPayloadShape,
+  sealedPayload,
+} from '../src/data/events.ts';
+import { sha256Hex } from '../src/data/hash.ts';
+import { eventChainProblems, publishedLinkProblems } from '../src/data/validate.ts';
+
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const recordsPath = path.join(root, 'src', 'data', 'records.json');
 
-function canonicalize(value) {
-  return JSON.stringify(sortValue(value));
-}
+const payloadDigestOf = (record) =>
+  sha256Hex(canonicalize(sealedPayload(record)));
+const legacyDigestOf = (record) =>
+  sha256Hex(canonicalize(legacyPayloadShape(record)));
+const eventDigestOf = (event) =>
+  sha256Hex(canonicalize(eventEnvelope(event)));
 
-function sortValue(value) {
-  if (Array.isArray(value)) return value.map(sortValue);
-  if (value && typeof value === 'object') {
-    const out = {};
-    for (const key of Object.keys(value).sort()) {
-      if (value[key] === undefined) continue;
-      out[key] = sortValue(value[key]);
-    }
-    return out;
-  }
-  return value;
-}
-
-export function digestOf(record) {
-  const { integrity, ...payload } = record;
-  void integrity;
-  return createHash('sha256').update(canonicalize(payload)).digest('hex');
-}
+const refreshEvents = process.argv.includes('--refresh-events');
 
 const records = JSON.parse(await readFile(recordsPath, 'utf8'));
-let changed = 0;
 
-const sealed = records.map((record) => {
-  const digest = digestOf(record);
-  if (record.integrity.digest !== digest) changed += 1;
-  return { ...record, integrity: { ...record.integrity, digest } };
-});
+const newlySealed = [];
+const verified = [];
+const digestFailures = [];
+const eventFailures = [];
 
-await writeFile(recordsPath, `${JSON.stringify(sealed, null, 2)}\n`, 'utf8');
+for (const record of records) {
+  const scope = record.integrity?.payloadScope;
 
-console.log(
-  `Sealed ${sealed.length} records (${changed} digest${changed === 1 ? '' : 's'} updated).`,
-);
-for (const record of sealed) {
-  console.log(`  ${record.id}  ${record.integrity.digest.slice(0, 16)}…  ${record.title}`);
+  if (!scope) {
+    // Never sealed under either model: this is a first publication.
+    record.integrity = {
+      ...record.integrity,
+      digest: await payloadDigestOf(record),
+      payloadScope: 'sealed-payload',
+    };
+    newlySealed.push(record.id);
+  } else {
+    const recomputed =
+      scope === 'legacy-record' ? await legacyDigestOf(record) : await payloadDigestOf(record);
+    if (recomputed === record.integrity.digest) verified.push(record.id);
+    else digestFailures.push(record.id);
+  }
+
+  if (refreshEvents) {
+    let previous = null;
+    for (const event of record.events ?? []) {
+      event.prevDigest = previous;
+      event.digest = await eventDigestOf(event);
+      previous = event.digest;
+    }
+  }
+
+  for (const event of record.events ?? []) {
+    if ((await eventDigestOf(event)) !== event.digest) {
+      eventFailures.push(`${record.id}/${event.seq}: digest does not reproduce`);
+    }
+  }
+  eventFailures.push(...eventChainProblems(record));
+
+  const matches = record.integrity?.digest !== undefined && record.integrity.digest !== null;
+  const recomputedForLink =
+    matches && scope
+      ? scope === 'legacy-record'
+        ? await legacyDigestOf(record)
+        : await payloadDigestOf(record)
+      : null;
+  eventFailures.push(
+    ...publishedLinkProblems(
+      record,
+      recomputedForLink !== null && recomputedForLink === record.integrity?.digest,
+      recomputedForLink,
+    ),
+  );
+}
+
+if (digestFailures.length > 0) {
+  console.error(`\n  Refusing to write: ${digestFailures.length} record(s) do not match their own digest.`);
+  for (const id of digestFailures) console.error(`    · ${id}`);
+  console.error('\n  A published record cannot be re-sealed. Restore the content or issue a new revision.\n');
+  process.exit(1);
+}
+
+if (eventFailures.length > 0) {
+  console.error('\n  Refusing to write: the publication link or the event chain is inconsistent.');
+  for (const problem of eventFailures) console.error(`    · ${problem}`);
+  console.error('\n  Run with --refresh-events only when intentionally rebuilding chains.\n');
+  process.exit(1);
+}
+
+if (newlySealed.length === 0 && !refreshEvents) {
+  console.log(
+    `  Nothing to seal. ${verified.length} records verified against their own digest and ` +
+      `against their publication event; no published record was re-sealed.`,
+  );
+} else {
+  await writeFile(recordsPath, `${JSON.stringify(records, null, 2)}\n`, 'utf8');
+  if (newlySealed.length > 0) {
+    console.log(`  Sealed ${newlySealed.length} previously unsealed record(s).`);
+  }
+  if (refreshEvents) console.log('  Event digests regenerated.');
+  console.log(`  ${verified.length} records verified untouched.`);
 }

@@ -1,4 +1,3 @@
-import { useEffect } from 'react';
 import { Link, useParams } from 'react-router-dom';
 import {
   ArrowLeft,
@@ -10,6 +9,7 @@ import {
   Scale,
 } from 'lucide-react';
 import { adjacentRecords, CATEGORY_LABELS, findRecord } from '@/data/records';
+import { deriveLifecycle } from '@/data/lifecycle';
 import type { EvidenceKind, PredictionRecord } from '@/data/types';
 import {
   formatDate,
@@ -41,6 +41,7 @@ function RecordNotFound({ id }: { id?: string }) {
   return (
     <div className={styles.notFound}>
       <EmptyState
+        headingLevel={1}
         icon={<FileText aria-hidden="true" />}
         title="That record is not in the archive"
         actions={
@@ -66,13 +67,6 @@ export function PredictionRecordPage() {
   const { id } = useParams<{ id: string }>();
   const record = id ? findRecord(id) : undefined;
 
-  useEffect(() => {
-    if (record) document.title = `${record.id} — ${record.title} · THE ORACLE`;
-    return () => {
-      document.title = "THE ORACLE — See what's coming.";
-    };
-  }, [record]);
-
   if (!record) return <RecordNotFound id={id} />;
 
   return <RecordView record={record} />;
@@ -80,7 +74,8 @@ export function PredictionRecordPage() {
 
 function RecordView({ record }: { record: PredictionRecord }) {
   const { previous, next } = adjacentRecords(record.id);
-  const isResolved = record.status === 'resolved' && record.resolution;
+  const { status, resolution } = deriveLifecycle(record);
+  const isResolved = status === 'resolved' && resolution !== undefined;
 
   return (
     <article className={styles.page} aria-labelledby="record-title">
@@ -101,7 +96,7 @@ function RecordView({ record }: { record: PredictionRecord }) {
 
           <div className={styles.headerTop}>
             <div className={styles.badges}>
-              <StatusBadge status={record.status} />
+              <StatusBadge status={status} />
               <Badge tone="violet">{CATEGORY_LABELS[record.category]}</Badge>
               {record.demo ? <DemoBadge label="Illustrative record" /> : null}
             </div>
@@ -145,7 +140,7 @@ function RecordView({ record }: { record: PredictionRecord }) {
 
           <div className={styles.probabilityCard}>
             <p className={styles.figureLabel}>
-              {record.status === 'annulled' ? 'Original probability' : 'Published probability'}
+              {status === 'annulled' ? 'Original probability' : 'Published probability'}
             </p>
             <ProbabilityDisplay record={record} size="lg" />
             <div className={styles.barWrap}>
@@ -199,11 +194,11 @@ function RecordView({ record }: { record: PredictionRecord }) {
                 <ClipboardCheck size={12} aria-hidden="true" />
                 Status
               </dt>
-              <dd>{STATUS_LABELS[record.status]}</dd>
+              <dd>{STATUS_LABELS[status]}</dd>
               <dd className={styles.factSub}>
                 {isResolved
-                  ? `Outcome recorded ${formatDate(record.resolution!.resolvedAt)}`
-                  : record.status === 'annulled'
+                  ? `Outcome recorded ${formatDate(resolution!.resolvedAt)}`
+                  : status === 'annulled'
                     ? 'Retained for public audit'
                     : 'Awaiting resolution'}
               </dd>
@@ -228,44 +223,44 @@ function RecordView({ record }: { record: PredictionRecord }) {
             <div
               className={[
                 styles.resolutionCard,
-                record.resolution!.outcome === 'yes'
+                resolution!.outcome === 'yes'
                   ? styles.outcomeYes
-                  : record.resolution!.outcome === 'no'
+                  : resolution!.outcome === 'no'
                     ? styles.outcomeNo
                     : styles.outcomeIndeterminate,
               ].join(' ')}
             >
               <div className={styles.resolutionHead}>
                 <span className={styles.resolutionOutcome}>
-                  {record.resolution!.outcome.toUpperCase()}
+                  {resolution!.outcome.toUpperCase()}
                 </span>
                 <span className={styles.resolutionDate}>
                   Recorded{' '}
-                  <time dateTime={isoAttribute(record.resolution!.resolvedAt)}>
-                    {formatDateLong(record.resolution!.resolvedAt)}
+                  <time dateTime={isoAttribute(resolution!.resolvedAt)}>
+                    {formatDateLong(resolution!.resolvedAt)}
                   </time>
                 </span>
               </div>
-              <p className={styles.resolutionBasis}>{record.resolution!.basis}</p>
-              <p className={styles.resolutionNote}>{record.resolution!.note}</p>
+              <p className={styles.resolutionBasis}>{resolution!.basis}</p>
+              <p className={styles.resolutionNote}>{resolution!.note}</p>
               <p className={styles.resolutionCompare}>
                 Published probability was{' '}
                 <strong>{formatPercent(record.probability)}</strong>. The outcome was{' '}
-                <strong>{record.resolution!.outcome}</strong>. Both figures stay on
+                <strong>{resolution!.outcome}</strong>. Both figures stay on
                 the record permanently.
               </p>
             </div>
           </section>
         ) : null}
 
-        {record.status === 'annulled' && record.resolution ? (
+        {status === 'annulled' && resolution ? (
           <section className={styles.block} aria-labelledby="annul-title">
             <h2 id="annul-title" className={styles.blockTitle}>
               Why this record was annulled
             </h2>
             <Callout tone="caution" title="Annulled, not deleted">
-              <p>{record.resolution.basis}</p>
-              <p>{record.resolution.note}</p>
+              <p>{resolution.basis}</p>
+              <p>{resolution.note}</p>
             </Callout>
           </section>
         ) : null}

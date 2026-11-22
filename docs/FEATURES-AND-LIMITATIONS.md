@@ -139,13 +139,22 @@ accountable forecasting should not begin with an inflated account of itself.
 
 7. **The digest verifies consistency, not authorship.** A SHA-256 hash is not a signature.
    Public keys and signed records are not implemented.
-8. **Client-side only.** No SSR or prerendering, so link previews show generic metadata and
-   the archive is not crawlable without JavaScript execution.
+8. **Client-side only, with per-route metadata.** Each route now sets its own title,
+   description, canonical URL and Open Graph title, so tabs and shared links are accurate.
+   There is still no SSR or prerendering: social crawlers that do not execute JavaScript read
+   the static defaults in `index.html`, and a record-specific preview is not possible yet.
+   The site ships `noindex` until real records exist.
 9. **`localStorage` capacity.** Drafts are capped at 24 entries (roughly 20 KB of text) and
    are pruned oldest-last; there is no quota handling beyond silent failure.
-10. **The question parser is shallow.** Keyword lexicons and token overlap misclassify
-    unusual phrasing and cannot detect semantic equivalence. It is deliberately conservative
-    (it prefers "unclassified" over guessing) but that is a mitigation, not a fix.
+10. **The question parser is shallow, and the archive key is wording-level.** Keyword
+    lexicons and token overlap misclassify unusual phrasing and cannot detect semantic
+    equivalence. The canonical-question key is now Unicode-aware — it keeps letters, digits
+    and combining marks from every script — but it is still a *string* comparison, not a
+    semantic one. Specifically: `baterías` and `baterias` do **not** merge, `1.200` and
+    `1200` do **not** merge, and two paraphrases of the same question are not detected.
+    Every one of those gaps is a missed merge, never a false one. False merges are the
+    failure mode that would let two official answers to one question coexist, so the bias
+    is intentional.
 11. **Category and status filters do not persist across page loads** beyond the URL. Deep
     links work; returning later resets to defaults.
 12. **No dark/light theme switch.** The product is dark-only by design; `color-scheme: dark`
@@ -183,3 +192,128 @@ accountable forecasting should not begin with an inflated account of itself.
 4. Publish the raw archive as a static JSON endpoint so readers can verify offline.
 5. Only then start the forecasting work: reference classes, structured elicitation,
    aggregation and Brier-scored calibration.
+
+### Deployment readiness
+
+19. **The canonical origin is a placeholder.** `https://the-oracle.example` appears in
+    `index.html` (canonical, `og:url`, `og:image`) and in
+    `src/components/layout/RouteMetadata.tsx`. Open Graph images must be absolute URLs, so
+    previews will not render until this is replaced with the real origin.
+20. **Indexing is switched off on purpose.** `index.html` carries
+    `<meta name="robots" content="noindex, nofollow">` because the archive is demonstration
+    data. Removing it before real records exist would put illustrative probabilities into
+    search results.
+21. **SPA fallback is configured, not proven.** `public/_redirects` (Netlify, Cloudflare
+    Pages) and `public/vercel.json` (Vercel) are committed and the build serves correctly
+    under `vite preview`, but no host has been exercised. Every route must be reloaded
+    directly against the deployed origin before launch.
+22. **No consent, analytics or privacy policy.** Nothing is tracked and nothing is sent
+    anywhere, which makes this easy to disclose honestly — but a public deployment still
+    needs that disclosure written somewhere a visitor can find it.
+
+### Canonical-question enforcement
+
+23. **Is the rule enforced outside the tests? Yes, since the pre-launch audit.** The rules
+    live in `src/data/validate.ts`, which imports no JSON and no DOM, so
+    `scripts/validate-archive.mjs` imports it directly under Node and runs it against the
+    records that actually ship. `npm run build` and `npm run seal` both start with
+    `npm run validate`, which exits non-zero on a duplicate canonical question — a real
+    build was verified to refuse to produce `dist/`. Before this change the function existed
+    but was only ever called from tests, so a duplicate could have shipped.
+24. **The gate is still not a publication service.** It runs at build time on a static
+    dataset. There is no server that can reject a record at publish time, because there is
+    no publishing pipeline yet. Anyone who edits `records.json` locally and runs `dev`
+    bypasses the gate entirely; the `build` and `seal` scripts are the enforced paths.
+
+### Integrity model (payload/event split)
+
+25. **No shipped record can claim publication-before-outcome.** All ten demo records were
+    sealed before the split, when the digest covered status and resolution. Their digests are
+    preserved and verified under `payloadScope: 'legacy-record'`, and every one carries
+    `sealClaim: 'self-consistent'`. The claim that a probability was fixed *before* the
+    outcome existed is only available to records sealed from now on, and only becomes
+    *demonstrable* once an external anchor exists (§6 of the architecture proposal).
+26. **`status` is derived, not stored.** It is folded from the event chain by
+    `deriveLifecycle`. This is a real improvement — a status cannot be edited into place — but
+    it means the archive JSON no longer contains a `status` field. Anything reading
+    `records.json` directly must fold the events.
+27. **Revisions are still records, not chains.** `integrity.revision` exists, but a revision
+    is a separate record. The event chain models state transitions within one revision, not
+    the relationship between revisions.
+28. **The chain is local tamper-evidence.** Recomputing it proves internal consistency. It does
+    not prove the chain was not rebuilt from scratch by someone with write access, because
+    nothing anchors it externally yet. The publication link makes a *partial* edit detectable
+    (payload or event changed in isolation); a full rebuild that regenerates every digest stays
+    internally consistent and is caught only by comparing against git history, not by
+    `npm run validate`. Until an anchor exists, that is the honest boundary.
+29. **Every shipped event is `migrated`.** Its `occurredAt` is a restated archive date, not an
+    observation. No shipped event can claim it was written while the thing happened. That
+    capability arrives with the publication pipeline; until then `origin: 'observed'` appears
+    only in tests.
+30. **`recordedAt` is per record, not per event.** All events of one record share the migration
+    timestamp in the current data. The validator checks the ordering inequality, not an exact
+    per-event time, because no such precision was ever recorded.
+31. **A `legacy-record` record that is still open cannot be resolved, and that is the
+    decision.** Its digest covers `status` and `resolution`, so recording an outcome changes
+    the bytes it was computed over and the stored digest stops reproducing. Seven shipped
+    records are in this state (0001–0006, 0008).
+
+    **Current policy: they are kept as immutable historical demonstrations.** No resolution,
+    no annulment, no revision, no change to their digests. `nextEvent()` and `appendEvent()`
+    refuse the operation outright, and `npm run validate` would reject a hand-edited archive
+    that acquired a terminal event, because the digest stops reproducing.
+
+    Revisions and supersession are **not available features**. They are not implemented in
+    the interface, the validator or the data model. A future design could introduce them —
+    a new record that supersedes a legacy one, carrying its own modern-scope seal and an
+    explicit reference to what it replaces — but until such a system exists and is validated,
+    it must not be described as a way to resolve these records.
+32. **`npm run validate` cannot detect a full internal rebuild.** Recomputing every payload
+    digest, the publication event and the whole chain produces a consistent archive that
+    passes. Only the git history contradicts it. Closing this needs an external anchor.
+
+33. **`anchored` is rejected, not trusted.** No anchoring mechanism exists, so a record that
+    sets `integrity.anchored: true` fails validation and the panel reports the claim as
+    unhonoured. This must stay until a verifiable external proof exists — and when it does,
+    the check becomes "the proof verifies", never "the flag says so".
+34. **`observed` is a declared provenance, not a demonstrated one.** The digest protects the
+    claim from being edited; it cannot show the claim is true. A full rebuild can mint any
+    `origin` and `recordedAt`. Only an external witness closes this.
+35. **Seven legacy records are permanently unresolvable.** `0001`–`0006` and `0008` are open
+    and sealed under `legacy-record`, whose digest covers the outcome. `nextEvent` and
+    `appendEvent` refuse terminal events on them. This is the original sealing defect made
+    explicit; it is not repaired, because repairing it would mean re-sealing or rewriting
+    history.
+
+36. **One UI test needs a longer wait than the default, and only under load.**
+    `App.test.tsx > navigation > navigates from the homepage to the archive` clicks a `lazy()`
+    route and then waits for the new page.
+
+    *Normal behaviour.* The test passes with Testing Library's default async-utility timeout.
+    A single isolated run completes the navigation in roughly 0.3 s.
+
+    *Extreme contention.* With several full-file runs competing for CPU the navigation is not
+    broken, it is late: instrumented at 3.6–4.4 s. At that latency the default 1000 ms fails
+    the assertion, which is correct behaviour for a timeout — the wait, not the component, is
+    the problem.
+
+    *Localised fix applied.* That one `findByRole` passes `timeout: 5000`. No global ceiling is
+    configured; every other assertion in the suite keeps the default, so a genuinely stuck
+    component still fails quickly everywhere else.
+
+    *Residual limitation.* This is mitigation, not a cure. Measurements taken while
+    investigating:
+
+    | Condition | default 1000 ms | 5000 ms |
+    |---|---|---|
+    | 1 copy, isolated | pass | pass |
+    | 3 copies, full suite | pass | pass |
+    | 6 copies, that test only | fails 5/6 | fails 3/6 |
+    | 6 copies, whole file | — | can fail |
+
+    A 6/6 pass was observed with a 20 s ceiling on that test alone, but that is **not a general
+    guarantee**: it shows the navigation eventually completes, not that any ceiling survives
+    arbitrary parallelism. Even 10 s failed at six concurrent full-file runs. The honest
+    position is that the suite is reliable in a normal run and that unusually heavy parallelism
+    can still produce this failure. If it appears in CI, run that file in isolation rather than
+    raising the number again.

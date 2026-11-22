@@ -10,6 +10,8 @@
 
 import raw from './records.json';
 import type { ArchiveSummary, PredictionCategory, PredictionRecord } from './types';
+import type { PredictionStatus as PredictionLifecycleStatus } from './types';
+import { deriveLifecycle } from './lifecycle';
 
 export const predictionRecords = raw as PredictionRecord[];
 
@@ -40,7 +42,7 @@ export const CATEGORY_ORDER: PredictionCategory[] = [
 
 export interface RecordFilter {
   category?: PredictionCategory | 'all';
-  status?: PredictionRecord['status'] | 'all';
+  status?: PredictionLifecycleStatus | 'all';
   query?: string;
 }
 
@@ -65,7 +67,7 @@ export function filterRecords(
   const needle = query.trim().toLowerCase();
   return records.filter((record) => {
     if (category !== 'all' && record.category !== category) return false;
-    if (status !== 'all' && record.status !== status) return false;
+    if (status !== 'all' && deriveLifecycle(record).status !== status) return false;
     if (needle && !searchable(record).includes(needle)) return false;
     return true;
   });
@@ -113,11 +115,12 @@ export function summarizeArchive(records: readonly PredictionRecord[]): ArchiveS
   let correct = 0;
 
   for (const record of records) {
-    if (record.status === 'open') open += 1;
-    if (record.status === 'resolved') resolved += 1;
-    if (record.status === 'annulled') annulled += 1;
-    if (record.status === 'resolved' && record.resolution) {
-      const { outcome } = record.resolution;
+    const { status, resolution } = deriveLifecycle(record);
+    if (status === 'open') open += 1;
+    if (status === 'resolved') resolved += 1;
+    if (status === 'annulled') annulled += 1;
+    if (status === 'resolved' && resolution) {
+      const { outcome } = resolution;
       if (outcome === 'yes' || outcome === 'no') {
         decisive += 1;
         const wentYes = outcome === 'yes';
@@ -137,37 +140,13 @@ export function summarizeArchive(records: readonly PredictionRecord[]): ArchiveS
 }
 
 /**
- * A cheap structural check used by tests and the integrity panel:
- * every record must be marked demo, carry evidence, and have a digest of the
- * expected shape. It deliberately does not verify the hash — that is async
- * and lives in `lib/integrity.ts`.
+ * Archive rules that must hold before publication. They live in `./validate`,
+ * which imports no JSON, so `scripts/validate-archive.mjs` can run the exact
+ * same checks against the shipped records outside the test suite.
  */
-export function assertArchiveShape(records: readonly PredictionRecord[]): string[] {
-  const problems: string[] = [];
-  const ids = new Set<string>();
-  for (const record of records) {
-    if (ids.has(record.id)) problems.push(`Duplicate record id: ${record.id}`);
-    ids.add(record.id);
-    if (!/^ORC-\d{4}-\d{4}$/.test(record.id)) {
-      problems.push(`Malformed record id: ${record.id}`);
-    }
-    if (!record.demo) problems.push(`Record ${record.id} is missing the demo flag`);
-    if (record.evidence.length === 0) problems.push(`Record ${record.id} has no evidence`);
-    if (record.probability <= 0 || record.probability >= 1) {
-      problems.push(`Record ${record.id} has an out-of-range probability`);
-    }
-    if (!/^[0-9a-f]{64}$/.test(record.integrity.digest)) {
-      problems.push(`Record ${record.id} has no valid SHA-256 digest`);
-    }
-    if (Date.parse(record.horizon.endsAt) <= Date.parse(record.publishedAt)) {
-      problems.push(`Record ${record.id} ends before it was published`);
-    }
-    if (Date.parse(record.resolutionCriteria.resolveOn) < Date.parse(record.horizon.endsAt)) {
-      problems.push(`Record ${record.id} resolves before its horizon ends`);
-    }
-    if (record.status === 'resolved' && record.resolution?.outcome === 'indeterminate') {
-      problems.push(`Record ${record.id} is resolved with an indeterminate outcome`);
-    }
-  }
-  return problems;
-}
+export {
+  assertArchiveShape,
+  canonicalKey,
+  findCanonicalCollisions,
+  type QuestionCollision,
+} from './validate';

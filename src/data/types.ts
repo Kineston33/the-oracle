@@ -86,8 +86,21 @@ export interface ResolutionCriteria {
  */
 export interface IntegrityMetadata {
   algorithm: 'SHA-256';
-  /** Lowercase hex digest of the canonical payload. */
+  /** Lowercase hex digest of the sealed payload. */
   digest: string;
+  /**
+   * Which payload definition this digest covers.
+   *
+   * `sealed-payload` — digest over `SealedPayload` only. Publication status and
+   *   outcomes live in events and never influence it.
+   *
+   * `legacy-record` — digest over the whole record as it was modelled before the
+   *   payload/event split, status and resolution included. These digests are
+   *   preserved exactly as issued; they are verified against the shape they were
+   *   actually computed from, and are never recomputed. A record carrying this
+   *   value cannot claim that its payload predates its outcome.
+   */
+  payloadScope: 'sealed-payload' | 'legacy-record';
   /** Monotonic revision number. Revisions add; they never overwrite. */
   revision: number;
   /** Where the record is published. */
@@ -105,25 +118,31 @@ export interface Resolution {
   note: string;
 }
 
+/* -------------------------------------------------------------------------
+   Integrity: sealed payload + append-only events
+   ------------------------------------------------------------------------- */
+
 /**
- * A single official prediction record.
+ * A prediction record as the archive *reads* it.
  *
- * Invariants for the eventual implementation (documented, not yet enforced by
- * a server):
- *   1. Records are append-only. A correction creates a new revision or record.
- *   2. `probability` is fixed at publication and can never be revised.
- *   3. `resolutionCriteria` is fixed at publication.
- *   4. Every record carries evidence and a resolution authority.
+ * The split below is the whole point of the model. A record's content is fixed
+ * at publication and sealed; everything that happens afterwards is appended as
+ * an event. Nothing that occurs after publication ever rewrites the sealed
+ * content.
  */
-export interface PredictionRecord {
+
+/**
+ * Exactly the information fixed at publication. This is what a digest covers.
+ *
+ * Nothing here may ever be revisited: a correction produces a new revision or a
+ * new record, never an edit to an existing seal.
+ */
+export interface SealedPayload {
   id: PredictionId;
-  /** Canonical phrasing. Equivalent questions must point at this one record. */
   canonicalQuestion: string;
-  /** Compact label for dense surfaces (cards, lists). */
   title: string;
   category: PredictionCategory;
   publishedAt: IsoDateTime;
-  /** Singular probability, fixed for the life of this revision. */
   probability: number;
   horizon: {
     startsAt: IsoDateTime;
@@ -132,14 +151,171 @@ export interface PredictionRecord {
   };
   resolutionCriteria: ResolutionCriteria;
   evidence: EvidenceReference[];
-  status: PredictionStatus;
-  resolution?: Resolution;
-  integrity: IntegrityMetadata;
-  /**
-   * True for illustrative records that ship with this prototype.
-   * The UI must never present a demo record as a real forecast.
-   */
+  /** True for illustrative records. Never presented as a real forecast. */
   demo: boolean;
+  /**
+   * What this payload's digest actually demonstrates.
+   *
+   * `self-consistent` — the sealed bytes match the shipped record. It does NOT
+   *   follow that the payload existed before the outcome was known: records
+   *   sealed after their resolution fall into this class, and saying otherwise
+   *   would assert a provenance nobody witnessed.
+   *
+   * `published-before-outcome` — the payload was sealed during the publication
+   *   step, before any resolution or annulment event existed. Records sealed
+   *   under this model carry it, and it is true by construction.
+   */
+  sealClaim: SealClaim;
+}
+
+export type SealClaim = 'self-consistent' | 'published-before-outcome';
+
+/** Body of the event that accompanies a publication. */
+export interface PublishedEventBody {
+  /**
+   * Digest of the payload this event publishes, computed under `payloadScope`.
+   *
+   * For records sealed under the legacy model this is the legacy digest — which
+   * covers the outcome too — and `payloadScope` says so. Storing the scope here
+   * is what stops the two being confused later.
+   */
+  payloadDigest: string;
+  /** The payload definition `payloadDigest` was computed over. */
+  payloadScope: IntegrityMetadata['payloadScope'];
+  /** How the payload was sealed. Mirrors `SealedPayload.sealClaim`. */
+  sealClaim: SealClaim;
+  note: string;
+}
+
+/** Body of a resolution event. Never touches the sealed payload. */
+export interface ResolvedEventBody {
+  outcome: Exclude<ResolutionOutcome, 'indeterminate'>;
+  basis: string;
+  note: string;
+  /** Evidence the resolution rests on. Appended, never swapped in. */
+  evidenceIds: string[];
+}
+
+/** Body of an annulment event. Never touches the sealed payload. */
+export interface AnnulledEventBody {
+  reason: string;
+  basis: string;
+  note: string;
+}
+
+export type RecordEventBody = PublishedEventBody | ResolvedEventBody | AnnulledEventBody;
+
+export type RecordEventKind = 'published' | 'resolved' | 'annulled';
+
+/**
+ * How an event came to be in this archive.
+ *
+ * - `migrated` — the event was constructed when the payload/event model was
+ *   introduced, from fields that already existed on the record (`publishedAt`,
+ *   `resolution.resolvedAt`). The chain did not exist at `occurredAt`.
+ * - `observed` — the event was written while the thing happened, under this
+ *   model. Only these events are contemporaneous with their `occurredAt`.
+ *
+ * Never derive one from the other. A migrated event is a faithful restatement of
+ * a recorded date, not a witness that anything happened on that date.
+ */
+export type EventOrigin = 'migrated' | 'observed';
+
+/**
+ * One link in a record's append-only event chain.
+ *
+ * `digest` covers the schema-2 envelope, which is exactly:
+ *
+ * ```
+ * { schema, algorithm, scope, seq, kind, occurredAt, recordedAt, origin, body, prevDigest }
+ * ```
+ *
+ * That is every field of this interface except `digest` itself. Nothing is left
+ * out: `recordedAt` and `origin` used to sit outside the envelope in schema 1,
+ * which let a migrated event be relabelled as observed with an unchanged digest.
+ * Putting them inside is what makes the declaration tamper-evident.
+ *
+ * The chain is therefore ordered and tamper-evident: changing any field of any
+ * event invalidates that event and every event after it. Adding an event appends
+ * a link; it never alters an earlier one.
+ *
+ * The declaration fields exist so a digest never has to be interpreted by
+ * convention. A verifier reading a single event knows which hash produced it,
+ * which scheme version it belongs to, and exactly which bytes it covers.
+ */
+export interface RecordEvent {
+  /** Deterministic position: 'e0', 'e1', … Assigned at append time. */
+  seq: string;
+  kind: RecordEventKind;
+  /**
+   * The date the event is *declared* to have happened. For a migrated event this
+   * is the date the archive already recorded; it is not an observation date.
+   */
+  occurredAt: IsoDateTime;
+  body: RecordEventBody;
+  /**
+   * When this event was written into the archive.
+   *
+   * For migrated events this is provably later than `occurredAt`: a migrated
+   * chain could not have existed before the model that defines events. The
+   * validator enforces `recordedAt > occurredAt` for every event, and that
+   * `recordedAt` never moves backwards along a chain.
+   *
+   * Being inside the digest makes this value tamper-evident. It does not make it
+   * *witnessed*: a full rebuild can produce any `recordedAt` it likes. Only an
+   * external anchor could show when these bytes existed.
+   */
+  recordedAt: IsoDateTime;
+  origin: EventOrigin;
+  /**
+   * Digest algorithm. `sha256` is the only value this build accepts; an unknown
+   * value is a validation failure, not a fallback.
+   */
+  algorithm: 'sha256';
+  /**
+   * Scheme version of this envelope. Bumping it changes every event digest.
+   *
+   * Version 2 moved `recordedAt` and `origin` inside the hash. A verifier must
+   * implement the version an event declares; an unknown version is a failure,
+   * never a silent skip.
+   */
+  schemaVersion: 2;
+  /**
+   * Exactly what `digest` covers.
+   *
+   * `published-payload` — the digest of the sealed payload (for a
+   *   `sealed-payload` record) or of the legacy whole-record shape (for a
+   *   `legacy-record` record). Same bytes as `integrity.digest`.
+   * `event-envelope` — the event envelope itself, chained to its predecessor.
+   * `event-envelope+published-payload` — both, for the `published` event, so
+   *   the chain is bound to the payload by a single hash.
+   */
+  scope: EventDigestScope;
+  /** Lowercase hex digest over the declared scope. */
+  digest: string;
+  /** Digest of the previous event, or null for the first ('published'). */
+  prevDigest: string | null;
+}
+
+export type EventDigestScope =
+  | 'published-payload'
+  | 'event-envelope'
+  | 'event-envelope+published-payload';
+
+/**
+ * A single official prediction record.
+ */
+export interface PredictionRecord extends SealedPayload {
+  /** Everything that happened after publication, oldest first. Append-only. */
+  events: RecordEvent[];
+  /**
+   * Digest of the sealed payload as shipped.
+   *
+   * For records sealed under the legacy model this digest also covers the
+   * status and resolution that were present at sealing time, which is why
+   * `legacyDigest` records are verified with the legacy algorithm.
+   */
+  integrity: IntegrityMetadata;
 }
 
 /** Aggregates shown on archive-wide surfaces. */

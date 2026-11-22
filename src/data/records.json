@@ -47,15 +47,36 @@
         "note": "Identifies the jurisdictions that would need to overperform. Fabricated for demonstration."
       }
     ],
-    "status": "open",
     "integrity": {
       "algorithm": "SHA-256",
       "digest": "2c3c0206265888468d5ce4dc253351c2f2d5703e1d26ab067b36183fac2340e1",
       "revision": 1,
       "channel": "public-archive",
-      "anchored": false
+      "anchored": false,
+      "payloadScope": "legacy-record"
     },
-    "demo": true
+    "demo": true,
+    "sealClaim": "self-consistent",
+    "events": [
+      {
+        "seq": "e0",
+        "kind": "published",
+        "occurredAt": "2025-11-04T09:00:00.000Z",
+        "body": {
+          "payloadDigest": "2c3c0206265888468d5ce4dc253351c2f2d5703e1d26ab067b36183fac2340e1",
+          "sealClaim": "self-consistent",
+          "note": "Sealed before the payload/event split. The digest covers the record as it then existed, outcome included, so it does not demonstrate that this payload predates its outcome.",
+          "payloadScope": "legacy-record"
+        },
+        "digest": "e74c8122016cba4edeabede5c31639762877d67d20ced822a23fc3277c605bd8",
+        "prevDigest": null,
+        "recordedAt": "2026-11-22T17:51:26.000Z",
+        "origin": "migrated",
+        "algorithm": "sha256",
+        "schemaVersion": 2,
+        "scope": "event-envelope+published-payload"
+      }
+    ]
   },
   {
     "id": "ORC-2025-0002",
@@ -97,15 +118,36 @@
         "note": "Upper-bound check on plausible cluster scale. Fabricated for demonstration."
       }
     ],
-    "status": "open",
     "integrity": {
       "algorithm": "SHA-256",
       "digest": "ef3a72926fec5d04bf488c226f8a2ea52ee1b1618d49ac251cf83b85085c660c",
       "revision": 1,
       "channel": "public-archive",
-      "anchored": false
+      "anchored": false,
+      "payloadScope": "legacy-record"
     },
-    "demo": true
+    "demo": true,
+    "sealClaim": "self-consistent",
+    "events": [
+      {
+        "seq": "e0",
+        "kind": "published",
+        "occurredAt": "2025-10-21T14:30:00.000Z",
+        "body": {
+          "payloadDigest": "ef3a72926fec5d04bf488c226f8a2ea52ee1b1618d49ac251cf83b85085c660c",
+          "sealClaim": "self-consistent",
+          "note": "Sealed before the payload/event split. The digest covers the record as it then existed, outcome included, so it does not demonstrate that this payload predates its outcome.",
+          "payloadScope": "legacy-record"
+        },
+        "digest": "47eb311ccc458548db21228e4b9399b9f32d81826845e992dccb6743ba80179b",
+        "prevDigest": null,
+        "recordedAt": "2026-11-22T17:51:26.000Z",
+        "origin": "migrated",
+        "algorithm": "sha256",
+        "schemaVersion": 2,
+        "scope": "event-envelope+published-payload"
+      }
+    ]
   },
   {
     "id": "ORC-2025-0003",
@@ -147,15 +189,36 @@
         "note": "Used to estimate how many bills historically reach funded status. Fabricated for demonstration."
       }
     ],
-    "status": "open",
     "integrity": {
       "algorithm": "SHA-256",
       "digest": "bbf8f62996189aa828f2edd19100e5b24ae7385119df91f331722aecd912a546",
       "revision": 1,
       "channel": "public-archive",
-      "anchored": false
+      "anchored": false,
+      "payloadScope": "legacy-record"
     },
-    "demo": true
+    "demo": true,
+    "sealClaim": "self-consistent",
+    "events": [
+      {
+        "seq": "e0",
+        "kind": "published",
+        "occurredAt": "2025-09-15T08:15:00.000Z",
+        "body": {
+          "payloadDigest": "bbf8f62996189aa828f2edd19100e5b24ae7385119df91f331722aecd912a546",
+          "sealClaim": "self-consistent",
+          "note": "Sealed before the payload/event split. The digest covers the record as it then existed, outcome included, so it does not demonstrate that this payload predates its outcome.",
+          "payloadScope": "legacy-record"
+        },
+        "digest": "56965f28312acfe31107c073e51f05810c61a847e6393c09f9c9d70705848e5b",
+        "prevDigest": null,
+        "recordedAt": "2026-11-22T17:51:26.000Z",
+        "origin": "migrated",
+        "algorithm": "sha256",
+        "schemaVersion": 2,
+        "scope": "event-envelope+published-payload"
+      }
+    ]
   },
   {
     "id": "ORC-2025-0004",
@@ -197,15 +260,36 @@
         "note": "Informs the schedule-risk discount. Fabricated for demonstration."
       }
     ],
-    "status": "open",
     "integrity": {
       "algorithm": "SHA-256",
       "digest": "4efacfd19030cd04e7bde1dfa539b89835bbaff14766dd1c79fcefa2fdbe63c7",
       "revision": 1,
       "channel": "public-archive",
-      "anchored": false
+      "anchored": false,
+      "payloadScope": "legacy-record"
     },
-    "demo": true
+    "demo": true,
+    "sealClaim": "self-consistent",
+    "events": [
+      {
+        "seq": "e0",
+        "kind": "published",
+        "occurredAt": "2025-08-02T16:45:00.000Z",
+        "body": {
+          "payloadDigest": "4efacfd19030cd04e7bde1dfa539b89835bbaff14766dd1c79fcefa2fdbe63c7",
+          "sealClaim": "self-consistent",
+          "note": "Sealed before the payload/event split. The digest covers the record as it then existed, outcome included, so it does not demonstrate that this payload predates its outcome.",
+          "payloadScope": "legacy-record"
+        },
+        "digest": "c38011104b4cff27b450ef8c97953f5803ccdf4ceb0ecdaf830068443fcf56f2",
+        "prevDigest": null,
+        "recordedAt": "2026-11-22T17:51:26.000Z",
+        "origin": "migrated",
+        "algorithm": "sha256",
+        "schemaVersion": 2,
+        "scope": "event-envelope+published-payload"
+      }
+    ]
   },
   {
     "id": "ORC-2025-0005",
@@ -247,15 +331,36 @@
         "note": "Used to model the 2027–2029 replacement wave. Fabricated for demonstration."
       }
     ],
-    "status": "open",
     "integrity": {
       "algorithm": "SHA-256",
       "digest": "cd89e5cc9446767284d146c3801ccceb49aaac80597f6f2bc520f37f441e09b3",
       "revision": 1,
       "channel": "public-archive",
-      "anchored": false
+      "anchored": false,
+      "payloadScope": "legacy-record"
     },
-    "demo": true
+    "demo": true,
+    "sealClaim": "self-consistent",
+    "events": [
+      {
+        "seq": "e0",
+        "kind": "published",
+        "occurredAt": "2025-07-11T11:00:00.000Z",
+        "body": {
+          "payloadDigest": "cd89e5cc9446767284d146c3801ccceb49aaac80597f6f2bc520f37f441e09b3",
+          "sealClaim": "self-consistent",
+          "note": "Sealed before the payload/event split. The digest covers the record as it then existed, outcome included, so it does not demonstrate that this payload predates its outcome.",
+          "payloadScope": "legacy-record"
+        },
+        "digest": "9a1e45deb85f364f3aa269b3711f644ee0863518fcd2b4449c53f377f4567e5f",
+        "prevDigest": null,
+        "recordedAt": "2026-11-22T17:51:26.000Z",
+        "origin": "migrated",
+        "algorithm": "sha256",
+        "schemaVersion": 2,
+        "scope": "event-envelope+published-payload"
+      }
+    ]
   },
   {
     "id": "ORC-2025-0006",
@@ -297,15 +402,36 @@
         "note": "Median and tail review durations. Fabricated for demonstration."
       }
     ],
-    "status": "open",
     "integrity": {
       "algorithm": "SHA-256",
       "digest": "75065f05a0087da606e9550e663e03a3a113d4d2036a31ccfb1b20219122c832",
       "revision": 1,
       "channel": "public-archive",
-      "anchored": false
+      "anchored": false,
+      "payloadScope": "legacy-record"
     },
-    "demo": true
+    "demo": true,
+    "sealClaim": "self-consistent",
+    "events": [
+      {
+        "seq": "e0",
+        "kind": "published",
+        "occurredAt": "2025-06-24T10:20:00.000Z",
+        "body": {
+          "payloadDigest": "75065f05a0087da606e9550e663e03a3a113d4d2036a31ccfb1b20219122c832",
+          "sealClaim": "self-consistent",
+          "note": "Sealed before the payload/event split. The digest covers the record as it then existed, outcome included, so it does not demonstrate that this payload predates its outcome.",
+          "payloadScope": "legacy-record"
+        },
+        "digest": "91eefd8800cc6d54ce985d6eec3b3189f335b72dd5ecaf28fb761fc902f5c71d",
+        "prevDigest": null,
+        "recordedAt": "2026-11-22T17:51:26.000Z",
+        "origin": "migrated",
+        "algorithm": "sha256",
+        "schemaVersion": 2,
+        "scope": "event-envelope+published-payload"
+      }
+    ]
   },
   {
     "id": "ORC-2025-0007",
@@ -339,21 +465,54 @@
         "note": "Baseline growth estimate. Fabricated for demonstration."
       }
     ],
-    "status": "resolved",
-    "resolution": {
-      "resolvedAt": "2026-06-18T12:00:00.000Z",
-      "outcome": "yes",
-      "basis": "Illustrative annual mean of 431.2 ppm reported for calendar year 2025 in the demo observatory series.",
-      "note": "Demo resolution recorded to demonstrate how outcomes attach to a sealed record. The figures are fabricated."
-    },
     "integrity": {
       "algorithm": "SHA-256",
       "digest": "52c940f249d805fe61bb1bd381cae7ae0c45f03b454264da0ff0bf28f43c45bc",
       "revision": 1,
       "channel": "public-archive",
-      "anchored": false
+      "anchored": false,
+      "payloadScope": "legacy-record"
     },
-    "demo": true
+    "demo": true,
+    "sealClaim": "self-consistent",
+    "events": [
+      {
+        "seq": "e0",
+        "kind": "published",
+        "occurredAt": "2025-05-19T07:00:00.000Z",
+        "body": {
+          "payloadDigest": "52c940f249d805fe61bb1bd381cae7ae0c45f03b454264da0ff0bf28f43c45bc",
+          "sealClaim": "self-consistent",
+          "note": "Sealed before the payload/event split. The digest covers the record as it then existed, outcome included, so it does not demonstrate that this payload predates its outcome.",
+          "payloadScope": "legacy-record"
+        },
+        "digest": "afc303a86f2a88fd8e0fafb3bf8c72b6e36f1ab49e774a8f842277ea88f9c9d5",
+        "prevDigest": null,
+        "recordedAt": "2026-11-22T17:51:26.000Z",
+        "origin": "migrated",
+        "algorithm": "sha256",
+        "schemaVersion": 2,
+        "scope": "event-envelope+published-payload"
+      },
+      {
+        "seq": "e1",
+        "kind": "resolved",
+        "occurredAt": "2026-06-18T12:00:00.000Z",
+        "body": {
+          "outcome": "yes",
+          "basis": "Illustrative annual mean of 431.2 ppm reported for calendar year 2025 in the demo observatory series.",
+          "note": "Demo resolution recorded to demonstrate how outcomes attach to a sealed record. The figures are fabricated.",
+          "evidenceIds": []
+        },
+        "digest": "871b70a0d9b7aa072c70b0b70341c3f07da40ad77b86210b2f9ead5058c9c2b6",
+        "prevDigest": "afc303a86f2a88fd8e0fafb3bf8c72b6e36f1ab49e774a8f842277ea88f9c9d5",
+        "recordedAt": "2026-11-22T17:51:26.000Z",
+        "origin": "migrated",
+        "algorithm": "sha256",
+        "schemaVersion": 2,
+        "scope": "event-envelope"
+      }
+    ]
   },
   {
     "id": "ORC-2025-0008",
@@ -395,15 +554,36 @@
         "note": "Pilot cohort used to test method sensitivity. Fabricated for demonstration."
       }
     ],
-    "status": "open",
     "integrity": {
       "algorithm": "SHA-256",
       "digest": "8dee59310bcd60ee848816e62e1f2e6b1b3ae17db5664f9d8422ccea35bd52ac",
       "revision": 1,
       "channel": "public-archive",
-      "anchored": false
+      "anchored": false,
+      "payloadScope": "legacy-record"
     },
-    "demo": true
+    "demo": true,
+    "sealClaim": "self-consistent",
+    "events": [
+      {
+        "seq": "e0",
+        "kind": "published",
+        "occurredAt": "2025-04-30T13:10:00.000Z",
+        "body": {
+          "payloadDigest": "8dee59310bcd60ee848816e62e1f2e6b1b3ae17db5664f9d8422ccea35bd52ac",
+          "sealClaim": "self-consistent",
+          "note": "Sealed before the payload/event split. The digest covers the record as it then existed, outcome included, so it does not demonstrate that this payload predates its outcome.",
+          "payloadScope": "legacy-record"
+        },
+        "digest": "1ab08277feaf45f48593102e3f858ad422fac3360beb4366dd9c1743183d8af4",
+        "prevDigest": null,
+        "recordedAt": "2026-11-22T17:51:26.000Z",
+        "origin": "migrated",
+        "algorithm": "sha256",
+        "schemaVersion": 2,
+        "scope": "event-envelope+published-payload"
+      }
+    ]
   },
   {
     "id": "ORC-2025-0009",
@@ -437,21 +617,53 @@
         "note": "Background only; no operational test could be fixed. Fabricated for demonstration."
       }
     ],
-    "status": "annulled",
-    "resolution": {
-      "resolvedAt": "2025-04-02T10:00:00.000Z",
-      "outcome": "indeterminate",
-      "basis": "Annulled before its horizon ended because the resolution rule could not be applied consistently by two independent reviewers using the published text.",
-      "note": "Annulled records stay public with their original probability and full revision history. This is how the archive is designed to handle a badly specified question."
-    },
     "integrity": {
       "algorithm": "SHA-256",
       "digest": "94946e6d44fc4fa05f3ff64ee0c4e2c63cf371891fa89efc557a2f3eb8ad8db7",
       "revision": 1,
       "channel": "public-archive",
-      "anchored": false
+      "anchored": false,
+      "payloadScope": "legacy-record"
     },
-    "demo": true
+    "demo": true,
+    "sealClaim": "self-consistent",
+    "events": [
+      {
+        "seq": "e0",
+        "kind": "published",
+        "occurredAt": "2025-03-12T09:40:00.000Z",
+        "body": {
+          "payloadDigest": "94946e6d44fc4fa05f3ff64ee0c4e2c63cf371891fa89efc557a2f3eb8ad8db7",
+          "sealClaim": "self-consistent",
+          "note": "Sealed before the payload/event split. The digest covers the record as it then existed, outcome included, so it does not demonstrate that this payload predates its outcome.",
+          "payloadScope": "legacy-record"
+        },
+        "digest": "75fd9465833bfbd65b7472d730f86fa5e584d5010b46c2660aa921244a27ea40",
+        "prevDigest": null,
+        "recordedAt": "2026-11-22T17:51:26.000Z",
+        "origin": "migrated",
+        "algorithm": "sha256",
+        "schemaVersion": 2,
+        "scope": "event-envelope+published-payload"
+      },
+      {
+        "seq": "e1",
+        "kind": "annulled",
+        "occurredAt": "2025-04-02T10:00:00.000Z",
+        "body": {
+          "reason": "Annulled before its horizon ended because the resolution rule could not be applied consistently by two independent reviewers using the published text.",
+          "basis": "Annulled before its horizon ended because the resolution rule could not be applied consistently by two independent reviewers using the published text.",
+          "note": "Annulled records stay public with their original probability and full revision history. This is how the archive is designed to handle a badly specified question."
+        },
+        "digest": "eaf445c0e507bf926e8f4c9504cac328c883678c2aeece5bccbab18c0aab7d81",
+        "prevDigest": "75fd9465833bfbd65b7472d730f86fa5e584d5010b46c2660aa921244a27ea40",
+        "recordedAt": "2026-11-22T17:51:26.000Z",
+        "origin": "migrated",
+        "algorithm": "sha256",
+        "schemaVersion": 2,
+        "scope": "event-envelope"
+      }
+    ]
   },
   {
     "id": "ORC-2024-0010",
@@ -485,20 +697,53 @@
         "note": "Base rate of successful replication in this literature. Fabricated for demonstration."
       }
     ],
-    "status": "resolved",
-    "resolution": {
-      "resolvedAt": "2026-01-12T09:00:00.000Z",
-      "outcome": "no",
-      "basis": "No qualifying independent replication was reported before the horizon ended.",
-      "note": "Demo resolution. The literature review behind this base rate is fabricated."
-    },
     "integrity": {
       "algorithm": "SHA-256",
       "digest": "4f35f6b8cc69e5f473562184f323810315cc8e30f9a7210b4296d440a8818f51",
       "revision": 1,
       "channel": "public-archive",
-      "anchored": false
+      "anchored": false,
+      "payloadScope": "legacy-record"
     },
-    "demo": true
+    "demo": true,
+    "sealClaim": "self-consistent",
+    "events": [
+      {
+        "seq": "e0",
+        "kind": "published",
+        "occurredAt": "2024-12-18T15:00:00.000Z",
+        "body": {
+          "payloadDigest": "4f35f6b8cc69e5f473562184f323810315cc8e30f9a7210b4296d440a8818f51",
+          "sealClaim": "self-consistent",
+          "note": "Sealed before the payload/event split. The digest covers the record as it then existed, outcome included, so it does not demonstrate that this payload predates its outcome.",
+          "payloadScope": "legacy-record"
+        },
+        "digest": "65ea586cd471c28fe3358aab03e67087611734338d9d6a8e52f690208ccb93c0",
+        "prevDigest": null,
+        "recordedAt": "2026-11-22T17:51:26.000Z",
+        "origin": "migrated",
+        "algorithm": "sha256",
+        "schemaVersion": 2,
+        "scope": "event-envelope+published-payload"
+      },
+      {
+        "seq": "e1",
+        "kind": "resolved",
+        "occurredAt": "2026-01-12T09:00:00.000Z",
+        "body": {
+          "outcome": "no",
+          "basis": "No qualifying independent replication was reported before the horizon ended.",
+          "note": "Demo resolution. The literature review behind this base rate is fabricated.",
+          "evidenceIds": []
+        },
+        "digest": "1ed42444e5b3467612c8965eee13e315c0a3fbc99a046d0a08e07c3f65ec3a70",
+        "prevDigest": "65ea586cd471c28fe3358aab03e67087611734338d9d6a8e52f690208ccb93c0",
+        "recordedAt": "2026-11-22T17:51:26.000Z",
+        "origin": "migrated",
+        "algorithm": "sha256",
+        "schemaVersion": 2,
+        "scope": "event-envelope"
+      }
+    ]
   }
 ]
