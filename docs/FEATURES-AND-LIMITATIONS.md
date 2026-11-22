@@ -285,14 +285,35 @@ accountable forecasting should not begin with an inflated account of itself.
     explicit; it is not repaired, because repairing it would mean re-sealing or rewriting
     history.
 
-36. **One UI test is sensitive to extreme parallel load.** `App.test.tsx > navigation >
-    navigates from the homepage to the archive` clicks through a `lazy()` route. Under heavy
-    CPU contention the navigation completes but takes 3.6–4.4 s, which exceeded the default
-    1000 ms async-utility timeout. The ceiling is now 5000 ms, measured, and the test passes in
-    a normal run.
+36. **One UI test needs a longer wait than the default, and only under load.**
+    `App.test.tsx > navigation > navigates from the homepage to the archive` clicks a `lazy()`
+    route and then waits for the new page.
 
-    It is **not** fully fixed: with six concurrent full-file runs it can still fail even at a
-    10 s ceiling, because there is no value that survives arbitrary contention. The cause is
-    known — jsdom plus a dynamic import under load, not a broken component: with a 20 s ceiling
-    the same test passes 6/6 and nothing else fails. If this ever appears in CI, the answer is
-    to run that file in isolation, not to raise the ceiling again.
+    *Normal behaviour.* The test passes with Testing Library's default async-utility timeout.
+    A single isolated run completes the navigation in roughly 0.3 s.
+
+    *Extreme contention.* With several full-file runs competing for CPU the navigation is not
+    broken, it is late: instrumented at 3.6–4.4 s. At that latency the default 1000 ms fails
+    the assertion, which is correct behaviour for a timeout — the wait, not the component, is
+    the problem.
+
+    *Localised fix applied.* That one `findByRole` passes `timeout: 5000`. No global ceiling is
+    configured; every other assertion in the suite keeps the default, so a genuinely stuck
+    component still fails quickly everywhere else.
+
+    *Residual limitation.* This is mitigation, not a cure. Measurements taken while
+    investigating:
+
+    | Condition | default 1000 ms | 5000 ms |
+    |---|---|---|
+    | 1 copy, isolated | pass | pass |
+    | 3 copies, full suite | pass | pass |
+    | 6 copies, that test only | fails 5/6 | fails 3/6 |
+    | 6 copies, whole file | — | can fail |
+
+    A 6/6 pass was observed with a 20 s ceiling on that test alone, but that is **not a general
+    guarantee**: it shows the navigation eventually completes, not that any ceiling survives
+    arbitrary parallelism. Even 10 s failed at six concurrent full-file runs. The honest
+    position is that the suite is reliable in a normal run and that unusually heavy parallelism
+    can still produce this failure. If it appears in CI, run that file in isolation rather than
+    raising the number again.

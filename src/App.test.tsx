@@ -33,8 +33,17 @@ describe('navigation', () => {
     const nav = screen.getByRole('navigation', { name: 'Primary' });
     await user.click(within(nav).getByRole('link', { name: /predictions/i }));
 
+    // This is the only test in the suite that clicks through a lazy() route and
+    // then waits for it, so it is the only one that needs more than Testing
+    // Library's default. Measured under load: the navigation completes in
+    // 3.6-4.4 s rather than not at all. The timeout is local to this call so the
+    // rest of the suite keeps the default. See limitation 36.
     expect(
-      await screen.findByRole('heading', { level: 1, name: /every prediction/i }),
+      await screen.findByRole(
+        'heading',
+        { level: 1, name: /every prediction/i },
+        { timeout: 5000 },
+      ),
     ).toBeInTheDocument();
   });
 
