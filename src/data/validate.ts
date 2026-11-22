@@ -13,8 +13,20 @@
  * one official prediction.
  */
 
-import type { PredictionRecord, RecordEvent } from './types.ts';
+import type { EventDigestScope, PredictionRecord } from './types.ts';
 import { deriveLifecycle } from './lifecycle.ts';
+import {
+  CHAINED_SCOPE,
+  EVENT_ALGORITHM,
+  EVENT_SCHEMA_VERSION,
+  PUBLISHED_SCOPE,
+  canonicalize,
+  eventEnvelope as eventEnvelopeOf,
+  expectedScope,
+  legacyPayloadShape,
+  sealedPayload,
+} from './events.ts';
+import { sha256Hex } from './hash.ts';
 
 /**
  * A comparison form for a canonical question: case, punctuation, quotes and
@@ -137,6 +149,52 @@ export function assertArchiveShape(records: readonly PredictionRecord[]): string
 }
 
 /**
+ * Full validation: structural checks plus the cryptographic ones.
+ *
+ * Structural checks alone cannot prove that `integrity.digest` is the digest of
+ * the shipped payload, because they never hash anything. This is the entry point
+ * the build gate uses, and it is the one that closes that gap: a payload edited
+ * together with its recorded digest still fails, because the publication event
+ * names the digest it was issued with and that event is inside the chain.
+ */
+export async function validateArchive(
+  records: readonly PredictionRecord[],
+): Promise<string[]> {
+  const problems = assertArchiveShape(records);
+
+  for (const record of records) {
+    let recomputed: string | null = null;
+    try {
+      recomputed = await recomputeDeclaredDigest(record);
+    } catch (error) {
+      problems.push(
+        `Record ${record.id} digest could not be recomputed: ${(error as Error).message}`,
+      );
+    }
+    const matches = recomputed !== null && recomputed === record.integrity.digest;
+    problems.push(...publishedLinkProblems(record, matches, recomputed));
+
+    // Every event digest must reproduce, under the algorithm it declares.
+    for (const event of record.events) {
+      if (
+        event.algorithm !== EVENT_ALGORITHM ||
+        event.schemaVersion !== EVENT_SCHEMA_VERSION
+      ) {
+        continue; // already reported structurally
+      }
+      const recomputedEvent = await sha256Hex(canonicalize(eventEnvelopeOf(event)));
+      if (recomputedEvent !== event.digest) {
+        problems.push(
+          `Record ${record.id} event ${event.seq} digest does not reproduce from its contents`,
+        );
+      }
+    }
+  }
+
+  return problems;
+}
+
+/**
  * Structural checks on a record's append-only event chain.
  *
  * These are the rules that make the chain meaningful, and they are checked
@@ -170,6 +228,39 @@ export function eventChainProblems(record: PredictionRecord): string[] {
     problems.push(`Record ${id} has more than one terminal event`);
   }
 
+  // Every event must declare how it was hashed. An unknown algorithm or schema
+  // is a hard failure: a verifier that silently accepts an unrecognised scheme
+  // is not verifying anything.
+  events.forEach((event) => {
+    if (event.algorithm !== EVENT_ALGORITHM) {
+      problems.push(
+        `Record ${id} event ${event.seq} declares unknown algorithm '${String(event.algorithm)}'`,
+      );
+    }
+    if (event.schemaVersion !== EVENT_SCHEMA_VERSION) {
+      problems.push(
+        `Record ${id} event ${event.seq} declares unknown schema version '${String(event.schemaVersion)}'`,
+      );
+    }
+    const scope = event.scope as EventDigestScope | undefined;
+    if (scope !== CHAINED_SCOPE && scope !== PUBLISHED_SCOPE) {
+      problems.push(`Record ${id} event ${event.seq} declares unknown digest scope '${String(scope)}'`);
+    } else if (scope !== expectedScope(event.kind)) {
+      problems.push(
+        `Record ${id} event ${event.seq} declares scope '${scope}' but a '${event.kind}' event must use '${expectedScope(event.kind)}'`,
+      );
+    }
+    const origin = (event as { origin?: unknown }).origin;
+    if (origin !== undefined && origin !== 'migrated' && origin !== 'observed') {
+      problems.push(`Record ${id} event ${event.seq} declares unknown origin '${String(origin)}'`);
+    }
+    if (typeof event.recordedAt !== 'string' || Number.isNaN(Date.parse(event.recordedAt))) {
+      problems.push(`Record ${id} event ${event.seq} has no usable recordedAt`);
+    }
+  });
+
+  problems.push(...temporalProblems(record));
+
   events.forEach((event, index) => {
     if (event.seq !== `e${index}`) {
       problems.push(
@@ -196,32 +287,161 @@ export function eventChainProblems(record: PredictionRecord): string[] {
 }
 
 /**
- * Assert that a record's sealed payload has not been reopened.
+ * Temporal sanity, checked without inventing anything.
  *
- * Compares the payload digest recomputed now against the digest recorded in the
- * `published` event. A mismatch means the content was edited after publication,
- * which no operation in this codebase is allowed to do.
+ * A migrated chain is built from dates the record already carried, so the only
+ * thing that can be asserted is an inequality: the event was written into the
+ * archive later than the moment it records. That is true of every migrated event
+ * by construction - the model that defines events did not exist before them - so
+ * requiring it detects a fabricated `recordedAt` without pretending to know the
+ * exact hour anything was written.
  */
-export function payloadMatchesPublishedEvent(
-  record: PredictionRecord,
-  recomputedPayloadDigest: string,
-): boolean {
-  const published = record.events.find((event) => event.kind === 'published');
-  if (!published) return false;
-  const body = published.body as { payloadDigest?: string; payloadScope?: string };
-  // The digest to compare against depends on which definition it was issued
-  // under. Comparing a legacy digest with a modern payload digest would fail for
-  // every legacy record and prove nothing.
-  if (body.payloadScope !== record.integrity.payloadScope) return false;
-  return body.payloadDigest === recomputedPayloadDigest;
+export function temporalProblems(record: PredictionRecord): string[] {
+  const problems: string[] = [];
+  const { id, events } = record;
+  if (events.length === 0) return problems;
+
+  const recordedTimes = events
+    .map((event) => Date.parse(event.recordedAt))
+    .filter((time) => !Number.isNaN(time));
+  if (recordedTimes.length !== events.length) return problems;
+
+  const latestOccurrence = Math.max(...events.map((event) => Date.parse(event.occurredAt)));
+  const earliestRecording = Math.min(...recordedTimes);
+  if (earliestRecording <= latestOccurrence) {
+    problems.push(
+      `Record ${id} claims an event was recorded at or before the latest moment it records`,
+    );
+  }
+
+  for (const event of events) {
+    if (Date.parse(event.recordedAt) <= Date.parse(event.occurredAt)) {
+      problems.push(
+        `Record ${id} event ${event.seq} is recorded at or before the moment it records`,
+      );
+    }
+    if (Date.parse(event.occurredAt) < Date.parse(record.publishedAt)) {
+      problems.push(`Record ${id} event ${event.seq} predates the publication date`);
+    }
+  }
+
+  for (let index = 1; index < events.length; index += 1) {
+    if (Date.parse(events[index].recordedAt) < Date.parse(events[index - 1].recordedAt)) {
+      problems.push(`Record ${id} event ${events[index].seq} is recorded before its predecessor`);
+    }
+  }
+
+  const migrated = events.filter((event) => (event as { origin?: unknown }).origin === 'migrated');
+  if (migrated.length > 0 && migrated.length !== events.length) {
+    problems.push(`Record ${id} mixes migrated and observed events in one chain`);
+  }
+
+  return problems;
 }
 
-/** Type guard used by callers that already narrowed a chain. */
-export function isRecordEvent(value: unknown): value is RecordEvent {
-  return (
-    typeof value === 'object' &&
-    value !== null &&
-    typeof (value as RecordEvent).seq === 'string' &&
-    typeof (value as RecordEvent).digest === 'string'
-  );
+
+/**
+ * The publication event must be the single authority over the payload digest.
+ *
+ * This is the rule that stops a rewrite. Editing the sealed content changes its
+ * digest; updating `integrity.digest` to match is a one-line edit. What a forger
+ * cannot do cheaply is make the *published event* agree, because that event's
+ * own digest covers its body and is in turn covered by every later link — and
+ * rebuilding all of that still leaves nothing anchored outside the repository.
+ *
+ * Enforced structurally (exactly one `published`, first, naming one digest, only
+ * that digest) and cryptographically (the named digest must equal
+ * `integrity.digest` *and* the digest recomputed from the shipped bytes).
+ */
+export function publishedLinkProblems(
+  record: PredictionRecord,
+  digestMatches: boolean,
+  recomputedDigest: string | null,
+): string[] {
+  const problems: string[] = [];
+  const { id, events } = record;
+
+  const publishedEvents = events.filter((event) => event.kind === 'published');
+
+  if (publishedEvents.length === 0) {
+    return [`Record ${id} has no publication event, so its payload is unanchored`];
+  }
+  if (publishedEvents.length > 1) {
+    problems.push(`Record ${id} has ${publishedEvents.length} publication events; exactly one is allowed`);
+  }
+  if (events[0]?.kind !== 'published') {
+    problems.push(`Record ${id} does not begin with its publication event`);
+  }
+
+  const published = publishedEvents[0];
+  const body = published.body as {
+    payloadDigest?: unknown;
+    payloadScope?: unknown;
+    sealClaim?: unknown;
+  };
+
+  if (typeof body.payloadDigest !== 'string') {
+    problems.push(`Record ${id} publication event names no payload digest`);
+    return problems;
+  }
+  if (!/^[0-9a-f]{64}$/.test(body.payloadDigest)) {
+    problems.push(`Record ${id} publication event names a malformed payload digest`);
+  }
+
+  // The event must declare the same payload definition the record does.
+  if (body.payloadScope !== record.integrity.payloadScope) {
+    problems.push(
+      `Record ${id} publication event covers '${String(body.payloadScope)}' but the record declares '${record.integrity.payloadScope}'`,
+    );
+  }
+  if (body.sealClaim !== record.sealClaim) {
+    problems.push(`Record ${id} publication event disagrees with the record about its seal claim`);
+  }
+
+  // The named digest must be the record's digest, and must reproduce.
+  if (body.payloadDigest !== record.integrity.digest) {
+    problems.push(
+      `Record ${id} publication event names a different payload digest than integrity.digest`,
+    );
+  }
+  if (!digestMatches) {
+    problems.push(
+      `Record ${id} payload does not reproduce its declared digest; the publication event cannot be honoured`,
+    );
+  }
+  if (recomputedDigest !== null && body.payloadDigest !== recomputedDigest) {
+    problems.push(
+      `Record ${id} publication event does not name the digest of the shipped payload`,
+    );
+  }
+
+  // No other event may carry a payload digest: only the publication names one.
+  for (const event of events) {
+    if (event.kind === 'published') continue;
+    const other = event.body as { payloadDigest?: unknown };
+    if (other.payloadDigest !== undefined) {
+      problems.push(
+        `Record ${id} event ${event.seq} names a payload digest; only the publication may`,
+      );
+    }
+  }
+
+  return problems;
 }
+
+/**
+ * Recompute the digest a record declares, under the scope it declares.
+ *
+ * Duplicated here rather than imported from `lib/integrity.ts` because that
+ * module is browser-oriented and this one must run under plain Node with no
+ * bundler. Both delegate to `hash.ts` and `events.ts`, so the bytes hashed are
+ * identical by construction.
+ */
+export async function recomputeDeclaredDigest(record: PredictionRecord): Promise<string> {
+  const bytes =
+    record.integrity.payloadScope === 'legacy-record'
+      ? canonicalize(legacyPayloadShape(record))
+      : canonicalize(sealedPayload(record));
+  return sha256Hex(bytes);
+}
+

@@ -310,6 +310,57 @@ Each event hashes its own envelope plus the previous event's digest, so the chai
 ordered and tamper-evident. Resolving or annulling a record appends a link; it cannot touch
 the payload, the probability, the publication date, or the payload digest.
 
+### The chain is bound to the payload by the publication event
+
+The `published` event carries the payload digest, and its own digest covers that value. So
+the payload and the event that published it cannot be edited independently: changing one
+leaves the other naming a state that never existed.
+
+`npm run validate` enforces this cryptographically, not structurally:
+
+- the `published` event must exist, be unique, and open the chain;
+- the digest it names must equal both `integrity.digest` *and* the digest recomputed from
+  the shipped bytes;
+- no other event may name a payload digest.
+
+Editing a probability and recomputing `integrity.digest` therefore fails, because the
+publication event still names the original. This is tested destructively in
+`src/data/publication-link.test.ts` — including the strongest form of the attack, where the
+whole chain is rebuilt, which passes validation and is reported as what it is: an internal
+rewrite that no external anchor can contradict yet.
+
+### Every event declares its own scheme
+
+An event digest is never interpreted by convention. Each event states:
+
+| Field | Meaning |
+|---|---|
+| `algorithm` | `sha256` — the only value accepted |
+| `schemaVersion` | `1` — bumping it changes every event digest |
+| `scope` | `event-envelope`, or `event-envelope+published-payload` for `e0` |
+| `origin` | `observed` or `migrated` |
+| `occurredAt` | the date the event is *declared* to have happened |
+| `recordedAt` | when the event was written into this archive |
+
+An unknown algorithm, schema version or scope is a validation failure, not a fallback.
+`recordedAt` and `origin` sit deliberately *outside* the hashed envelope: they describe the
+archive's handling of an event, not the thing it records, and a more precise `recordedAt`
+must not force a chain rebuild.
+
+### Migrated versus observed
+
+Every event in this repository is `origin: 'migrated'`. The chains were constructed on
+`2026-11-22T17:51:26Z` from timestamps the records already carried, so:
+
+- `occurredAt` is a **declared** date, restated faithfully from the archive;
+- `recordedAt` is the moment the restatement was written;
+- neither is a timestamp proving the hashes existed at `occurredAt`.
+
+The validator enforces that inequality per record: a chain must be recorded strictly later
+than the latest moment it records. That is provable from the data without inventing a
+timestamp. A migrated event is never presented as a temporal proof, and the record page
+says so explicitly.
+
 ```bash
 npm run validate   # shape, uniqueness, and event-chain continuity
 npm run seal       # seals unsealed records; refuses to re-seal a published one
@@ -332,4 +383,5 @@ witnessed. Any record sealed from now on uses `payloadScope: 'sealed-payload'` a
 ### Re-sealing is refused
 
 `npm run seal` exits non-zero and writes nothing if any published record no longer matches its
-own digest. Verified by tampering with a copy: exit 1, file untouched, offending id named.
+own digest, or if any publication link or event chain is inconsistent. There is no `--force`.
+Verified by tampering with a copy: exit 1, file untouched, offending id named.

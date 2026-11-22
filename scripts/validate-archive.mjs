@@ -3,8 +3,8 @@
  * Validate the archive before it is built or published.
  *
  * Runs the same rules the test suite exercises, but against the records that
- * actually ship — so a duplicate canonical question cannot reach production
- * just because nobody ran the tests.
+ * actually ship — so a duplicate canonical question, a rewritten payload, or a
+ * broken event chain cannot reach production just because nobody ran the tests.
  *
  * Wired into `npm run build` and `npm run seal`. Exits non-zero on any problem.
  *
@@ -16,13 +16,17 @@ import { readFile } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 
-import { assertArchiveShape, findCanonicalCollisions } from '../src/data/validate.ts';
+import { validateArchive, findCanonicalCollisions } from '../src/data/validate.ts';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const recordsPath = path.join(root, 'src', 'data', 'records.json');
 
 const records = JSON.parse(await readFile(recordsPath, 'utf8'));
-const problems = assertArchiveShape(records);
+
+// Full validation, not just the structural pass: this recomputes every payload
+// digest and every event digest, so an edit that also rewrites the recorded
+// digest is still caught by the publication event that names it.
+const problems = await validateArchive(records);
 
 if (problems.length > 0) {
   console.error(`\n  Archive validation failed — ${problems.length} problem(s):\n`);

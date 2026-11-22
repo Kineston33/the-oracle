@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react';
 import { Check, CircleAlert, Copy, Fingerprint, Loader } from 'lucide-react';
 import type { PredictionRecord } from '@/data/types';
 import { shortDigest, verifyRecordDigest } from '@/lib/integrity';
+import { formatDate } from '@/lib/format';
 import styles from './IntegrityPanel.module.css';
 
 type VerificationState =
@@ -25,6 +26,14 @@ const SCOPE_LABEL: Record<PredictionRecord['integrity']['payloadScope'], string>
 export function IntegrityPanel({ record }: { record: PredictionRecord }) {
   const [state, setState] = useState<VerificationState>({ status: 'checking' });
   const [copied, setCopied] = useState(false);
+
+  // Provenance of the chain, kept separate from the chain's own dates: a
+  // migrated event carries the date the thing happened, not the date the event
+  // was written. The panel must never let those be read as one.
+  const origins = new Set(record.events.map((event) => event.origin));
+  const chainOrigin =
+    origins.size === 0 ? 'observed' : origins.size > 1 ? 'mixed' : [...origins][0];
+  const migratedAt = record.events.find((event) => event.origin === 'migrated')?.recordedAt;
 
   useEffect(() => {
     let cancelled = false;
@@ -99,6 +108,16 @@ export function IntegrityPanel({ record }: { record: PredictionRecord }) {
             {record.integrity.anchored ? 'Yes' : 'No — not yet'}
           </dd>
         </div>
+        <div className={styles.field}>
+          <dt>Event chain</dt>
+          <dd>
+            {chainOrigin === 'migrated'
+              ? 'Migrated, not witnessed'
+              : chainOrigin === 'mixed'
+                ? 'Mixed provenance'
+                : 'Recorded as events'}
+          </dd>
+        </div>
       </dl>
 
       <div className={styles.digestBlock}>
@@ -145,6 +164,17 @@ export function IntegrityPanel({ record }: { record: PredictionRecord }) {
           </p>
         ) : null}
       </div>
+
+      {chainOrigin !== 'observed' && migratedAt ? (
+        <p className={styles.caveat}>
+          <strong>Event chain migration.</strong> The events below record dates this
+          archive already held. They were written into this event model on{' '}
+          {formatDate(migratedAt)}, not on the dates they describe, so they are
+          declared <em>migrated</em>. A migrated event is a faithful restatement of a
+          recorded date, <strong>not</strong> a witness that anything happened on it,
+          and not a timestamp proving when these hashes existed.
+        </p>
+      ) : null}
 
       <p className={styles.caveat}>
         {record.integrity.payloadScope === 'legacy-record' ? (

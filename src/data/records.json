@@ -68,8 +68,13 @@
           "note": "Sealed before the payload/event split. The digest covers the record as it then existed, outcome included, so it does not demonstrate that this payload predates its outcome.",
           "payloadScope": "legacy-record"
         },
-        "digest": "40a33e225294fa9c466359d2f9b4932d0464f93ec108a3471f7d3c417f97fa1e",
-        "prevDigest": null
+        "digest": "a4feb0c4309c7b0cdcc17e88c0619a74b1945d60fc801cda909cd09f083abc24",
+        "prevDigest": null,
+        "recordedAt": "2026-11-22T17:51:26.000Z",
+        "origin": "migrated",
+        "algorithm": "sha256",
+        "schemaVersion": 1,
+        "scope": "event-envelope+published-payload"
       }
     ]
   },
@@ -134,8 +139,13 @@
           "note": "Sealed before the payload/event split. The digest covers the record as it then existed, outcome included, so it does not demonstrate that this payload predates its outcome.",
           "payloadScope": "legacy-record"
         },
-        "digest": "b90fe5f6086ce7a29a544bb7d8358392699fe49ecf9d8cbae0e1ad2cae6d518c",
-        "prevDigest": null
+        "digest": "f1d40d26bb2043b85fa214051a1bea112a675b0265331b146740744cf03d5fe3",
+        "prevDigest": null,
+        "recordedAt": "2026-11-22T17:51:26.000Z",
+        "origin": "migrated",
+        "algorithm": "sha256",
+        "schemaVersion": 1,
+        "scope": "event-envelope+published-payload"
       }
     ]
   },
@@ -200,8 +210,13 @@
           "note": "Sealed before the payload/event split. The digest covers the record as it then existed, outcome included, so it does not demonstrate that this payload predates its outcome.",
           "payloadScope": "legacy-record"
         },
-        "digest": "f5651bd345ace5c4460454a029282bc9fd50a9aa911a1c9d65c6a8b5009c00ee",
-        "prevDigest": null
+        "digest": "f415b94fa9a779abd689a4072c3e0bbda99239461d5a0b6e5e84c0f0f7f7177e",
+        "prevDigest": null,
+        "recordedAt": "2026-11-22T17:51:26.000Z",
+        "origin": "migrated",
+        "algorithm": "sha256",
+        "schemaVersion": 1,
+        "scope": "event-envelope+published-payload"
       }
     ]
   },
@@ -266,8 +281,13 @@
           "note": "Sealed before the payload/event split. The digest covers the record as it then existed, outcome included, so it does not demonstrate that this payload predates its outcome.",
           "payloadScope": "legacy-record"
         },
-        "digest": "dc58abfcebca3ab675eb6949d2f56c27381a3a7bdf8f092323fd0a303fcc35c7",
-        "prevDigest": null
+        "digest": "f6bb7f893745d1fda7280af045c6b1967fa400d1499d955d3eaa303249b4a451",
+        "prevDigest": null,
+        "recordedAt": "2026-11-22T17:51:26.000Z",
+        "origin": "migrated",
+        "algorithm": "sha256",
+        "schemaVersion": 1,
+        "scope": "event-envelope+published-payload"
       }
     ]
   },
@@ -332,8 +352,13 @@
           "note": "Sealed before the payload/event split. The digest covers the record as it then existed, outcome included, so it does not demonstrate that this payload predates its outcome.",
           "payloadScope": "legacy-record"
         },
-        "digest": "76df886b2e123df0d1a6d0f7e4788a364adcef09371a66647943c952cb2c3adf",
-        "prevDigest": null
+        "digest": "8e9f9abec996555c2b855501b7fcfdec42c24a08c4561d9e94c5ce8d110e8a5c",
+        "prevDigest": null,
+        "recordedAt": "2026-11-22T17:51:26.000Z",
+        "origin": "migrated",
+        "algorithm": "sha256",
+        "schemaVersion": 1,
+        "scope": "event-envelope+published-payload"
       }
     ]
   },
@@ -398,8 +423,13 @@
           "note": "Sealed before the payload/event split. The digest covers the record as it then existed, outcome included, so it does not demonstrate that this payload predates its outcome.",
           "payloadScope": "legacy-record"
         },
-        "digest": "b44528acf543cd335e387b98eedff70eb1d6c71a033484fe62a046bf4f6f613c",
-        "prevDigest": null
+        "digest": "55412897cd7c35b1bffafc189d9604d3085e167453b65eca0c4a5da1ed41799c",
+        "prevDigest": null,
+        "recordedAt": "2026-11-22T17:51:26.000Z",
+        "origin": "migrated",
+        "algorithm": "sha256",
+        "schemaVersion": 1,
+        "scope": "event-envelope+published-payload"
       }
     ]
   },
@@ -456,8 +486,13 @@
           "note": "Sealed before the payload/event split. The digest covers the record as it then existed, outcome included, so it does not demonstrate that this payload predates its outcome.",
           "payloadScope": "legacy-record"
         },
-        "digest": "2a084413ba5675867ba0d481d83dc32efd7f8b128c2367ffb5a1ac226c2b13de",
-        "prevDigest": null
+        "digest": "84a4cb79b045ee182b4f15ddf6620faf5ae6baec4f16f8bfc4b814123dd1cc60",
+        "prevDigest": null,
+        "recordedAt": "2026-11-22T17:51:26.000Z",
+        "origin": "migrated",
+        "algorithm": "sha256",
+        "schemaVersion": 1,
+        "scope": "event-envelope+published-payload"
       },
       {
         "seq": "e1",
@@ -469,8 +504,13 @@
           "note": "Demo resolution recorded to demonstrate how outcomes attach to a sealed record. The figures are fabricated.",
           "evidenceIds": []
         },
-        "digest": "18da47c87088e9286d47677ca4d6d35c11ec84471886c36a4285cfd534e0cbda",
-        "prevDigest": "2a084413ba5675867ba0d481d83dc32efd7f8b128c2367ffb5a1ac226c2b13de"
+        "digest": "e9313509ced70b57edd645279d689e33bc2970320b92e0165169df4da917c59d",
+        "prevDigest": "84a4cb79b045ee182b4f15ddf6620faf5ae6baec4f16f8bfc4b814123dd1cc60",
+        "recordedAt": "2026-11-22T17:51:26.000Z",
+        "origin": "migrated",
+        "algorithm": "sha256",
+        "schemaVersion": 1,
+        "scope": "event-envelope"
       }
     ]
   },
@@ -535,8 +575,13 @@
           "note": "Sealed before the payload/event split. The digest covers the record as it then existed, outcome included, so it does not demonstrate that this payload predates its outcome.",
           "payloadScope": "legacy-record"
         },
-        "digest": "b5287a347ef88eecaf63b4f67a58e60259c0ef85d1dc99670df13646c0354a0e",
-        "prevDigest": null
+        "digest": "f70e7423a6325e2ed893c45936a8da1dcfe5908e0c6397c7d3eb2247c6c338b4",
+        "prevDigest": null,
+        "recordedAt": "2026-11-22T17:51:26.000Z",
+        "origin": "migrated",
+        "algorithm": "sha256",
+        "schemaVersion": 1,
+        "scope": "event-envelope+published-payload"
       }
     ]
   },
@@ -593,8 +638,13 @@
           "note": "Sealed before the payload/event split. The digest covers the record as it then existed, outcome included, so it does not demonstrate that this payload predates its outcome.",
           "payloadScope": "legacy-record"
         },
-        "digest": "06b06591d49ca3dca02bfae30b973ae59d28385e12c0d514e292ca7278dc0500",
-        "prevDigest": null
+        "digest": "21d3a3f8412b6040e58ef7c662baf8a1e125b33a9a28b6c464eade1d3c95e580",
+        "prevDigest": null,
+        "recordedAt": "2026-11-22T17:51:26.000Z",
+        "origin": "migrated",
+        "algorithm": "sha256",
+        "schemaVersion": 1,
+        "scope": "event-envelope+published-payload"
       },
       {
         "seq": "e1",
@@ -605,8 +655,13 @@
           "basis": "Annulled before its horizon ended because the resolution rule could not be applied consistently by two independent reviewers using the published text.",
           "note": "Annulled records stay public with their original probability and full revision history. This is how the archive is designed to handle a badly specified question."
         },
-        "digest": "0f5d4ccdfad351a1be2e87987e1367f4fcc28ab59f7c59dfef908650e7b6040c",
-        "prevDigest": "06b06591d49ca3dca02bfae30b973ae59d28385e12c0d514e292ca7278dc0500"
+        "digest": "10eed0daf45a82d5b5159136bdc4e53039fff962560b173751cff2c6f31de469",
+        "prevDigest": "21d3a3f8412b6040e58ef7c662baf8a1e125b33a9a28b6c464eade1d3c95e580",
+        "recordedAt": "2026-11-22T17:51:26.000Z",
+        "origin": "migrated",
+        "algorithm": "sha256",
+        "schemaVersion": 1,
+        "scope": "event-envelope"
       }
     ]
   },
@@ -663,8 +718,13 @@
           "note": "Sealed before the payload/event split. The digest covers the record as it then existed, outcome included, so it does not demonstrate that this payload predates its outcome.",
           "payloadScope": "legacy-record"
         },
-        "digest": "8356251447e523e1ea79882363c987bf3791186074aa6cc63ae803d81e39a70c",
-        "prevDigest": null
+        "digest": "5ff55606d245d75e2100961943293088adda5d77f77bbc57f9f9d18f83a5aa75",
+        "prevDigest": null,
+        "recordedAt": "2026-11-22T17:51:26.000Z",
+        "origin": "migrated",
+        "algorithm": "sha256",
+        "schemaVersion": 1,
+        "scope": "event-envelope+published-payload"
       },
       {
         "seq": "e1",
@@ -676,8 +736,13 @@
           "note": "Demo resolution. The literature review behind this base rate is fabricated.",
           "evidenceIds": []
         },
-        "digest": "42a167ec75280d649e9eba18e071c3fc43a7a8e41a129ad93cb434d8d7c49f59",
-        "prevDigest": "8356251447e523e1ea79882363c987bf3791186074aa6cc63ae803d81e39a70c"
+        "digest": "7c8b9b0b10d0a974369961cc560aa154c16775323edca1f84bd0599c029193d4",
+        "prevDigest": "5ff55606d245d75e2100961943293088adda5d77f77bbc57f9f9d18f83a5aa75",
+        "recordedAt": "2026-11-22T17:51:26.000Z",
+        "origin": "migrated",
+        "algorithm": "sha256",
+        "schemaVersion": 1,
+        "scope": "event-envelope"
       }
     ]
   }

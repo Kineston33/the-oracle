@@ -3,10 +3,15 @@ import {
   AppendError,
   appendEvent,
   canonicalize,
+  nextEvent,
   sealedPayload,
   sequenceLabel,
 } from './events';
-import { eventChainProblems, payloadMatchesPublishedEvent } from './validate';
+import {
+  eventChainProblems,
+  publishedLinkProblems,
+  recomputeDeclaredDigest,
+} from './validate';
 import { deriveLifecycle } from './lifecycle';
 import { predictionRecords } from './records';
 import { digestPayload, digestEvent, verifyEventChain } from '@/lib/integrity';
@@ -31,6 +36,11 @@ function resolutionEvent(prevDigest: string): RecordEvent {
       note: 'Test fixture.',
       evidenceIds: [],
     },
+    recordedAt: '2029-01-02T00:00:00.000Z',
+    origin: 'observed',
+    algorithm: 'sha256',
+    schemaVersion: 1,
+    scope: 'event-envelope',
     digest: 'a'.repeat(64),
     prevDigest,
   };
@@ -98,12 +108,11 @@ describe('appending events', () => {
     expect(deriveLifecycle(appended).status).toBe('resolved');
   });
 
-  it('forces a reopen to become a new record, not a new event', () => {
-    // Sequencing is enforced at build time; a resolved record cannot take
-    // another terminal event, which is what stops a silent re-resolution.
+  it('refuses a second terminal event before the chain is even built', () => {
+    // Not merely rejected later by validation: appendEvent throws, so an
+    // invalid chain cannot be constructed in the first place.
     const second = { ...resolutionEvent(resolved.events[1].digest), seq: 'e2' };
-    const reopened = appendEvent(resolved, second);
-    expect(eventChainProblems(reopened).length).toBeGreaterThan(0);
+    expect(() => appendEvent(resolved, second)).toThrow(AppendError);
   });
 });
 
@@ -165,32 +174,27 @@ describe('event ordering rules', () => {
 });
 
 describe('re-sealing is refused', () => {
-  it('matches a published event against the digest scope it declares', async () => {
+  it('links the published event to the digest the record declares', () => {
     const published = open.events[0].body as { payloadDigest: string; payloadScope: string };
     expect(published.payloadScope).toBe(open.integrity.payloadScope);
     expect(published.payloadDigest).toBe(open.integrity.digest);
-
-    // Verified with the algorithm that scope implies.
-    const { verifyRecordDigest } = await import('@/lib/integrity');
-    const current = await verifyRecordDigest(open);
-    expect(payloadMatchesPublishedEvent(open, current)).toBe(true);
+    expect(publishedLinkProblems(open, true, open.integrity.digest)).toEqual([]);
   });
 
   it('flags a payload edited after publication', async () => {
-    const { verifyRecordDigest } = await import('@/lib/integrity');
     const edited: PredictionRecord = { ...open, probability: open.probability + 0.05 };
-    const current = await verifyRecordDigest(edited);
-    expect(payloadMatchesPublishedEvent(edited, current)).toBe(false);
+    const current = await recomputeDeclaredDigest(edited);
+    const problems = publishedLinkProblems(edited, current === edited.integrity.digest, current);
+    expect(problems.length).toBeGreaterThan(0);
   });
 
   it('refuses to compare across payload scopes', () => {
-    // A legacy digest compared with a modern payload digest must never "match".
-    expect(payloadMatchesPublishedEvent(open, open.integrity.digest)).toBe(true);
     const wrongScope: PredictionRecord = {
       ...open,
       integrity: { ...open.integrity, payloadScope: 'sealed-payload' },
     };
-    expect(payloadMatchesPublishedEvent(wrongScope, open.integrity.digest)).toBe(false);
+    const problems = publishedLinkProblems(wrongScope, true, wrongScope.integrity.digest);
+    expect(problems.some((p) => p.includes('covers'))).toBe(true);
   });
 
   it('keeps the published event digest pointing at the original payload', async () => {
@@ -204,6 +208,99 @@ describe('re-sealing is refused', () => {
 
   it('exposes an AppendError type for callers that sequence events', () => {
     expect(new AppendError('x')).toBeInstanceOf(Error);
+  });
+});
+
+describe('terminal transitions are final', () => {
+  const resolvedRecord = predictionRecords.find((r) => r.id === 'ORC-2025-0007')!;
+  const annulledRecord = predictionRecords.find((r) => r.id === 'ORC-2025-0009')!;
+
+  function body() {
+    return {
+      outcome: 'yes' as const,
+      basis: 'fixture',
+      note: 'fixture',
+      evidenceIds: [],
+    };
+  }
+
+  function annulBody() {
+    return { reason: 'fixture', basis: 'fixture', note: 'fixture' };
+  }
+
+  it('refuses to resolve a record that was already resolved', () => {
+    expect(() =>
+      appendEvent(resolvedRecord, {
+        ...resolutionEvent(resolvedRecord.events[1].digest),
+        seq: 'e2',
+      }),
+    ).toThrow(AppendError);
+  });
+
+  it('refuses to annul a record that was already resolved', () => {
+    // The incompatible pair: a resolution and an annulment cannot coexist.
+    expect(() =>
+      appendEvent(resolvedRecord, {
+        ...resolutionEvent(resolvedRecord.events[1].digest),
+        seq: 'e2',
+        kind: 'annulled',
+        body: annulBody(),
+      }),
+    ).toThrow(/resolution is final/i);
+  });
+
+  it('refuses to resolve a record that was annulled', () => {
+    expect(() =>
+      appendEvent(annulledRecord, {
+        ...resolutionEvent(annulledRecord.events[1].digest),
+        seq: 'e2',
+        kind: 'resolved',
+        body: body(),
+      }),
+    ).toThrow(/annulment is final/i);
+  });
+
+  it('refuses to annul a record that was already annulled', () => {
+    expect(() =>
+      appendEvent(annulledRecord, {
+        ...resolutionEvent(annulledRecord.events[1].digest),
+        seq: 'e2',
+        kind: 'annulled',
+        body: annulBody(),
+      }),
+    ).toThrow(AppendError);
+  });
+
+  it('allows the first terminal transition on an open record', () => {
+    const appended = appendEvent(open, resolutionEvent(open.events[0].digest));
+    expect(deriveLifecycle(appended).status).toBe('resolved');
+  });
+
+  it('refuses a second publication', () => {
+    expect(() =>
+      appendEvent(open, { ...open.events[0], seq: 'e1', prevDigest: open.events[0].digest }),
+    ).toThrow(AppendError);
+  });
+
+  it('refuses to record an event before the moment it records', () => {
+    // nextEvent rejects a recordedAt that is not strictly later.
+    expect(() =>
+      nextEvent(open, 'resolved', '2029-01-01T00:00:00.000Z', body(), {
+        digest: 'a'.repeat(64),
+        recordedAt: '2029-01-01T00:00:00.000Z',
+      }),
+    ).toThrow(AppendError);
+  });
+
+  it('accepts a well-formed transition and marks it observed', () => {
+    const event = nextEvent(open, 'resolved', '2029-01-01T00:00:00.000Z', body(), {
+      digest: 'a'.repeat(64),
+      recordedAt: '2029-01-02T00:00:00.000Z',
+    });
+    expect(event.origin).toBe('observed');
+    expect(event.scope).toBe('event-envelope');
+    expect(event.algorithm).toBe('sha256');
+    expect(event.schemaVersion).toBe(1);
   });
 });
 

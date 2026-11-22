@@ -351,15 +351,20 @@ describe('canonicalKey across scripts', () => {
 describe('validation module stays importable outside the bundle', () => {
   const source = readFileSync(resolve(process.cwd(), 'src/data/validate.ts'), 'utf8');
 
-  it('declares no runtime dependency beyond the domain-free lifecycle module', () => {
-    const runtimeImports = source
-      .split('\n')
-      .filter((line) => /^import (?!type )/.test(line.trim()))
-      // lifecycle.ts is itself JSON-free and DOM-free; it is what makes derived
-      // status available to validation without pulling in the archive.
-      .filter((line) => !line.includes("'./lifecycle.ts'"));
+  it('declares no runtime dependency outside the JSON-free data modules', () => {
+    // Parse specifiers rather than lines: the imports are multi-line, and a
+    // line-based filter silently passed them through.
+    const runtimeSpecifiers = [...source.matchAll(/^import (?!type )([\s\S]*?)from '([^']+)';/gm)].map(
+      (match) => match[2],
+    );
 
-    expect(runtimeImports).toEqual([]);
+    // Every allowed module is itself JSON-free, DOM-free and free of path
+    // aliases, which is what lets the build gate import validate.ts under a
+    // plain `node` process with no bundler.
+    expect(runtimeSpecifiers.every((specifier) => specifier.startsWith('./'))).toBe(true);
+    expect(
+      runtimeSpecifiers.filter((specifier) => !['./lifecycle.ts', './events.ts', './hash.ts'].includes(specifier)),
+    ).toEqual([]);
   });
 
   it('imports types only from the domain module', () => {

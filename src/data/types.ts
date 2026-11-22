@@ -208,23 +208,79 @@ export type RecordEventBody = PublishedEventBody | ResolvedEventBody | AnnulledE
 export type RecordEventKind = 'published' | 'resolved' | 'annulled';
 
 /**
+ * How an event came to be in this archive.
+ *
+ * - `migrated` — the event was constructed when the payload/event model was
+ *   introduced, from fields that already existed on the record (`publishedAt`,
+ *   `resolution.resolvedAt`). The chain did not exist at `occurredAt`.
+ * - `observed` — the event was written while the thing happened, under this
+ *   model. Only these events are contemporaneous with their `occurredAt`.
+ *
+ * Never derive one from the other. A migrated event is a faithful restatement of
+ * a recorded date, not a witness that anything happened on that date.
+ */
+export type EventOrigin = 'migrated' | 'observed';
+
+/**
  * One link in a record's append-only event chain.
  *
- * `digest` covers `{ seq, kind, occurredAt, body, prevDigest }`, so the chain is
- * ordered and tamper-evident: changing any event invalidates it and every event
- * after it. Adding an event appends a link; it never alters an earlier one.
+ * `digest` covers `{ schema, algorithm, scope, seq, kind, occurredAt, body,
+ * prevDigest }`, so the chain is ordered and tamper-evident: changing any event
+ * invalidates it and every event after it. Adding an event appends a link; it
+ * never alters an earlier one.
+ *
+ * The declaration fields exist so a digest never has to be interpreted by
+ * convention. A verifier reading a single event knows which hash produced it,
+ * which scheme version it belongs to, and exactly which bytes it covers.
  */
 export interface RecordEvent {
   /** Deterministic position: 'e0', 'e1', … Assigned at append time. */
   seq: string;
   kind: RecordEventKind;
+  /**
+   * The date the event is *declared* to have happened. For a migrated event this
+   * is the date the archive already recorded; it is not an observation date.
+   */
   occurredAt: IsoDateTime;
   body: RecordEventBody;
-  /** Hex SHA-256 over the canonical event envelope. */
+  /**
+   * When this event was written into the archive.
+   *
+   * For migrated events this is provably later than `occurredAt`: a migrated
+   * chain could not have existed before the model that defines events. The
+   * validator enforces `recordedAt > max(occurredAt)` per record, which is a
+   * real property of the data rather than an invented timestamp.
+   */
+  recordedAt: IsoDateTime;
+  origin: EventOrigin;
+  /**
+   * Digest algorithm. `sha256` is the only value this build accepts; an unknown
+   * value is a validation failure, not a fallback.
+   */
+  algorithm: 'sha256';
+  /** Scheme version of this envelope. Bumping it changes every event digest. */
+  schemaVersion: 1;
+  /**
+   * Exactly what `digest` covers.
+   *
+   * `published-payload` — the digest of the sealed payload (for a
+   *   `sealed-payload` record) or of the legacy whole-record shape (for a
+   *   `legacy-record` record). Same bytes as `integrity.digest`.
+   * `event-envelope` — the event envelope itself, chained to its predecessor.
+   * `event-envelope+published-payload` — both, for the `published` event, so
+   *   the chain is bound to the payload by a single hash.
+   */
+  scope: EventDigestScope;
+  /** Lowercase hex digest over the declared scope. */
   digest: string;
   /** Digest of the previous event, or null for the first ('published'). */
   prevDigest: string | null;
 }
+
+export type EventDigestScope =
+  | 'published-payload'
+  | 'event-envelope'
+  | 'event-envelope+published-payload';
 
 /**
  * A single official prediction record.

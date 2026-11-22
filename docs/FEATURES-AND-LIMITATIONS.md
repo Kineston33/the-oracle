@@ -242,4 +242,14 @@ accountable forecasting should not begin with an inflated account of itself.
     the relationship between revisions.
 28. **The chain is local tamper-evidence.** Recomputing it proves internal consistency. It does
     not prove the chain was not rebuilt from scratch by someone with write access, because
-    nothing anchors it externally yet.
+    nothing anchors it externally yet. The publication link makes a *partial* edit detectable
+    (payload or event changed in isolation); a full rebuild that regenerates every digest stays
+    internally consistent and is caught only by comparing against git history, not by
+    `npm run validate`. Until an anchor exists, that is the honest boundary.
+29. **Every shipped event is `migrated`.** Its `occurredAt` is a restated archive date, not an
+    observation. No shipped event can claim it was written while the thing happened. That
+    capability arrives with the publication pipeline; until then `origin: 'observed'` appears
+    only in tests.
+30. **`recordedAt` is per record, not per event.** All events of one record share the migration
+    timestamp in the current data. The validator checks the ordering inequality, not an exact
+    per-event time, because no such precision was ever recorded.

@@ -27,6 +27,12 @@ import {
   payloadBytes,
   sealedPayload,
 } from '@/data/events';
+import { hasWebCrypto, sha256Hex } from '@/data/hash';
+import {
+  EVENT_ALGORITHM,
+  EVENT_SCHEMA_VERSION,
+} from '@/data/events';
+import { eventChainProblems, publishedLinkProblems } from '@/data/validate';
 
 export { canonicalize, sealedPayload };
 export type { SealedPayload } from '@/data/types';
@@ -38,19 +44,16 @@ export function shortDigest(digest: string, head = 10, tail = 6): string {
 }
 
 /**
- * SHA-256 hex digest of a byte array, via Web Crypto.
+ * SHA-256 hex digest, via Web Crypto.
  *
  * `crypto.subtle` requires a secure context (https or localhost). On an
  * insecure origin the caller receives a rejected promise and the integrity
  * panel reports that verification is unavailable rather than pretending.
+ *
+ * The implementation lives in `data/hash.ts` so the build gate, which runs as a
+ * plain Node process with no bundler, hashes exactly the same bytes.
  */
-export async function sha256Hex(bytes: Uint8Array): Promise<string> {
-  if (!globalThis.crypto?.subtle) {
-    throw new Error('Web Crypto is unavailable in this context');
-  }
-  const buffer = await globalThis.crypto.subtle.digest('SHA-256', toArrayBuffer(bytes));
-  return toHex(new Uint8Array(buffer));
-}
+export { sha256Hex } from '@/data/hash';
 
 /**
  * Digest of the sealed payload — the content fixed at publication.
@@ -113,6 +116,14 @@ export async function verifyEventChain(record: PredictionRecord): Promise<ChainV
 
   for (let index = 0; index < record.events.length; index += 1) {
     const event = record.events[index];
+    if (event.algorithm !== EVENT_ALGORITHM) {
+      broken.push(event.seq);
+      continue;
+    }
+    if (event.schemaVersion !== EVENT_SCHEMA_VERSION) {
+      broken.push(event.seq);
+      continue;
+    }
     const recomputed = await digestEvent(event);
     if (recomputed !== event.digest) broken.push(event.seq);
 
@@ -125,27 +136,79 @@ export async function verifyEventChain(record: PredictionRecord): Promise<ChainV
 }
 
 /* -------------------------------------------------------------------------
-   Deprecated name
+   Full verification
    ------------------------------------------------------------------------- */
 
-/**
- * @deprecated Ambiguous: it silently picked whichever payload definition was
- * current. Use `digestPayload` (sealed content) or `verifyRecordDigest` (what a
- * stored digest claims to be).
- *
- * Kept as an alias of `digestPayload` so existing call sites keep compiling,
- * but nothing that needs to re-seal a published record should call it.
- */
-export const digestRecord = digestPayload;
-
-function toArrayBuffer(bytes: Uint8Array): ArrayBuffer {
-  const buffer = new ArrayBuffer(bytes.byteLength);
-  new Uint8Array(buffer).set(bytes);
-  return buffer;
+export interface RecordVerification {
+  ok: boolean;
+  /** Human-readable failures, empty when `ok`. */
+  problems: string[];
+  /** Digest recomputed from the shipped bytes, under the declared scope. */
+  computedDigest: string | null;
+  /** Whether the recomputed digest equals `integrity.digest`. */
+  digestMatches: boolean;
 }
 
-function toHex(bytes: Uint8Array): string {
-  let out = '';
-  for (const byte of bytes) out += byte.toString(16).padStart(2, '0');
-  return out;
+/**
+ * Everything a reader needs to know about one record, in one call.
+ *
+ * Three things are checked and all three must hold:
+ *
+ *   1. the sealed payload's digest reproduces under the scope it declares;
+ *   2. the `published` event names exactly that digest, and nothing else does;
+ *   3. every event digest reproduces and every link points backwards correctly.
+ *
+ * Checks 1 and 2 are what close the gap that made re-sealing invisible: editing
+ * the payload and updating `integrity.digest` alone leaves an event that names
+ * the old digest, and rebuilding the event fixes that but cannot forge an
+ * anchor. With no external witness, checks 1–3 together prove internal
+ * consistency and nothing more — see the returned `problems` wording, which
+ * never claims otherwise.
+ */
+export async function verifyRecordCompletely(
+  record: PredictionRecord,
+): Promise<RecordVerification> {
+  const problems: string[] = [];
+  let computedDigest: string | null = null;
+
+  if (!hasWebCrypto()) {
+    return {
+      ok: false,
+      problems: ['Web Crypto is unavailable, so nothing could be verified.'],
+      computedDigest: null,
+      digestMatches: false,
+    };
+  }
+
+  try {
+    computedDigest = await verifyRecordDigest(record);
+  } catch (error) {
+    problems.push(`Digest could not be recomputed: ${(error as Error).message}`);
+  }
+
+  const digestMatches = computedDigest !== null && computedDigest === record.integrity.digest;
+  if (computedDigest !== null && !digestMatches) {
+    problems.push(
+      `Record ${record.id}: the sealed content no longer matches integrity.digest.`,
+    );
+  }
+
+  problems.push(...publishedLinkProblems(record, digestMatches, computedDigest));
+  problems.push(...eventChainProblems(record));
+
+  const chain = await verifyEventChain(record);
+  if (!chain.ok) {
+    if (chain.broken.length > 0) {
+      problems.push(
+        `Record ${record.id}: event digest does not reproduce for ${chain.broken.join(', ')}.`,
+      );
+    }
+    if (chain.mislinked.length > 0) {
+      problems.push(
+        `Record ${record.id}: event link is wrong for ${chain.mislinked.join(', ')}.`,
+      );
+    }
+  }
+
+  return { ok: problems.length === 0, problems, computedDigest, digestMatches };
 }
