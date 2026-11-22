@@ -284,3 +284,15 @@ accountable forecasting should not begin with an inflated account of itself.
     `appendEvent` refuse terminal events on them. This is the original sealing defect made
     explicit; it is not repaired, because repairing it would mean re-sealing or rewriting
     history.
+
+36. **One UI test is sensitive to extreme parallel load.** `App.test.tsx > navigation >
+    navigates from the homepage to the archive` clicks through a `lazy()` route. Under heavy
+    CPU contention the navigation completes but takes 3.6–4.4 s, which exceeded the default
+    1000 ms async-utility timeout. The ceiling is now 5000 ms, measured, and the test passes in
+    a normal run.
+
+    It is **not** fully fixed: with six concurrent full-file runs it can still fail even at a
+    10 s ceiling, because there is no value that survives arbitrary contention. The cause is
+    known — jsdom plus a dynamic import under load, not a broken component: with a 20 s ceiling
+    the same test passes 6/6 and nothing else fails. If this ever appears in CI, the answer is
+    to run that file in isolation, not to raise the ceiling again.

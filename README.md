@@ -162,19 +162,44 @@ draft and a resolution checklist instead, and states its own limitations inline.
 
 ## Editing the demo archive
 
-Records live in `src/data/records.json`. To change one:
+Records live in `src/data/records.json`. **A published record is not editable.** Changing its
+sealed content and recomputing the digest is the exact rewrite this model exists to prevent,
+and the tooling refuses it.
+
+`npm run seal` verifies; it does not re-seal:
+
+| Record state | What `npm run seal` does |
+|---|---|
+| Carries a digest that reproduces | Verifies it, reports it untouched. Writes nothing |
+| Carries a digest that does **not** reproduce | **Refuses.** Exit 1, nothing written, the offending id named |
+| Carries no digest at all (never sealed) | Seals it for the first time — the one supported write |
+| Event chain or publication link inconsistent | **Refuses.** Exit 1, nothing written |
+
+There is no `--force`. If you edit a published record, the next `npm run seal` and
+`npm run validate` both fail, and that failure is the feature working.
 
 ```bash
-# 1. edit src/data/records.json
-npm run seal     # 2. recompute every record's SHA-256 digest
-npm test         # 3. the integrity test fails if any record is unsealed
+npm run seal      # verify every digest; seal only what was never sealed
+npm run validate  # structural + cryptographic checks; fails the build on any problem
 ```
 
-`scripts/seal-records.mjs` uses the identical canonicalization routine as the runtime
-(`lib/integrity.ts`), so the digests it writes are the digests the browser verifies.
+So how do you change something? You do not, in place:
 
-> Sealing is **not** notarization. It proves the digest embedded in the repository matches
-> the record shipped with it. No external party has witnessed or countersigned anything.
+- **A typo or a wrong source in a record that was never published** — correct it before it is
+  sealed. Once sealed, it is sealed.
+- **A correction to a published record** — a new record, with its own publication event and
+  its own seal. The original stays visible. Revisions are *not* implemented yet; the honest
+  current answer is that a correction means a new entry, not an edited one.
+- **The seven open legacy records** — immutable historical demonstrations. Not resolvable,
+  not revisable, digests never rewritten. See limitation 31.
+
+`scripts/seal-records.mjs` shares the canonicalization routine with the runtime
+(`lib/integrity.ts`) and the build gate (`data/validate.ts`), so the digests it writes are the
+digests the browser verifies.
+
+> Sealing is **not** notarization. It shows the bytes shipped in the repository reproduce the
+> digest stored beside them. It does not show when that digest existed, and no external party
+> has witnessed or countersigned anything.
 
 ---
 
@@ -368,10 +393,13 @@ Every event in this repository is `origin: 'migrated'`. The chains were construc
 - `recordedAt` is the moment the restatement was written;
 - neither is a timestamp proving the hashes existed at `occurredAt`.
 
-The validator enforces the inequality per event: each was recorded strictly later than the
-moment it records, and `recordedAt` never goes backwards along a chain. That is provable
-from the data without inventing a timestamp. A migrated event is never presented as a
-temporal proof, and the record page says so explicitly.
+The validator enforces an ordering per event: `recordedAt` must be strictly later than
+`occurredAt`, and must not move backwards along a chain. That is a **consistency condition on
+the shipped fields**, not proof of when anything was written — a reconstruction can choose both
+values and satisfy it. What the inequality rules out is a specific, careless error: a record
+that claims to have been written before the moment it describes. It cannot rule out a
+deliberate rebuild. A migrated event is never presented as a temporal proof, and the record
+page says so explicitly.
 
 Mixed chains are allowed. A migrated record resolved *later*, for real, must record that
 resolution as `observed`; forcing the whole chain to stay `migrated` would mean mislabelling
@@ -385,16 +413,22 @@ digest protects that claim — it cannot be edited into place — but protecting
 the same as proving it. Someone who rebuilds the whole chain can produce any `origin` and any
 `recordedAt` they like, and every digest will verify.
 
-The two origins therefore make different-strength claims:
+Neither origin is proof of *when* the event was written. Both are declarations the digest
+protects from casual editing, and neither survives a rebuild:
 
-| Origin | What it claims | Can this build prove it? |
+| Origin | What it declares | Provable as a date? |
 |---|---|---|
-| `migrated` | written later than the dates it records | Yes, by the ordering inequality, independently of the hash |
-| `observed` | written contemporaneously with the event | No. Parsimony alone distinguishes it, and that would be circular |
+| `migrated` | this event was written after the dates it records | **No.** The validator checks `recordedAt > occurredAt`, which is a consistency condition on the shipped fields. A reconstruction can set both values freely and recompute every hash |
+| `observed` | this event was written while the thing happened | **No.** Nothing distinguishes a genuine contemporaneous record from an invented one without an external witness |
+
+What `migrated` *does* buy you is bounded: it is an admission that the chain was written after
+the fact, so it cannot be mistaken for contemporaneous evidence. `observed` makes the stronger
+claim and therefore owes more — and cannot pay it yet.
 
 Only an external witness — a transparency log, a timestamped publication — could show when
-these bytes existed. Until one is implemented, `observed` is shown in the interface as
-"declared observed, not proven", and no record can be marked anchored.
+these bytes existed. Until one is implemented, the interface shows `observed` as "declared
+observed, not proven", `migrated` as "migrated, not witnessed", and no record can be marked
+anchored.
 
 ### A legacy-scope record can never be resolved
 
