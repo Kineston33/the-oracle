@@ -9,6 +9,8 @@ import {
   predictionRecords,
   sortByPublication,
 } from './records';
+import { readFileSync } from 'node:fs';
+import { resolve } from 'node:path';
 import type { PredictionRecord } from './types';
 
 describe('filterRecords', () => {
@@ -132,6 +134,12 @@ describe('canonical question uniqueness', () => {
     );
   });
 
+  it('folds compatibility equivalents through NFKC', () => {
+    // Full-width digits and letters, ligatures and enclosed numerals.
+    expect(canonicalKey('Exceed １２００ GW?')).toBe(canonicalKey('Exceed 1200 GW?'));
+    expect(canonicalKey('the \uFB01rst ① target')).toBe(canonicalKey('the first 1 target'));
+  });
+
   it('keeps genuinely different questions apart', () => {
     const a = canonicalKey('Will battery storage exceed 1,200 GW?');
     const b = canonicalKey('Will battery storage exceed 2,100 GW?');
@@ -215,5 +223,138 @@ describe('published probability is frozen', () => {
 describe('demonstration provenance', () => {
   it('flags every shipped record as demonstration data', () => {
     expect(predictionRecords.every((record) => record.demo)).toBe(true);
+  });
+});
+
+/**
+ * The canonical key must survive every script, not just Latin. An earlier
+ * version used `[^a-z0-9]`, which deleted whole words: an Arabic or Russian
+ * question collapsed to its digits alone and then collided with any other.
+ */
+describe('canonicalKey across scripts', () => {
+  it('preserves Spanish accents instead of deleting the word', () => {
+    const key = canonicalKey('¿Se superarán los 1.200 GW de almacenamiento antes de 2030?');
+    expect(key).toContain('superarán');
+    expect(key).toContain('almacenamiento');
+  });
+
+  it('preserves Portuguese accents', () => {
+    const key = canonicalKey('A capacidade de armazenamento excederá 1.200 GW?');
+    expect(key).toContain('excederá');
+    expect(key).toContain('capacidade');
+  });
+
+  it('preserves French accents and apostrophes', () => {
+    const key = canonicalKey("La capacité d'stockage dépassera-t-elle 1 200 GW ?");
+    expect(key).toContain('capacité');
+    expect(key).toContain('dépassera');
+  });
+
+  it('preserves Cyrillic', () => {
+    const key = canonicalKey('Превысит ли мощность накопителей 1200 ГВт?');
+    expect(key).toContain('превысит');
+    expect(key).toContain('накопителей');
+    expect(key).not.toBe('1200');
+  });
+
+  it('preserves Greek', () => {
+    const key = canonicalKey('Θα ξεπεράσει η αποθήκευση 1200 GW;');
+    expect(key).toContain('ξεπεράσει');
+    expect(key).toContain('αποθήκευση');
+  });
+
+  it('preserves Arabic', () => {
+    const key = canonicalKey('هل ستتجاوز سعة التخزين 1200 جيجاواط؟');
+    expect(key).toContain('التخزين');
+    expect(key).toContain('جيجاواط');
+    expect(key).not.toBe('1200');
+  });
+
+  it('preserves Hebrew', () => {
+    const key = canonicalKey('האם קיבולת האחסון תעלה על 1200 גיגוואט?');
+    expect(key).toContain('האחסון');
+  });
+
+  it('preserves Japanese and Chinese', () => {
+    expect(canonicalKey('蓄電池の設備容量は1,200GWを超えるか？')).toContain('蓄電池');
+    expect(canonicalKey('电池储能容量会超过1200吉瓦吗？')).toContain('电池');
+  });
+
+  it('preserves Devanagari', () => {
+    const key = canonicalKey('क्या भंडारण क्षमता 1200 गीगावाट से अधिक होगी?');
+    expect(key).toContain('भंडारण');
+  });
+
+  it('keeps combining marks attached', () => {
+    // é written as e + U+0301 must survive as a letter with its mark.
+    const composed = 'caf\u00e9';
+    const decomposed = 'cafe\u0301';
+    expect(canonicalKey(composed)).toBe(canonicalKey(decomposed));
+    expect(canonicalKey(decomposed)).toBe('café');
+  });
+
+  it('does not let two different Arabic questions collide', () => {
+    const a = canonicalKey('هل ستتجاوز سعة التخزين 1200 جيجاواط؟');
+    const b = canonicalKey('هل ستنخفض أسعار الطاقة 1200 دولار؟');
+    expect(a).not.toBe(b);
+  });
+
+  it('does not let two different Cyrillic questions collide', () => {
+    const a = canonicalKey('Превысит ли мощность накопителей 1200 ГВт?');
+    const b = canonicalKey('Снизятся ли цены на энергию 1200 рублей?');
+    expect(a).not.toBe(b);
+  });
+
+  it('still detects typographic variation within a non-Latin script', () => {
+    const a = canonicalKey('هل ستتجاوز سعة التخزين 1200 جيجاواط؟');
+    const b = canonicalKey('  هل   ستتجاوز سعة التخزين 1200 جيجاواط  ');
+    expect(a).toBe(b);
+  });
+
+  it('still detects typographic variation across accents and case', () => {
+    const a = canonicalKey('¿SE SUPERARÁN los 1.200 GW de almacenamiento?');
+    const b = canonicalKey('  ¿Se   superarán los 1.200 GW de almacenamiento?  ');
+    expect(a).toBe(b);
+  });
+
+  it('keeps a thousands separator distinct from a bare number', () => {
+    // "1.200" and "1200" are the same quantity in different conventions, but the
+    // key compares wording, not arithmetic. Keeping them apart is the
+    // conservative direction: a missed merge is safer than a false one.
+    expect(canonicalKey('1.200 GW')).not.toBe(canonicalKey('1200 GW'));
+  });
+
+  it('does not merge an accented word with its unaccented form', () => {
+    // Deliberate: a false merge is worse than a missed one. See limitations.
+    expect(canonicalKey('baterías')).not.toBe(canonicalKey('baterias'));
+  });
+
+  it('returns an empty key for text with no letters or digits', () => {
+    expect(canonicalKey('   ?!·—  ')).toBe('');
+  });
+});
+
+/**
+ * The publication gate works because `validate.ts` has no runtime dependencies:
+ * Node can import it directly, without a bundler, and run the same rules the
+ * tests run. If someone adds a JSON or DOM import here, that silently breaks.
+ */
+describe('validation module stays importable outside the bundle', () => {
+  const source = readFileSync(resolve(process.cwd(), 'src/data/validate.ts'), 'utf8');
+
+  it('declares no runtime imports', () => {
+    const runtimeImports = source
+      .split('\n')
+      .filter((line) => /^import (?!type )/.test(line.trim()));
+    expect(runtimeImports).toEqual([]);
+  });
+
+  it('imports types only from the domain module', () => {
+    expect(source).toMatch(/import type \{ PredictionRecord \} from '\.\/types'/);
+  });
+
+  it('does not reach for JSON data or the DOM', () => {
+    expect(source).not.toMatch(/records\.json/);
+    expect(source).not.toMatch(/\bdocument\.|\bwindow\./);
   });
 });

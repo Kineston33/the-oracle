@@ -137,101 +137,13 @@ export function summarizeArchive(records: readonly PredictionRecord[]): ArchiveS
 }
 
 /**
- * A cheap structural check used by tests and the integrity panel:
- * every record must be marked demo, carry evidence, and have a digest of the
- * expected shape. It deliberately does not verify the hash — that is async
- * and lives in `lib/integrity.ts`.
+ * Archive rules that must hold before publication. They live in `./validate`,
+ * which imports no JSON, so `scripts/validate-archive.mjs` can run the exact
+ * same checks against the shipped records outside the test suite.
  */
-/**
- * A comparison form for a canonical question: case, punctuation, quotes and
- * whitespace are folded, so two records that ask the same thing in different
- * typography are recognised as the same question.
- *
- * This is deliberately *not* a semantic comparison. Two genuinely different
- * questions can never collide through it (it only removes surface noise), but
- * it also cannot prove that two differently-worded questions mean the same
- * thing. Detection of paraphrase is a stated limitation, not something this
- * function pretends to do.
- */
-export function canonicalKey(question: string): string {
-  return question
-    .normalize('NFKC')
-    .toLowerCase()
-    .replace(/[\u2018\u2019\u02bc]/g, "'")
-    .replace(/[\u201c\u201d]/g, '"')
-    .replace(/[^a-z0-9]+/g, ' ')
-    .trim();
-}
-
-export interface QuestionCollision {
-  key: string;
-  ids: string[];
-}
-
-/**
- * Finds canonical questions that appear on more than one record.
- *
- * The product rule is that one canonical question maps to exactly one official
- * prediction. Revisions live *on* a record (`integrity.revision`), so a second
- * record carrying the same canonical question is never a legitimate revision —
- * it is a fork, and two true answers to the same question would then exist.
- *
- * This compares wording, not meaning. Two paraphrase-equivalent questions can
- * slip past it; that detection gap is a stated limitation, not something this
- * function pretends to solve.
- */
-export function findCanonicalCollisions(
-  records: readonly PredictionRecord[],
-): QuestionCollision[] {
-  const byKey = new Map<string, string[]>();
-  for (const record of records) {
-    const key = canonicalKey(record.canonicalQuestion);
-    const bucket = byKey.get(key);
-    if (bucket) bucket.push(record.id);
-    else byKey.set(key, [record.id]);
-  }
-
-  const collisions: QuestionCollision[] = [];
-  for (const [key, ids] of byKey) {
-    if (ids.length > 1) collisions.push({ key, ids });
-  }
-  return collisions;
-}
-
-export function assertArchiveShape(records: readonly PredictionRecord[]): string[] {
-  const problems: string[] = [];
-  const ids = new Set<string>();
-  for (const record of records) {
-    if (ids.has(record.id)) problems.push(`Duplicate record id: ${record.id}`);
-    ids.add(record.id);
-    if (!/^ORC-\d{4}-\d{4}$/.test(record.id)) {
-      problems.push(`Malformed record id: ${record.id}`);
-    }
-    if (!record.demo) problems.push(`Record ${record.id} is missing the demo flag`);
-    if (record.evidence.length === 0) problems.push(`Record ${record.id} has no evidence`);
-    if (record.probability <= 0 || record.probability >= 1) {
-      problems.push(`Record ${record.id} has an out-of-range probability`);
-    }
-    if (!/^[0-9a-f]{64}$/.test(record.integrity.digest)) {
-      problems.push(`Record ${record.id} has no valid SHA-256 digest`);
-    }
-    if (Date.parse(record.horizon.endsAt) <= Date.parse(record.publishedAt)) {
-      problems.push(`Record ${record.id} ends before it was published`);
-    }
-    if (Date.parse(record.resolutionCriteria.resolveOn) < Date.parse(record.horizon.endsAt)) {
-      problems.push(`Record ${record.id} resolves before its horizon ends`);
-    }
-    if (record.status === 'resolved' && record.resolution?.outcome === 'indeterminate') {
-      problems.push(`Record ${record.id} is resolved with an indeterminate outcome`);
-    }
-  }
-
-  // One canonical question, one official prediction.
-  for (const collision of findCanonicalCollisions(records)) {
-    problems.push(
-      `Canonical question claimed by more than one record without supersession: ${collision.ids.join(', ')}`,
-    );
-  }
-
-  return problems;
-}
+export {
+  assertArchiveShape,
+  canonicalKey,
+  findCanonicalCollisions,
+  type QuestionCollision,
+} from './validate';

@@ -70,7 +70,7 @@ Checks:
 
 ```bash
 npm run typecheck # strict tsc for the app, the tests and the audit harness
-npm test          # Vitest: 170 tests across 9 files
+npm test          # Vitest: 191 tests across 9 files
 npm run seal      # recompute the SHA-256 digest of every record (see below)
 ```
 
@@ -206,7 +206,7 @@ entirely, including ambient drift).
 
 ## Testing
 
-170 tests across nine files:
+191 tests across nine files:
 
 - `lib/question.test.ts` — normalisation, category detection, horizon parsing, archive
   matching, canonical draft generation, and the invariant that a reading never contains a
@@ -218,9 +218,10 @@ entirely, including ambient drift).
   rule that demo content is always flagged.
 - `test/contrast.test.ts` — reads `tokens.css` and asserts every text token clears WCAG AA
   against every surface token, and that the text hierarchy stays monotonic.
-- `data/records.test.ts` — includes the canonical-question rule: every record asks a
-  distinct question, a duplicate is reported as a fork, and the probability is never
-  mutated by any read helper.
+- `data/records.test.ts` — the canonical-question rule: every record asks a distinct
+  question, a duplicate is reported as a fork, the key survives every script (Spanish,
+  Portuguese, French, Cyrillic, Greek, Arabic, Hebrew, CJK, Devanagari), typographic
+  variation still folds, and the probability is never mutated by any read helper.
 - `components/layout/RouteMetadata.test.tsx` — each route carries its own title,
   description, canonical URL and Open Graph title.
 - `App.test.tsx` — navigation, mobile/desktop routes, question submission and validation,
@@ -266,3 +267,27 @@ third-party witnesses and independent re-resolution.
 
 No explicit licence is granted at this stage. The repository is public for review,
 all rights reserved, until a licensing decision is made.
+
+## The archive gate
+
+`src/data/validate.ts` holds the rules that must hold before the archive ships: unique
+record ids, a demo flag, evidence, an in-range probability, a well-formed digest, a
+coherent horizon, and — the one the product rests on — **one canonical question per
+official prediction**.
+
+The module imports no JSON and no DOM, which is what lets `scripts/validate-archive.mjs`
+import it directly under Node and run it against the real `records.json`:
+
+```bash
+npm run validate    # standalone
+npm run build       # runs validate first, refuses to build on failure
+npm run seal        # runs validate first, refuses to re-seal on failure
+```
+
+A duplicate canonical question stops the build with a non-zero exit and names the
+offending record ids. This is exercised by tests and was verified against a deliberately
+corrupted copy of the archive.
+
+`canonicalKey` is Unicode-aware (`\p{L}`, `\p{N}`, `\p{M}`), so accented Latin, Cyrillic,
+Greek, Arabic, Hebrew and CJK are all preserved rather than deleted. It compares wording,
+not meaning; paraphrase detection is a stated limitation.

@@ -146,9 +146,15 @@ accountable forecasting should not begin with an inflated account of itself.
    The site ships `noindex` until real records exist.
 9. **`localStorage` capacity.** Drafts are capped at 24 entries (roughly 20 KB of text) and
    are pruned oldest-last; there is no quota handling beyond silent failure.
-10. **The question parser is shallow.** Keyword lexicons and token overlap misclassify
-    unusual phrasing and cannot detect semantic equivalence. It is deliberately conservative
-    (it prefers "unclassified" over guessing) but that is a mitigation, not a fix.
+10. **The question parser is shallow, and the archive key is wording-level.** Keyword
+    lexicons and token overlap misclassify unusual phrasing and cannot detect semantic
+    equivalence. The canonical-question key is now Unicode-aware — it keeps letters, digits
+    and combining marks from every script — but it is still a *string* comparison, not a
+    semantic one. Specifically: `baterías` and `baterias` do **not** merge, `1.200` and
+    `1200` do **not** merge, and two paraphrases of the same question are not detected.
+    Every one of those gaps is a missed merge, never a false one. False merges are the
+    failure mode that would let two official answers to one question coexist, so the bias
+    is intentional.
 11. **Category and status filters do not persist across page loads** beyond the URL. Deep
     links work; returning later resets to defaults.
 12. **No dark/light theme switch.** The product is dark-only by design; `color-scheme: dark`
@@ -204,3 +210,17 @@ accountable forecasting should not begin with an inflated account of itself.
 22. **No consent, analytics or privacy policy.** Nothing is tracked and nothing is sent
     anywhere, which makes this easy to disclose honestly — but a public deployment still
     needs that disclosure written somewhere a visitor can find it.
+
+### Canonical-question enforcement
+
+23. **Is the rule enforced outside the tests? Yes, since the pre-launch audit.** The rules
+    live in `src/data/validate.ts`, which imports no JSON and no DOM, so
+    `scripts/validate-archive.mjs` imports it directly under Node and runs it against the
+    records that actually ship. `npm run build` and `npm run seal` both start with
+    `npm run validate`, which exits non-zero on a duplicate canonical question — a real
+    build was verified to refuse to produce `dist/`. Before this change the function existed
+    but was only ever called from tests, so a duplicate could have shipped.
+24. **The gate is still not a publication service.** It runs at build time on a static
+    dataset. There is no server that can reject a record at publish time, because there is
+    no publishing pipeline yet. Anyone who edits `records.json` locally and runs `dev`
+    bypasses the gate entirely; the `build` and `seal` scripts are the enforced paths.
