@@ -1,0 +1,131 @@
+/* ==========================================================================
+   THE ORACLE — Design tokens
+   A restrained, cinematic palette: deep obsidian, oracle violet, cosmic blue,
+   and a sparse warm gold reserved for integrity and archival meaning.
+   ========================================================================== */
+
+:root {
+  color-scheme: dark;
+
+  /* --- Surfaces ---------------------------------------------------------- */
+  --obsidian: #07070c;
+  --obsidian-2: #0a0a13;
+  --midnight: #0b0e1b;
+  --midnight-2: #0e1222;
+  --navy-raised: #121628;
+
+  --surface-1: rgba(255, 255, 255, 0.024);
+  --surface-2: rgba(255, 255, 255, 0.042);
+  --surface-3: rgba(255, 255, 255, 0.065);
+  --surface-solid: #0d1020;
+  --surface-glass: rgba(15, 18, 34, 0.66);
+
+  /* --- Lines ------------------------------------------------------------- */
+  --line-1: rgba(255, 255, 255, 0.075);
+  --line-2: rgba(255, 255, 255, 0.115);
+  --line-3: rgba(255, 255, 255, 0.18);
+  --line-violet: rgba(120, 107, 255, 0.32);
+
+  /* --- Brand ------------------------------------------------------------- */
+  --violet: #786bff;
+  --violet-bright: #948bff;
+  --violet-deep: #4a3fbe;
+  --violet-ghost: rgba(120, 107, 255, 0.12);
+  --cosmic: #00d4ff;
+  --cosmic-soft: #7ce6ff;
+  --cosmic-ghost: rgba(0, 212, 255, 0.1);
+
+  --gold: #e8c88a;
+  --gold-bright: #f6e3b8;
+  --gold-ghost: rgba(232, 200, 138, 0.1);
+
+  /* --- Text --------------------------------------------------------------
+     Every token below clears WCAG AA (4.5:1) as body text against the darkest
+     and the lightest surface in the system, because all four carry real
+     information — labels, IDs, digests, notes — not decorative filler. */
+  --text-primary: #f2f1fa; /* 17.9 : 1 */
+  --text-secondary: #b3b2c9; /* 9.7 : 1 */
+  --text-tertiary: #9c9ab6; /* 7.4 : 1 */
+  --text-quaternary: #8a88a4; /* 5.9 : 1 */
+  --text-on-accent: #08060f;
+
+  /* --- Semantic ---------------------------------------------------------- */
+  --positive: #48d6a3;
+  --positive-ghost: rgba(72, 214, 163, 0.1);
+  --caution: #f0b357;
+  --caution-ghost: rgba(240, 179, 87, 0.1);
+  --danger: #ff7a8a;
+  --danger-ghost: rgba(255, 122, 138, 0.1);
+
+  /* --- Type -------------------------------------------------------------- */
+  --font-sans: 'Inter Variable', 'Inter', ui-sans-serif, system-ui, -apple-system,
+    'Segoe UI', Roboto, sans-serif;
+  --font-display: 'Instrument Serif', 'Iowan Old Style', 'Palatino Linotype',
+    'Times New Roman', serif;
+  --font-mono: 'JetBrains Mono Variable', 'JetBrains Mono', ui-monospace,
+    'SF Mono', 'Cascadia Mono', Menlo, monospace;
+
+  /* Fluid display sizes — clamp keeps typography legible from 320px up. */
+  --fs-display-xl: clamp(3.25rem, 10.2vw, 8.75rem);
+  --fs-display-lg: clamp(2.5rem, 6.2vw, 4.75rem);
+  --fs-display-md: clamp(2rem, 4.4vw, 3.35rem);
+  --fs-display-sm: clamp(1.55rem, 3vw, 2.2rem);
+  --fs-h3: clamp(1.15rem, 1.7vw, 1.4rem);
+  --fs-body-lg: clamp(1.02rem, 1.25vw, 1.16rem);
+  --fs-body: 0.95rem;
+  --fs-sm: 0.845rem;
+  --fs-xs: 0.765rem;
+  --fs-micro: 0.69rem;
+
+  /* --- Space ------------------------------------------------------------- */
+  --space-1: 0.25rem;
+  --space-2: 0.5rem;
+  --space-3: 0.75rem;
+  --space-4: 1rem;
+  --space-5: 1.5rem;
+  --space-6: 2rem;
+  --space-7: 3rem;
+  --space-8: 4rem;
+  --space-9: 6rem;
+  --space-10: 8rem;
+
+  --page-gutter: clamp(1.15rem, 4vw, 3rem);
+  --page-max: 1280px;
+  --page-max-narrow: 860px;
+  --section-y: clamp(4.5rem, 9vw, 8rem);
+
+  /* --- Radius ------------------------------------------------------------ */
+  --r-xs: 6px;
+  --r-sm: 10px;
+  --r-md: 14px;
+  --r-lg: 20px;
+  --r-xl: 28px;
+  --r-2xl: 40px;
+  --r-pill: 999px;
+
+  /* --- Elevation --------------------------------------------------------- */
+  --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.4);
+  --shadow-md: 0 12px 32px -12px rgba(0, 0, 0, 0.7);
+  --shadow-lg: 0 32px 80px -32px rgba(0, 0, 0, 0.85);
+  --shadow-glow-violet: 0 0 0 1px rgba(120, 107, 255, 0.22),
+    0 18px 60px -24px rgba(120, 107, 255, 0.55);
+  --shadow-focus: 0 0 0 2px var(--obsidian), 0 0 0 4px rgba(148, 139, 255, 0.7);
+
+  /* --- Motion ------------------------------------------------------------ */
+  --ease-out: cubic-bezier(0.16, 1, 0.3, 1);
+  --ease-in-out: cubic-bezier(0.65, 0, 0.35, 1);
+  --ease-spring: cubic-bezier(0.34, 1.56, 0.64, 1);
+  --dur-fast: 140ms;
+  --dur-base: 240ms;
+  --dur-slow: 520ms;
+  --dur-atmos: 900ms;
+
+  /* --- Layering ---------------------------------------------------------- */
+  --z-base: 1;
+  --z-sticky: 40;
+  --z-nav: 80;
+  --z-overlay: 100;
+  --z-toast: 120;
+
+  --nav-height: 70px;
+}

@@ -1,0 +1,344 @@
+/* ==========================================================================
+   Crystal Sphere — cut-crystal instrument
+   ========================================================================== */
+
+.sphere {
+  position: relative;
+  width: 100%;
+  display: grid;
+  place-items: center;
+  pointer-events: none;
+  --spin-outer: 150s;
+  --spin-inner: 96s;
+  --spin-collar: 220s;
+}
+
+.hero {
+  aspect-ratio: 1 / 1;
+  max-width: 660px;
+  margin-inline: auto;
+}
+
+.compact {
+  width: 40px;
+  height: 40px;
+}
+
+.stage {
+  position: relative;
+  width: 100%;
+  aspect-ratio: 1 / 1;
+  display: grid;
+  place-items: center;
+  isolation: isolate;
+}
+
+.hero .stage {
+  max-width: 660px;
+}
+
+.compact .stage {
+  width: 40px;
+  height: 40px;
+}
+
+.scene {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  overflow: visible;
+  z-index: 2;
+  filter: drop-shadow(0 30px 76px rgba(8, 6, 30, 0.82));
+}
+
+/* --- Ambient light ------------------------------------------------------- */
+
+.bloom,
+.bloomWarm {
+  position: absolute;
+  border-radius: 50%;
+  filter: blur(52px);
+  z-index: 1;
+  transition: opacity var(--dur-atmos) var(--ease-out);
+}
+
+.bloom {
+  width: 62%;
+  height: 62%;
+  background: radial-gradient(
+    circle,
+    rgba(120, 107, 255, 0.34) 0%,
+    rgba(74, 63, 190, 0.14) 44%,
+    transparent 72%
+  );
+  animation: bloomPulse 12s var(--ease-in-out) infinite;
+}
+
+.bloomWarm {
+  width: 30%;
+  height: 30%;
+  transform: translate(18%, -14%);
+  background: radial-gradient(circle, rgba(0, 212, 255, 0.2) 0%, transparent 70%);
+  animation: bloomPulse 17s var(--ease-in-out) infinite reverse;
+}
+
+@keyframes bloomPulse {
+  0%, 100% { opacity: 0.6; transform: scale(1); }
+  48% { opacity: 0.92; transform: scale(1.06); }
+}
+
+/* --- Motion -------------------------------------------------------------- */
+
+.crystalBody {
+  transform-origin: 200px 200px;
+  animation: crystalFloat 15s var(--ease-in-out) infinite;
+}
+
+@keyframes crystalFloat {
+  0%, 100% { transform: translateY(-2.5px); }
+  50% { transform: translateY(3.5px); }
+}
+
+.ringOuter {
+  transform-origin: 200px 200px;
+}
+
+.ringInner {
+  transform-origin: 200px 200px;
+  animation: drift 70s var(--ease-in-out) infinite;
+}
+
+@keyframes drift {
+  0%, 100% { transform: rotate(0deg); }
+  50% { transform: rotate(2.4deg); }
+}
+
+.ringCollar {
+  transform-origin: 200px 200px;
+  animation: spin var(--spin-collar) linear infinite;
+}
+
+.ringMid {
+  transform-origin: 200px 200px;
+  animation: spin var(--spin-inner) linear infinite reverse;
+}
+
+.ringsFar {
+  opacity: 0.9;
+}
+
+/* The far half of each orbit fades as it passes behind the crystal. */
+.ringsNear {
+  opacity: 1;
+}
+
+/* Interior groups: no motion of their own, animated by their children. */
+.cosmos,
+.facetPlate,
+.particles {
+  transform-origin: 200px 200px;
+}
+
+@keyframes spin {
+  to { transform: rotate(360deg); }
+}
+
+/* The whole outer assembly turns slowly; the node travels independently. */
+.ringsNear .ringOuter {
+  animation: spin var(--spin-outer) linear infinite;
+}
+
+.disc {
+  transform-origin: 200px 203px;
+  animation: spin 96s linear infinite reverse;
+}
+
+.aurora {
+  transform-origin: 200px 200px;
+  animation: auroraDrift 24s var(--ease-in-out) infinite;
+}
+
+@keyframes auroraDrift {
+  0%, 100% { opacity: 0.62; transform: rotate(-26deg) scale(1); }
+  50% { opacity: 0.94; transform: rotate(-20deg) scale(1.03); }
+}
+
+.core {
+  transform-origin: 200px 198px;
+  animation: corePulse 8s var(--ease-in-out) infinite;
+}
+
+@keyframes corePulse {
+  0%, 100% { opacity: 0.86; transform: scale(1); }
+  40% { opacity: 1; transform: scale(1.05); }
+}
+
+.particle {
+  animation: particleTwinkle 6.5s var(--ease-in-out) infinite;
+}
+
+@keyframes particleTwinkle {
+  0%, 100% { opacity: 0.18; }
+  50% { opacity: 0.78; }
+}
+
+.specular {
+  animation: specularShift 20s var(--ease-in-out) infinite;
+}
+
+@keyframes specularShift {
+  0%, 100% { opacity: 0.9; }
+  50% { opacity: 0.5; }
+}
+
+.caustic {
+  animation: causticPulse 14s var(--ease-in-out) infinite;
+}
+
+@keyframes causticPulse {
+  0%, 100% { opacity: 0.5; }
+  50% { opacity: 0.82; }
+}
+
+.nodeOuter {
+  filter: drop-shadow(0 0 6px rgba(155, 238, 255, 0.9));
+}
+
+/* --- Interaction states -------------------------------------------------- */
+
+/* `idle` is the resting state; listed so the class name always resolves. */
+.idle {
+  --sphere-intensity: 1;
+}
+
+.thinking .bloom {
+  animation-duration: 2.6s;
+}
+
+.thinking .core {
+  animation-duration: 1.6s;
+}
+
+.thinking .disc {
+  animation-duration: 16s;
+}
+
+.thinking .ringMid {
+  animation-duration: 14s;
+}
+
+.thinking .ringInner {
+  animation-duration: 9s;
+}
+
+.thinking .crystalBody {
+  animation-duration: 3.2s;
+}
+
+.thinking .aurora {
+  animation-duration: 5s;
+}
+
+.reading .facetVeins {
+  opacity: 1;
+}
+
+.facetVeins {
+  opacity: 0.9;
+  transition: opacity var(--dur-atmos) var(--ease-out);
+}
+
+.paused *,
+.paused *::before,
+.paused *::after {
+  animation-play-state: paused !important;
+}
+
+/* --- Instrument readout -------------------------------------------------- */
+
+.readout {
+  position: absolute;
+  bottom: 1%;
+  left: 50%;
+  transform: translateX(-50%);
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  width: min(88%, 500px);
+  z-index: 3;
+  opacity: 0.6;
+}
+
+.readoutLine {
+  flex: 1;
+  height: 1px;
+  background: linear-gradient(90deg, transparent, var(--line-3), transparent);
+}
+
+.readoutText {
+  font-size: 0.53rem;
+  letter-spacing: 0.2em;
+  text-transform: uppercase;
+  color: var(--text-tertiary);
+  white-space: nowrap;
+}
+
+.compact .readout,
+.compact .bloom,
+.compact .bloomWarm,
+.compact .compass {
+  display: none;
+}
+
+.compact .scene {
+  filter: none;
+}
+
+.compact .crystalBody,
+.compact .core,
+.compact .aurora,
+.compact .disc,
+.compact .particle {
+  animation: none;
+}
+
+/* --- Responsive ---------------------------------------------------------- */
+
+@media (max-width: 1080px) {
+  .hero {
+    max-width: 440px;
+  }
+}
+
+@media (max-width: 480px) {
+  .hero {
+    max-width: 320px;
+  }
+  .readout {
+    width: 94%;
+    gap: 0.5rem;
+  }
+  .readoutText {
+    letter-spacing: 0.12em;
+    font-size: 0.45rem;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .crystalBody,
+  .core,
+  .aurora,
+  .disc,
+  .bloom,
+  .bloomWarm,
+  .caustic,
+  .particle,
+  .specular,
+  .ringCollar,
+  .ringMid,
+  .ringInner,
+  .ringsNear .ringOuter {
+    animation: none;
+  }
+}

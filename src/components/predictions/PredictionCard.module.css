@@ -1,0 +1,235 @@
+.card {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  gap: 1rem;
+  height: 100%;
+  padding: clamp(1.2rem, 2.2vw, 1.7rem);
+  border-radius: var(--r-lg);
+  border: 1px solid var(--line-1);
+  background:
+    linear-gradient(168deg, rgba(255, 255, 255, 0.045), rgba(255, 255, 255, 0.008) 48%),
+    rgba(11, 13, 26, 0.62);
+  backdrop-filter: blur(14px);
+  overflow: hidden;
+  transition:
+    border-color var(--dur-base) var(--ease-out),
+    background-color var(--dur-base) var(--ease-out),
+    transform var(--dur-base) var(--ease-out),
+    box-shadow var(--dur-base) var(--ease-out);
+}
+
+/* A thin violet light-leak along the top edge, revealed on hover. */
+.card::before {
+  content: '';
+  position: absolute;
+  inset: 0 0 auto;
+  height: 1px;
+  background: linear-gradient(90deg, transparent, var(--violet-bright), transparent);
+  opacity: 0;
+  transition: opacity var(--dur-slow) var(--ease-out);
+}
+
+.card::after {
+  content: '';
+  position: absolute;
+  top: -50%;
+  right: -30%;
+  width: 60%;
+  height: 100%;
+  border-radius: 50%;
+  background: radial-gradient(circle, rgba(120, 107, 255, 0.14), transparent 68%);
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity var(--dur-slow) var(--ease-out);
+}
+
+.card:hover,
+.card:focus-within {
+  border-color: var(--line-violet);
+  transform: translateY(-3px);
+  box-shadow: var(--shadow-md);
+}
+
+.card:hover::before,
+.card:focus-within::before,
+.card:hover::after,
+.card:focus-within::after {
+  opacity: 1;
+}
+
+.top {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 0.75rem;
+}
+
+.badges {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.35rem;
+}
+
+.id {
+  flex: none;
+  font-size: 0.62rem;
+  letter-spacing: 0.06em;
+  color: var(--text-quaternary);
+  padding-top: 0.2rem;
+}
+
+.title {
+  font-family: var(--font-sans);
+  font-size: 1.06rem;
+  font-weight: 540;
+  line-height: 1.32;
+  letter-spacing: -0.015em;
+  color: var(--text-primary);
+}
+
+.titleLink {
+  border-radius: 3px;
+}
+
+/* The title's link covers the whole card for a comfortable hit target,
+   while inner links stay above it. */
+.titleLink::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  border-radius: var(--r-lg);
+}
+
+.question {
+  font-size: var(--fs-sm);
+  line-height: 1.6;
+  color: var(--text-tertiary);
+  display: -webkit-box;
+  -webkit-line-clamp: 3;
+  line-clamp: 3;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+
+.probability {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+  margin-top: auto;
+  padding-top: 0.4rem;
+}
+
+.probabilityHead {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 0.75rem;
+}
+
+.probabilityLabel {
+  font-family: var(--font-mono);
+  font-size: 0.55rem;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+  color: var(--text-quaternary);
+}
+
+.probabilityValue {
+  font-family: var(--font-display);
+  font-size: 1.5rem;
+  line-height: 1;
+  color: var(--text-primary);
+  font-feature-settings: 'tnum' 1;
+}
+
+.footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem;
+  padding-top: 0.85rem;
+  border-top: 1px solid var(--line-1);
+}
+
+.meta {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  min-width: 0;
+  font-size: var(--fs-xs);
+  color: var(--text-tertiary);
+}
+
+.metaItem {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.32rem;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.metaDivider {
+  width: 1px;
+  height: 10px;
+  background: var(--line-2);
+  flex: none;
+}
+
+.action {
+  position: relative;
+  z-index: 1;
+  display: inline-flex;
+  align-items: center;
+  gap: 0.3rem;
+  flex: none;
+  font-family: var(--font-mono);
+  font-size: var(--fs-micro);
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--text-secondary);
+  transition: color var(--dur-base) var(--ease-out), gap var(--dur-base) var(--ease-out);
+}
+
+.card:hover .action,
+.action:focus-visible {
+  color: var(--violet-bright);
+  gap: 0.5rem;
+}
+
+/* --- Variants ------------------------------------------------------------
+   `default` is the base card above; it is declared so the variant prop always
+   maps to a real class. */
+
+.default {
+  --card-emphasis: 0;
+}
+
+.feature {
+  padding: clamp(1.5rem, 3vw, 2.2rem);
+  background:
+    radial-gradient(120% 100% at 0% 0%, rgba(120, 107, 255, 0.14), transparent 58%),
+    linear-gradient(168deg, rgba(255, 255, 255, 0.05), rgba(255, 255, 255, 0.01) 52%),
+    rgba(11, 13, 26, 0.72);
+}
+
+.feature .title {
+  font-family: var(--font-display);
+  font-size: clamp(1.5rem, 2.4vw, 2rem);
+  font-weight: 400;
+  letter-spacing: -0.01em;
+  line-height: 1.12;
+}
+
+.feature .probabilityValue {
+  font-size: 2rem;
+}
+
+@media (max-width: 520px) {
+  .footer {
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 0.6rem;
+  }
+}

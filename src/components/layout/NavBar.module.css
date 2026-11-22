@@ -1,0 +1,311 @@
+.header {
+  position: sticky;
+  top: 0;
+  z-index: var(--z-nav);
+  transition:
+    background-color var(--dur-slow) var(--ease-out),
+    border-color var(--dur-slow) var(--ease-out),
+    backdrop-filter var(--dur-slow) var(--ease-out);
+  border-bottom: 1px solid transparent;
+}
+
+.scrolled {
+  background: rgba(7, 7, 12, 0.72);
+  border-bottom-color: var(--line-1);
+  backdrop-filter: blur(20px) saturate(140%);
+  -webkit-backdrop-filter: blur(20px) saturate(140%);
+}
+
+.inner {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1.5rem;
+  width: 100%;
+  max-width: var(--page-max);
+  margin-inline: auto;
+  padding: 0 var(--page-gutter);
+  height: var(--nav-height);
+}
+
+/* --- Brand --------------------------------------------------------------- */
+
+.brand {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.7rem;
+  flex: none;
+  border-radius: var(--r-sm);
+}
+
+.mark {
+  display: grid;
+  place-items: center;
+  width: 38px;
+  height: 38px;
+  transition: transform var(--dur-slow) var(--ease-spring);
+}
+
+.brand:hover .mark {
+  transform: rotate(-8deg) scale(1.06);
+}
+
+.wordmark {
+  display: flex;
+  flex-direction: column;
+  gap: 0.18rem;
+  line-height: 1;
+}
+
+.wordmarkMain {
+  font-family: var(--font-sans);
+  font-size: 0.82rem;
+  font-weight: 620;
+  letter-spacing: 0.155em;
+  color: var(--text-primary);
+}
+
+.wordmarkSub {
+  font-family: var(--font-mono);
+  font-size: 0.5rem;
+  letter-spacing: 0.18em;
+  text-transform: uppercase;
+  color: var(--text-quaternary);
+}
+
+/* --- Desktop nav --------------------------------------------------------- */
+
+.desktopNav {
+  display: flex;
+  justify-content: center;
+  flex: 1;
+}
+
+.navList {
+  display: flex;
+  align-items: center;
+  gap: 0.15rem;
+  margin: 0;
+}
+
+.navLink {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  gap: 0.42rem;
+  padding: 0.5rem 0.85rem;
+  border-radius: var(--r-pill);
+  font-size: var(--fs-sm);
+  font-weight: 460;
+  color: var(--text-tertiary);
+  transition:
+    color var(--dur-base) var(--ease-out),
+    background-color var(--dur-base) var(--ease-out);
+}
+
+.navIndex {
+  font-family: var(--font-mono);
+  font-size: 0.5rem;
+  letter-spacing: 0.1em;
+  color: var(--text-quaternary);
+  transition: color var(--dur-base) var(--ease-out);
+}
+
+.navLink:hover {
+  color: var(--text-primary);
+  background: rgba(255, 255, 255, 0.045);
+}
+
+.active {
+  color: var(--text-primary);
+}
+
+.active .navIndex {
+  color: var(--violet-bright);
+}
+
+.active::after {
+  content: '';
+  position: absolute;
+  left: 50%;
+  bottom: 0.05rem;
+  width: 14px;
+  height: 1.5px;
+  transform: translateX(-50%);
+  border-radius: 1px;
+  background: linear-gradient(90deg, var(--violet), var(--cosmic));
+  box-shadow: 0 0 8px rgba(120, 107, 255, 0.8);
+}
+
+/* --- Right actions ------------------------------------------------------- */
+
+.actions {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  flex: none;
+}
+
+.archiveLink {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.45rem 0.85rem;
+  border-radius: var(--r-pill);
+  border: 1px solid var(--line-1);
+  background: rgba(255, 255, 255, 0.026);
+  font-family: var(--font-mono);
+  font-size: var(--fs-micro);
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--text-secondary);
+  transition:
+    border-color var(--dur-base) var(--ease-out),
+    color var(--dur-base) var(--ease-out),
+    background-color var(--dur-base) var(--ease-out);
+}
+
+.archiveDot {
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: var(--gold);
+  box-shadow: 0 0 8px rgba(232, 200, 138, 0.65);
+}
+
+.archiveLink:hover {
+  color: var(--text-primary);
+  border-color: rgba(232, 200, 138, 0.3);
+  background: rgba(232, 200, 138, 0.05);
+}
+
+.menuButton {
+  display: none;
+  place-items: center;
+  width: 40px;
+  height: 40px;
+  border-radius: var(--r-sm);
+  border: 1px solid var(--line-2);
+  color: var(--text-primary);
+  background: rgba(255, 255, 255, 0.03);
+}
+
+/* --- Mobile panel -------------------------------------------------------- */
+
+.panel {
+  display: none;
+  position: absolute;
+  top: calc(var(--nav-height) + 6px);
+  left: var(--page-gutter);
+  right: var(--page-gutter);
+  z-index: calc(var(--z-nav) + 1);
+  padding: 0.75rem;
+  border-radius: var(--r-lg);
+  border: 1px solid var(--line-2);
+  background: rgba(10, 10, 20, 0.97);
+  backdrop-filter: blur(28px);
+  box-shadow: var(--shadow-lg);
+}
+
+.panelOpen {
+  display: block;
+  animation: panelIn var(--dur-base) var(--ease-out);
+}
+
+@keyframes panelIn {
+  from {
+    opacity: 0;
+    transform: translateY(-6px) scale(0.99);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+.panelList {
+  display: grid;
+  gap: 0.15rem;
+  margin: 0;
+}
+
+.panelLink {
+  display: flex;
+  align-items: center;
+  gap: 0.9rem;
+  padding: 0.85rem 0.9rem;
+  border-radius: var(--r-md);
+  font-size: 1.05rem;
+  color: var(--text-secondary);
+  transition: background-color var(--dur-fast) var(--ease-out), color var(--dur-fast) var(--ease-out);
+}
+
+.panelLinkActive {
+  color: var(--text-primary);
+  background: rgba(120, 107, 255, 0.1);
+}
+
+.panelIndex {
+  font-family: var(--font-mono);
+  font-size: 0.6rem;
+  letter-spacing: 0.1em;
+  color: var(--text-quaternary);
+}
+
+.panelFooter {
+  margin-top: 0.5rem;
+  padding: 0.85rem 0.9rem 0.4rem;
+  border-top: 1px solid var(--line-1);
+}
+
+.panelNotice {
+  font-size: var(--fs-xs);
+  color: var(--text-quaternary);
+  line-height: 1.5;
+}
+
+.scrim {
+  display: none;
+  position: fixed;
+  inset: 0;
+  z-index: var(--z-nav);
+  background: rgba(4, 4, 8, 0.6);
+  backdrop-filter: blur(2px);
+  cursor: default;
+}
+
+/* --- Breakpoints --------------------------------------------------------- */
+
+@media (max-width: 1080px) {
+  .navLink {
+    padding: 0.5rem 0.65rem;
+  }
+  .navIndex {
+    display: none;
+  }
+}
+
+@media (max-width: 920px) {
+  .desktopNav,
+  .archiveLink {
+    display: none;
+  }
+  .menuButton {
+    display: grid;
+  }
+  .scrim {
+    display: block;
+  }
+  .panel[hidden] {
+    display: none;
+  }
+  .inner {
+    gap: 1rem;
+  }
+}
+
+@media (max-width: 400px) {
+  .wordmarkSub {
+    display: none;
+  }
+}

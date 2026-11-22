@@ -1,0 +1,316 @@
+.section {
+  padding-block: var(--section-y);
+  border-top: 1px solid var(--line-1);
+  background: radial-gradient(80% 50% at 100% 20%, rgba(120, 107, 255, 0.05), transparent 68%);
+}
+
+.inner {
+  width: 100%;
+  max-width: var(--page-max);
+  margin-inline: auto;
+  padding-inline: var(--page-gutter);
+}
+
+.layout {
+  display: grid;
+  grid-template-columns: minmax(0, 1.62fr) minmax(0, 1fr);
+  gap: clamp(1.25rem, 3vw, 2.5rem);
+  align-items: start;
+}
+
+/* --- Ledger -------------------------------------------------------------- */
+
+.ledger {
+  border: 1px solid var(--line-1);
+  border-radius: var(--r-lg);
+  background: rgba(9, 11, 22, 0.62);
+  overflow: hidden;
+}
+
+.ledgerHead {
+  display: grid;
+  grid-template-columns: 122px minmax(0, 1fr) 104px 58px 84px;
+  gap: 0.85rem;
+  padding: 0.72rem 1.15rem;
+  border-bottom: 1px solid var(--line-1);
+  background: rgba(255, 255, 255, 0.022);
+  font-family: var(--font-mono);
+  font-size: 0.53rem;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+  color: var(--text-quaternary);
+}
+
+.alignRight {
+  text-align: right;
+}
+
+.rows {
+  display: flex;
+  flex-direction: column;
+  margin: 0;
+}
+
+.rows > li + li {
+  border-top: 1px solid var(--line-1);
+}
+
+.row {
+  display: grid;
+  grid-template-columns: 122px minmax(0, 1fr) 104px 58px 84px;
+  gap: 0.85rem;
+  align-items: center;
+  padding: 0.9rem 1.15rem;
+  transition: background-color var(--dur-base) var(--ease-out);
+}
+
+.row:hover,
+.row:focus-visible {
+  background: rgba(120, 107, 255, 0.06);
+}
+
+.cellId {
+  font-size: 0.63rem;
+  letter-spacing: 0.04em;
+  color: var(--text-tertiary);
+  transition: color var(--dur-base) var(--ease-out);
+}
+
+.row:hover .cellId {
+  color: var(--violet-bright);
+}
+
+.cellQuestion {
+  display: flex;
+  flex-direction: column;
+  gap: 0.15rem;
+  min-width: 0;
+  font-size: var(--fs-sm);
+  line-height: 1.4;
+  color: var(--text-primary);
+}
+
+.cellQuestionSub {
+  font-family: var(--font-mono);
+  font-size: 0.56rem;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--text-quaternary);
+}
+
+.cellDate {
+  font-size: 0.63rem;
+  color: var(--text-tertiary);
+  text-align: right;
+  white-space: nowrap;
+}
+
+.cellProb {
+  font-family: var(--font-display);
+  font-size: 1.1rem;
+  line-height: 1;
+  color: var(--text-primary);
+  text-align: right;
+  font-feature-settings: 'tnum' 1;
+}
+
+.cellStatus {
+  display: flex;
+  justify-content: flex-end;
+}
+
+.statusPill {
+  padding: 0.14rem 0.48rem;
+  border-radius: var(--r-pill);
+  border: 1px solid var(--line-2);
+  font-family: var(--font-mono);
+  font-size: 0.52rem;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--text-tertiary);
+  white-space: nowrap;
+}
+
+.open {
+  color: #a5edff;
+  border-color: rgba(0, 212, 255, 0.24);
+  background: rgba(0, 212, 255, 0.08);
+}
+
+.resolved {
+  color: #8fe8c8;
+  border-color: rgba(72, 214, 163, 0.24);
+  background: rgba(72, 214, 163, 0.08);
+}
+
+.annulled {
+  color: #f5cf90;
+  border-color: rgba(240, 179, 87, 0.24);
+  background: rgba(240, 179, 87, 0.08);
+}
+
+.ledgerFoot {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem;
+  padding: 0.8rem 1.15rem;
+  border-top: 1px solid var(--line-1);
+  background: rgba(255, 255, 255, 0.014);
+  font-size: var(--fs-xs);
+  color: var(--text-quaternary);
+}
+
+.ledgerLink {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.3rem;
+  color: var(--text-secondary);
+  transition: color var(--dur-base) var(--ease-out);
+}
+
+.ledgerLink:hover {
+  color: var(--violet-bright);
+}
+
+/* --- Aside --------------------------------------------------------------- */
+
+.aside {
+  display: flex;
+  flex-direction: column;
+  gap: 1rem;
+}
+
+.integrity {
+  display: flex;
+  flex-direction: column;
+  gap: 0.7rem;
+  padding: 1.3rem 1.35rem;
+  border-radius: var(--r-lg);
+  border: 1px solid var(--line-1);
+  background:
+    linear-gradient(170deg, rgba(232, 200, 138, 0.045), transparent 56%),
+    rgba(11, 13, 26, 0.62);
+}
+
+.integrityIcon {
+  display: grid;
+  place-items: center;
+  width: 32px;
+  height: 32px;
+  border-radius: var(--r-sm);
+  border: 1px solid rgba(232, 200, 138, 0.22);
+  background: rgba(232, 200, 138, 0.07);
+  color: var(--gold);
+}
+
+.integrityTitle {
+  font-family: var(--font-sans);
+  font-size: 0.95rem;
+  font-weight: 540;
+  letter-spacing: -0.005em;
+  color: var(--text-primary);
+}
+
+.integrityList {
+  display: flex;
+  flex-direction: column;
+  gap: 0.6rem;
+  margin: 0;
+  font-size: var(--fs-xs);
+  line-height: 1.62;
+  color: var(--text-tertiary);
+}
+
+.integrityList strong {
+  display: block;
+  font-weight: 540;
+  color: var(--text-secondary);
+}
+
+.rateBlock {
+  padding: 1.1rem 1.35rem;
+  border-radius: var(--r-lg);
+  border: 1px solid var(--line-1);
+  background: rgba(11, 13, 26, 0.5);
+}
+
+.rateLabel {
+  font-family: var(--font-mono);
+  font-size: 0.53rem;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+  color: var(--text-quaternary);
+}
+
+.rateValue {
+  margin-top: 0.25rem;
+  font-family: var(--font-display);
+  font-size: 2.1rem;
+  line-height: 1;
+  color: var(--text-primary);
+  font-feature-settings: 'tnum' 1;
+}
+
+.rateNote {
+  margin-top: 0.5rem;
+  font-size: var(--fs-xs);
+  line-height: 1.6;
+  color: var(--text-quaternary);
+}
+
+/* --- Responsive ---------------------------------------------------------- */
+
+@media (max-width: 1080px) {
+  .layout {
+    grid-template-columns: 1fr;
+  }
+  .aside {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    align-items: start;
+  }
+  .rateBlock {
+    grid-column: span 2;
+  }
+}
+
+@media (max-width: 860px) {
+  .ledgerHead {
+    display: none;
+  }
+  .row {
+    grid-template-columns: minmax(0, 1fr) auto;
+    grid-template-areas:
+      'question prob'
+      'id status';
+    gap: 0.35rem 0.85rem;
+    padding: 0.9rem 1rem;
+  }
+  .cellId {
+    grid-area: id;
+  }
+  .cellQuestion {
+    grid-area: question;
+  }
+  .cellDate {
+    display: none;
+  }
+  .cellProb {
+    grid-area: prob;
+    font-size: 1.2rem;
+  }
+  .cellStatus {
+    grid-area: status;
+  }
+}
+
+@media (max-width: 620px) {
+  .aside {
+    grid-template-columns: 1fr;
+  }
+  .rateBlock {
+    grid-column: auto;
+  }
+}

@@ -1,0 +1,89 @@
+.nav {
+  display: flex;
+  flex-direction: column;
+  gap: 0.6rem;
+  padding: 1rem;
+  border-radius: var(--r-lg);
+  border: 1px solid var(--line-1);
+  background: rgba(10, 11, 21, 0.5);
+}
+
+.navLabel {
+  font-family: var(--font-mono);
+  font-size: var(--fs-micro);
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+  color: var(--text-quaternary);
+}
+
+.navList {
+  display: flex;
+  flex-direction: column;
+  gap: 0.1rem;
+  margin: 0;
+}
+
+.navLink {
+  display: flex;
+  align-items: baseline;
+  gap: 0.6rem;
+  padding: 0.42rem 0.5rem;
+  border-radius: var(--r-xs);
+  font-size: var(--fs-sm);
+  color: var(--text-tertiary);
+  transition: background-color var(--dur-fast) var(--ease-out), color var(--dur-fast) var(--ease-out);
+}
+
+.navLink:hover {
+  color: var(--text-primary);
+  background: rgba(255, 255, 255, 0.035);
+}
+
+.navIndex {
+  font-family: var(--font-mono);
+  font-size: 0.52rem;
+  letter-spacing: 0.06em;
+  color: var(--text-quaternary);
+}
+
+.active {
+  color: var(--violet-bright);
+  background: rgba(120, 107, 255, 0.08);
+}
+
+.active .navIndex {
+  color: var(--violet);
+}
+
+/* Below the two-column breakpoint the navigation becomes a horizontal rail. */
+@media (max-width: 1000px) {
+  .nav {
+    flex-direction: row;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 0.5rem 0.75rem;
+    padding: 0.6rem 0.75rem;
+  }
+
+  .navList {
+    flex-direction: row;
+    flex-wrap: wrap;
+    gap: 0.25rem;
+  }
+
+  .navLink {
+    padding: 0.35rem 0.6rem;
+    font-size: var(--fs-xs);
+    white-space: nowrap;
+  }
+}
+
+@media (max-width: 560px) {
+  .navLabel {
+    display: none;
+  }
+
+  .navIndex {
+    display: none;
+  }
+}

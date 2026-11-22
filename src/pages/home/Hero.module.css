@@ -1,0 +1,439 @@
+.hero {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  min-height: calc(100svh - var(--nav-height));
+  padding-block: clamp(1.5rem, 4vw, 3.5rem) clamp(2.5rem, 5vw, 4rem);
+  overflow: hidden;
+}
+
+.grid {
+  /* Two columns, three named areas: the sphere spans both rows on the right,
+     the headline sits top-left and the composer bottom-left. */
+  display: grid;
+  grid-template-columns: minmax(0, 1.03fr) minmax(0, 0.97fr);
+  grid-template-rows: auto auto;
+  grid-template-areas:
+    'lead orb'
+    'support orb';
+  align-items: center;
+  column-gap: clamp(1.5rem, 4vw, 3.25rem);
+  row-gap: clamp(1rem, 2vw, 1.5rem);
+  width: 100%;
+  max-width: var(--page-max);
+  margin-inline: auto;
+  padding-inline: var(--page-gutter);
+  flex: 1;
+}
+
+/* --- Copy ---------------------------------------------------------------- */
+
+.lead {
+  grid-area: lead;
+  display: flex;
+  flex-direction: column;
+  gap: clamp(0.8rem, 1.6vw, 1.1rem);
+  min-width: 0;
+  align-self: end;
+}
+
+.support {
+  grid-area: support;
+  display: flex;
+  flex-direction: column;
+  gap: clamp(1rem, 2vw, 1.35rem);
+  min-width: 0;
+  align-self: start;
+}
+
+.eyebrow {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.6rem;
+  font-family: var(--font-mono);
+  font-size: var(--fs-micro);
+  letter-spacing: 0.18em;
+  text-transform: uppercase;
+  color: var(--text-tertiary);
+  flex-wrap: wrap;
+}
+
+.eyebrowDot {
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: var(--cosmic);
+  box-shadow: 0 0 0 3px rgba(0, 212, 255, 0.16);
+  animation: beacon 3.4s var(--ease-in-out) infinite;
+}
+
+@keyframes beacon {
+  0%, 100% { opacity: 1; box-shadow: 0 0 0 3px rgba(0, 212, 255, 0.16); }
+  50% { opacity: 0.55; box-shadow: 0 0 0 6px rgba(0, 212, 255, 0.04); }
+}
+
+.eyebrowRule {
+  width: 32px;
+  height: 1px;
+  background: var(--line-3);
+}
+
+.eyebrowMeta {
+  color: var(--text-quaternary);
+}
+
+.headline {
+  font-family: var(--font-display);
+  font-size: var(--fs-display-xl);
+  font-weight: 400;
+  line-height: 0.86;
+  letter-spacing: -0.022em;
+  color: var(--text-primary);
+  display: flex;
+  flex-direction: column;
+  margin-left: -0.03em;
+}
+
+.headlineLine {
+  display: block;
+  position: relative;
+}
+
+/* The em starts a new visual line while staying part of the same text run. */
+.headlineEm {
+  display: block;
+  font-style: italic;
+  background: linear-gradient(104deg, #fdfcff 4%, #c4bbff 40%, #786bff 66%, #00d4ff 100%);
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+  padding-right: 0.06em;
+}
+
+.headlineEm {
+  font-style: italic;
+  background: linear-gradient(104deg, #fdfcff 4%, #c4bbff 40%, #786bff 66%, #00d4ff 100%);
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+  padding-right: 0.06em;
+}
+
+/* The final period is a small glowing crystal, not a typographic dot. */
+.headlinePeriod {
+  display: inline-block;
+  width: 0.13em;
+  height: 0.13em;
+  margin-left: 0.03em;
+  border-radius: 50%;
+  background: var(--gold);
+  box-shadow: 0 0 18px rgba(232, 200, 138, 0.9), 0 0 44px rgba(232, 200, 138, 0.35);
+  vertical-align: 0.14em;
+}
+
+.subtitle {
+  max-width: 46ch;
+  font-size: clamp(0.98rem, 1.2vw, 1.1rem);
+  line-height: 1.68;
+  color: var(--text-secondary);
+}
+
+.composerWrap {
+  margin-top: 0.35rem;
+}
+
+/* --- Suggestions --------------------------------------------------------- */
+
+.suggestions {
+  display: flex;
+  flex-direction: column;
+  gap: 0.55rem;
+  margin-top: 0.6rem;
+}
+
+.suggestionsLabel {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.45rem;
+  font-family: var(--font-mono);
+  font-size: var(--fs-micro);
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--text-quaternary);
+}
+
+.demoFlag {
+  margin-left: 0.2rem;
+  padding: 0.1rem 0.42rem;
+  border-radius: var(--r-pill);
+  border: 1px solid rgba(232, 200, 138, 0.26);
+  color: var(--gold);
+  font-size: 0.54rem;
+  letter-spacing: 0.12em;
+}
+
+.suggestionList {
+  display: flex;
+  flex-direction: column;
+  gap: 0.3rem;
+  margin: 0;
+}
+
+.suggestion {
+  display: flex;
+  align-items: center;
+  gap: 0.7rem;
+  padding: 0.6rem 0.75rem;
+  border-radius: var(--r-sm);
+  border: 1px solid transparent;
+  font-size: var(--fs-sm);
+  color: var(--text-secondary);
+  transition:
+    background-color var(--dur-base) var(--ease-out),
+    border-color var(--dur-base) var(--ease-out),
+    color var(--dur-base) var(--ease-out);
+}
+
+.suggestion:hover {
+  background: rgba(255, 255, 255, 0.04);
+  border-color: var(--line-1);
+  color: var(--text-primary);
+}
+
+.suggestionCategory {
+  flex: none;
+  width: 82px;
+  font-family: var(--font-mono);
+  font-size: 0.55rem;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--text-quaternary);
+}
+
+.suggestionText {
+  flex: 1;
+  min-width: 0;
+  line-height: 1.45;
+}
+
+.suggestionArrow {
+  flex: none;
+  color: var(--text-quaternary);
+  transition: transform var(--dur-base) var(--ease-out), color var(--dur-base) var(--ease-out);
+}
+
+.suggestion:hover .suggestionArrow {
+  color: var(--violet-bright);
+  transform: translate(2px, -2px);
+}
+
+/* --- Sphere column ------------------------------------------------------- */
+
+.orbColumn {
+  grid-area: orb;
+  display: flex;
+  flex-direction: column;
+  gap: 1.25rem;
+  min-width: 0;
+  justify-self: center;
+  width: 100%;
+}
+
+.orbFrame {
+  position: relative;
+  display: grid;
+  place-items: center;
+  padding-block: 0.5rem;
+}
+
+.orbAura {
+  position: absolute;
+  inset: 12%;
+  border-radius: 50%;
+  background: radial-gradient(
+    circle,
+    rgba(120, 107, 255, 0.22) 0%,
+    rgba(50, 40, 140, 0.1) 42%,
+    transparent 68%
+  );
+  filter: blur(46px);
+  pointer-events: none;
+}
+
+.orbCaption {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  width: min(70%, 340px);
+  margin-top: -0.25rem;
+}
+
+.captionRule {
+  flex: 1;
+  height: 1px;
+  background: linear-gradient(90deg, transparent, var(--line-2), transparent);
+}
+
+.captionText {
+  font-size: 0.52rem;
+  letter-spacing: 0.22em;
+  text-transform: uppercase;
+  color: var(--text-quaternary);
+  white-space: nowrap;
+}
+
+/* --- Stats --------------------------------------------------------------- */
+
+.stats {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 0;
+  margin: 0;
+  padding: 0.9rem 0;
+  border-top: 1px solid var(--line-1);
+  border-bottom: 1px solid var(--line-1);
+}
+
+.stat {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 0.2rem;
+  padding-inline: 0.4rem;
+  border-right: 1px solid var(--line-1);
+}
+
+.stat:last-child {
+  border-right: none;
+}
+
+.stat dt {
+  font-family: var(--font-mono);
+  font-size: 0.52rem;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+  color: var(--text-quaternary);
+}
+
+.stat dd {
+  margin: 0;
+  font-family: var(--font-display);
+  font-size: 1.4rem;
+  line-height: 1;
+  color: var(--text-primary);
+  font-feature-settings: 'tnum' 1;
+}
+
+.statDemo dd {
+  font-family: var(--font-mono);
+  font-size: 0.7rem;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--gold);
+  padding-top: 0.3rem;
+}
+
+/* --- Scroll cue ---------------------------------------------------------- */
+
+.scrollCue {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 0.35rem;
+  padding-top: 1.5rem;
+  opacity: 0.55;
+}
+
+.scrollLine {
+  width: 1px;
+  height: 34px;
+  background: linear-gradient(180deg, transparent, var(--line-3));
+}
+
+.scrollArrow {
+  color: var(--text-quaternary);
+  animation: scrollNudge 2.8s var(--ease-in-out) infinite;
+}
+
+@keyframes scrollNudge {
+  0%, 100% { transform: translateY(0); opacity: 0.5; }
+  50% { transform: translateY(3px); opacity: 1; }
+}
+
+.scrollText {
+  font-size: 0.5rem;
+  letter-spacing: 0.22em;
+  text-transform: uppercase;
+  color: var(--text-quaternary);
+}
+
+/* --- Responsive ---------------------------------------------------------- */
+
+@media (max-width: 1080px) {
+  .grid {
+    /* One column: headline, then sphere, then everything else. Keeping the
+       sphere between the two means the headline is always the first thing
+       above the fold, at any viewport height. */
+    grid-template-columns: 1fr;
+    grid-template-rows: auto auto auto;
+    grid-template-areas:
+      'lead'
+      'orb'
+      'support';
+    row-gap: clamp(0.75rem, 2vw, 1.25rem);
+    align-items: start;
+  }
+  .lead {
+    align-self: start;
+  }
+  .orbColumn {
+    max-width: 400px;
+    margin-inline: auto;
+    gap: 0.5rem;
+  }
+  .orbFrame {
+    padding-block: 0;
+  }
+  .orbCaption {
+    display: none;
+  }
+  .stats {
+    display: none;
+  }
+  .subtitle {
+    max-width: 58ch;
+  }
+  .scrollCue {
+    display: none;
+  }
+  .hero {
+    min-height: 0;
+    padding-bottom: clamp(3rem, 7vw, 4.5rem);
+  }
+}
+
+@media (max-width: 700px) {
+  .orbColumn {
+    max-width: min(320px, 70vw);
+  }
+}
+
+@media (max-width: 680px) {
+  .eyebrowMeta,
+  .eyebrowRule {
+    display: none;
+  }
+  .suggestionCategory {
+    display: none;
+  }
+  .suggestion {
+    padding: 0.6rem 0.55rem;
+    align-items: flex-start;
+  }
+  .suggestionArrow {
+    margin-top: 0.2rem;
+  }
+  .headline {
+    line-height: 0.9;
+  }
+}

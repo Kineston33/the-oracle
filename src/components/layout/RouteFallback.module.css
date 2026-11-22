@@ -1,0 +1,25 @@
+.fallback {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 1rem;
+  min-height: 62svh;
+}
+
+.sphere {
+  transform: scale(1.6);
+}
+
+.label {
+  font-size: var(--fs-micro);
+  letter-spacing: 0.22em;
+  text-transform: uppercase;
+  color: var(--text-quaternary);
+  animation: fallbackPulse 2.4s var(--ease-in-out) infinite;
+}
+
+@keyframes fallbackPulse {
+  0%, 100% { opacity: 0.4; }
+  50% { opacity: 1; }
+}
