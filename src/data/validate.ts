@@ -135,6 +135,22 @@ export function assertArchiveShape(records: readonly PredictionRecord[]): string
     if (!record.sealClaim) {
       problems.push(`Record ${record.id} does not declare what its seal demonstrates`);
     }
+    if (record.integrity.algorithm !== 'SHA-256') {
+      problems.push(
+        `Record ${record.id} declares unknown digest algorithm '${record.integrity.algorithm}'`,
+      );
+    }
+    // `anchored` is a boolean in the data, so on its own it proves nothing: it
+    // is a claim, not a proof. No anchoring mechanism is implemented in this
+    // build, therefore no record may assert one. This is not a placeholder to be
+    // relaxed later — it must stay until a verifiable external proof exists and
+    // is checked, at which point the rule becomes "the proof verifies", never
+    // "the flag says so".
+    if (record.integrity.anchored) {
+      problems.push(
+        `Record ${record.id} claims external anchoring, but no verifiable external witness is implemented`,
+      );
+    }
     problems.push(...eventChainProblems(record));
   }
 
@@ -230,6 +246,15 @@ export function eventChainProblems(record: PredictionRecord): string[] {
   if (terminal.length > 1) {
     problems.push(`Record ${id} has more than one terminal event`);
   }
+
+  // A legacy record may legitimately *have* a terminal event: three shipped
+  // records were sealed with their outcome already inside the digest. What it
+  // cannot do is acquire one afterwards. That is enforced at construction time
+  // (`assertTransitionAllowed`), and a hand-edited archive is caught by the
+  // digest itself: `legacyPayloadShape` folds status and resolution from the
+  // chain, so adding a terminal event changes the bytes the stored digest covers
+  // and `publishedLinkProblems` fails. There is deliberately no rule here, since
+  // validation cannot tell a sealed-with-outcome record from a tampered one.
 
   // Every event must declare how it was hashed. An unknown algorithm or schema
   // is a hard failure: a verifier that silently accepts an unrecognised scheme

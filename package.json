@@ -4,6 +4,7 @@
   "description": "THE ORACLE — a forecasting intelligence platform to explore the future, discover emerging signals, and read the public archive of official predictions.",
   "private": true,
   "type": "module",
+  "license": "MIT",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/Kineston33/the-oracle.git"

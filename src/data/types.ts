@@ -224,10 +224,20 @@ export type EventOrigin = 'migrated' | 'observed';
 /**
  * One link in a record's append-only event chain.
  *
- * `digest` covers `{ schema, algorithm, scope, seq, kind, occurredAt, body,
- * prevDigest }`, so the chain is ordered and tamper-evident: changing any event
- * invalidates it and every event after it. Adding an event appends a link; it
- * never alters an earlier one.
+ * `digest` covers the schema-2 envelope, which is exactly:
+ *
+ * ```
+ * { schema, algorithm, scope, seq, kind, occurredAt, recordedAt, origin, body, prevDigest }
+ * ```
+ *
+ * That is every field of this interface except `digest` itself. Nothing is left
+ * out: `recordedAt` and `origin` used to sit outside the envelope in schema 1,
+ * which let a migrated event be relabelled as observed with an unchanged digest.
+ * Putting them inside is what makes the declaration tamper-evident.
+ *
+ * The chain is therefore ordered and tamper-evident: changing any field of any
+ * event invalidates that event and every event after it. Adding an event appends
+ * a link; it never alters an earlier one.
  *
  * The declaration fields exist so a digest never has to be interpreted by
  * convention. A verifier reading a single event knows which hash produced it,
@@ -248,8 +258,12 @@ export interface RecordEvent {
    *
    * For migrated events this is provably later than `occurredAt`: a migrated
    * chain could not have existed before the model that defines events. The
-   * validator enforces `recordedAt > max(occurredAt)` per record, which is a
-   * real property of the data rather than an invented timestamp.
+   * validator enforces `recordedAt > occurredAt` for every event, and that
+   * `recordedAt` never moves backwards along a chain.
+   *
+   * Being inside the digest makes this value tamper-evident. It does not make it
+   * *witnessed*: a full rebuild can produce any `recordedAt` it likes. Only an
+   * external anchor could show when these bytes existed.
    */
   recordedAt: IsoDateTime;
   origin: EventOrigin;

@@ -377,6 +377,34 @@ resolution as `observed`; forcing the whole chain to stay `migrated` would mean 
 a contemporaneous event, which is the dishonesty this field exists to prevent. Each event
 declares its own provenance and that declaration is covered by its own digest.
 
+### Declared provenance is not demonstrated provenance
+
+`origin: 'observed'` means the event *says* it was written while the thing happened. The
+digest protects that claim — it cannot be edited into place — but protecting a claim is not
+the same as proving it. Someone who rebuilds the whole chain can produce any `origin` and any
+`recordedAt` they like, and every digest will verify.
+
+The two origins therefore make different-strength claims:
+
+| Origin | What it claims | Can this build prove it? |
+|---|---|---|
+| `migrated` | written later than the dates it records | Yes, by the ordering inequality, independently of the hash |
+| `observed` | written contemporaneously with the event | No. Parsimony alone distinguishes it, and that would be circular |
+
+Only an external witness — a transparency log, a timestamped publication — could show when
+these bytes existed. Until one is implemented, `observed` is shown in the interface as
+"declared observed, not proven", and no record can be marked anchored.
+
+### A legacy-scope record can never be resolved
+
+Seven records (`0001`–`0006`, `0008`) are open and sealed under `legacy-record`. Their digest
+covers `status` and `resolution`, so appending a resolution changes the bytes it was computed
+over. `nextEvent()` and `appendEvent()` refuse the operation outright rather than letting an
+invalid record be assembled and rejected later.
+
+They stay exactly as sealed: immutable historical demonstrations. Resolving them would require
+either re-sealing (forbidden) or rewriting history (dishonest).
+
 ```bash
 npm run validate   # shape, uniqueness, and event-chain continuity
 npm run seal       # seals unsealed records; refuses to re-seal a published one
@@ -395,6 +423,12 @@ Recomputing them under the new definition would have produced digests that never
 presented them as original seals. That was rejected: it would assert a provenance nobody
 witnessed. Any record sealed from now on uses `payloadScope: 'sealed-payload'` and
 `sealClaim: 'published-before-outcome'`, which *is* true by construction.
+
+### Anchoring cannot be claimed, only proved
+
+`integrity.anchored` is a boolean in the data. A boolean is not evidence, so the build
+rejects any record that sets it — there is no anchoring mechanism to back the claim. The
+public panel reports anchoring as *not verified* for every record, and never as a pass.
 
 ### Re-sealing is refused
 

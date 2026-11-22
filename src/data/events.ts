@@ -276,9 +276,9 @@ export function nextEvent(
 ): RecordEvent {
   const events = record.events;
 
-  assertTransitionAllowed(events, kind);
+  assertTransitionAllowed(record, kind);
 
-  const previousEvent = events[events.length - 1];
+  const previousEvent = record.events[record.events.length - 1];
   if (Date.parse(recordedAt) <= Date.parse(occurredAt)) {
     throw new AppendError(
       'An event cannot be recorded at or before the moment it records.',
@@ -318,10 +318,33 @@ export function nextEvent(
  * be constructed in the first place. Validation then acts as a second line of
  * defence against hand-edited JSON, not the only one.
  */
+/**
+ * Why a record sealed under the legacy scope can never take a terminal event.
+ *
+ * Its digest was computed over the whole record *including* status and
+ * resolution. Recording an outcome therefore changes the bytes that digest was
+ * computed from, so the stored digest would stop reproducing — and the only ways
+ * to make it reproduce again are to re-seal it (forbidden) or to rewrite history
+ * (dishonest).
+ *
+ * Those records stay exactly as sealed: historical demonstrations that are
+ * immutable rather than resolvable.
+ */
+export const LEGACY_TERMINAL_REFUSAL =
+  'A record sealed under the legacy payload scope cannot be resolved or annulled: ' +
+  'its digest covers status and resolution, so recording an outcome would break the seal. ' +
+  'It remains an immutable historical demonstration.';
+
 export function assertTransitionAllowed(
-  events: readonly RecordEvent[],
+  record: PredictionRecord,
   kind: RecordEventKind,
 ): void {
+  const { events } = record;
+
+  if (kind !== 'published' && record.integrity.payloadScope === 'legacy-record') {
+    throw new AppendError(LEGACY_TERMINAL_REFUSAL);
+  }
+
   if (kind === 'published') {
     if (events.length > 0) {
       throw new AppendError('A record can only be published once.');
@@ -356,6 +379,6 @@ export function assertTransitionAllowed(
  * cannot assemble a chain the validator would later reject.
  */
 export function appendEvent(record: PredictionRecord, event: RecordEvent): PredictionRecord {
-  assertTransitionAllowed(record.events, event.kind);
+  assertTransitionAllowed(record, event.kind);
   return { ...record, events: [...record.events, event] };
 }

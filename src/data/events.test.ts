@@ -26,6 +26,19 @@ import type { PredictionRecord, RecordEvent } from './types';
 const open = predictionRecords.find((r) => r.id === 'ORC-2025-0001')!;
 const resolved = predictionRecords.find((r) => r.id === 'ORC-2025-0007')!;
 
+/**
+ * A modern-scoped view of an open record.
+ *
+ * The append-safety rules are about what happens when a record *can* be
+ * resolved. Every shipped record is legacy-scoped, and legacy records refuse
+ * terminal events outright (the digest covers the outcome), so these tests need
+ * a record whose scope permits a resolution.
+ */
+const modernOpen = {
+  ...open,
+  integrity: { ...open.integrity, payloadScope: 'sealed-payload' as const },
+};
+
 function resolutionEvent(prevDigest: string): RecordEvent {
   return {
     seq: 'e1',
@@ -81,31 +94,31 @@ describe('sealedPayload', () => {
 
 describe('appending events', () => {
   it('preserves the sealed payload byte for byte', async () => {
-    const before = canonicalize(sealedPayload(open));
-    const appended = appendEvent(open, resolutionEvent(open.events[0].digest));
+    const before = canonicalize(sealedPayload(modernOpen));
+    const appended = appendEvent(modernOpen, resolutionEvent(modernOpen.events[0].digest));
     expect(canonicalize(sealedPayload(appended))).toBe(before);
   });
 
   it('leaves the payload digest unchanged', async () => {
-    const before = await digestPayload(open);
-    const appended = appendEvent(open, resolutionEvent(open.events[0].digest));
+    const before = await digestPayload(modernOpen);
+    const appended = appendEvent(modernOpen, resolutionEvent(modernOpen.events[0].digest));
     expect(await digestPayload(appended)).toBe(before);
   });
 
   it('leaves every earlier event digest unchanged', async () => {
-    const appended = appendEvent(open, resolutionEvent(open.events[0].digest));
-    expect(appended.events[0]).toEqual(open.events[0]);
+    const appended = appendEvent(modernOpen, resolutionEvent(modernOpen.events[0].digest));
+    expect(appended.events[0]).toEqual(modernOpen.events[0]);
   });
 
   it('does not mutate the original record', () => {
-    const snapshot = JSON.stringify(open);
-    appendEvent(open, resolutionEvent(open.events[0].digest));
-    expect(JSON.stringify(open)).toBe(snapshot);
+    const snapshot = JSON.stringify(modernOpen);
+    appendEvent(modernOpen, resolutionEvent(modernOpen.events[0].digest));
+    expect(JSON.stringify(modernOpen)).toBe(snapshot);
   });
 
   it('changes the derived status once the event is in the chain', () => {
-    expect(deriveLifecycle(open).status).toBe('open');
-    const appended = appendEvent(open, resolutionEvent(open.events[0].digest));
+    expect(deriveLifecycle(modernOpen).status).toBe('open');
+    const appended = appendEvent(modernOpen, resolutionEvent(modernOpen.events[0].digest));
     expect(deriveLifecycle(appended).status).toBe('resolved');
   });
 
@@ -213,8 +226,18 @@ describe('re-sealing is refused', () => {
 });
 
 describe('terminal transitions are final', () => {
-  const resolvedRecord = predictionRecords.find((r) => r.id === 'ORC-2025-0007')!;
-  const annulledRecord = predictionRecords.find((r) => r.id === 'ORC-2025-0009')!;
+  // Modern-scoped fixtures: a legacy record refuses *every* terminal event, so
+  // it could not tell us whether the "already closed" rule works.
+  const closedBase = predictionRecords.find((r) => r.id === 'ORC-2025-0007')!;
+  const annulledBase = predictionRecords.find((r) => r.id === 'ORC-2025-0009')!;
+  const resolvedRecord = {
+    ...closedBase,
+    integrity: { ...closedBase.integrity, payloadScope: 'sealed-payload' as const },
+  };
+  const annulledRecord = {
+    ...annulledBase,
+    integrity: { ...annulledBase.integrity, payloadScope: 'sealed-payload' as const },
+  };
 
   function body() {
     return {
@@ -273,7 +296,7 @@ describe('terminal transitions are final', () => {
   });
 
   it('allows the first terminal transition on an open record', () => {
-    const appended = appendEvent(open, resolutionEvent(open.events[0].digest));
+    const appended = appendEvent(modernOpen, resolutionEvent(modernOpen.events[0].digest));
     expect(deriveLifecycle(appended).status).toBe('resolved');
   });
 
@@ -286,7 +309,7 @@ describe('terminal transitions are final', () => {
   it('refuses to record an event before the moment it records', () => {
     // nextEvent rejects a recordedAt that is not strictly later.
     expect(() =>
-      nextEvent(open, 'resolved', '2029-01-01T00:00:00.000Z', body(), {
+      nextEvent(modernOpen, 'resolved', '2029-01-01T00:00:00.000Z', body(), {
         digest: 'a'.repeat(64),
         recordedAt: '2029-01-01T00:00:00.000Z',
       }),
@@ -294,7 +317,7 @@ describe('terminal transitions are final', () => {
   });
 
   it('accepts a well-formed transition and marks it observed', () => {
-    const event = nextEvent(open, 'resolved', '2029-01-01T00:00:00.000Z', body(), {
+    const event = nextEvent(modernOpen, 'resolved', '2029-01-01T00:00:00.000Z', body(), {
       digest: 'a'.repeat(64),
       recordedAt: '2029-01-02T00:00:00.000Z',
     });
@@ -364,6 +387,81 @@ describe('provenance is protected by the digest', () => {
   function eventChainOf(r: PredictionRecord) {
     return r.events;
   }
+});
+
+describe('legacy records refuse terminal events', () => {
+  const legacyOpen = predictionRecords.find((r) => r.id === 'ORC-2025-0001')!;
+
+  function resolution() {
+    return {
+      seq: 'e1',
+      kind: 'resolved' as const,
+      occurredAt: '2029-01-01T00:00:00.000Z',
+      body: { outcome: 'yes' as const, basis: 'f', note: 'f', evidenceIds: [] },
+      recordedAt: '2029-01-02T00:00:00.000Z',
+      origin: 'observed' as const,
+      algorithm: 'sha256' as const,
+      schemaVersion: 2 as const,
+      scope: 'event-envelope' as const,
+      digest: 'a'.repeat(64),
+      prevDigest: legacyOpen.events[0].digest,
+    };
+  }
+
+  it('confirms the record really is legacy-scoped and open', () => {
+    expect(legacyOpen.integrity.payloadScope).toBe('legacy-record');
+    expect(legacyOpen.events).toHaveLength(1);
+  });
+
+  it('nextEvent refuses to resolve a legacy record', () => {
+    expect(() =>
+      nextEvent(
+        legacyOpen,
+        'resolved',
+        '2029-01-01T00:00:00.000Z',
+        { outcome: 'yes', basis: 'f', note: 'f', evidenceIds: [] },
+        { digest: 'a'.repeat(64), recordedAt: '2029-01-02T00:00:00.000Z' },
+      ),
+    ).toThrow(/legacy payload scope cannot be resolved/i);
+  });
+
+  it('nextEvent refuses to annul a legacy record', () => {
+    expect(() =>
+      nextEvent(
+        legacyOpen,
+        'annulled',
+        '2029-01-01T00:00:00.000Z',
+        { reason: 'f', basis: 'f', note: 'f' },
+        { digest: 'a'.repeat(64), recordedAt: '2029-01-02T00:00:00.000Z' },
+      ),
+    ).toThrow(/legacy payload scope cannot be resolved/i);
+  });
+
+  it('appendEvent refuses to resolve a legacy record', () => {
+    expect(() => appendEvent(legacyOpen, resolution())).toThrow(AppendError);
+  });
+
+  it('appendEvent refuses to annul a legacy record', () => {
+    expect(() =>
+      appendEvent(legacyOpen, { ...resolution(), kind: 'annulled', body: { reason: 'f', basis: 'f', note: 'f' } }),
+    ).toThrow(/legacy payload scope/i);
+  });
+
+  it('refuses even if the event itself is otherwise perfectly formed', () => {
+    // No ordering, provenance or link problem: the refusal is about the record.
+    const event = resolution();
+    expect(event.prevDigest).toBe(legacyOpen.events[0].digest);
+    expect(() => appendEvent(legacyOpen, event)).toThrow(AppendError);
+  });
+
+  it('allows a modern-scoped record to be resolved', () => {
+    // The rule is about the digest scope, not about the archive being frozen.
+    const modern = {
+      ...legacyOpen,
+      integrity: { ...legacyOpen.integrity, payloadScope: 'sealed-payload' as const },
+    };
+    expect(() => appendEvent(modern, resolution())).not.toThrow();
+  });
 });
 
 describe('event digests', () => {

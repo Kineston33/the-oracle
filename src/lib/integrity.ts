@@ -284,14 +284,35 @@ export async function verifyRecordCompletely(
         detail: `All ${record.events.length} event digest(s) and link(s) reproduce.`,
       };
 
-  // Anchoring is not a pass/fail check: no external witness exists yet, so a
-  // false value is the honest state rather than a failure. It is separate so a
-  // reader cannot mistake internal consistency for third-party attestation.
-  const anchoringCheck: CheckResult = record.integrity.anchored
-    ? { status: 'pass', detail: 'An external witness has countersigned this digest.' }
+  // Anchoring can never pass in this build.
+  //
+  // `integrity.anchored` is a boolean the record carries; a boolean is a claim,
+  // not a proof. Treating it as a pass meant a one-character edit in the JSON
+  // produced a green "externally witnessed" tick. No anchoring mechanism is
+  // implemented, and there is no external proof to check, so the honest result
+  // is `unavailable` — even when the flag says otherwise. The validator rejects
+  // such a record outright, so this is the second line of defence rather than
+  // the first.
+  const anchoringClaimed = record.integrity.anchored;
+  // A record that claims anchoring it cannot prove is not internally consistent,
+  // so the claim has to reach the verdict. Without this the panel would show
+  // "anchoring failed" beside "everything verifies", which is exactly the kind
+  // of contradiction that makes a green tick untrustworthy.
+  if (anchoringClaimed) {
+    problems.push(
+      `Record ${record.id} claims external anchoring, but no verifiable external proof exists.`,
+    );
+  }
+  const anchoringCheck: CheckResult = anchoringClaimed
+    ? {
+        status: 'fail',
+        detail:
+          'This record claims external anchoring, but no verifiable external proof is implemented or checked. The claim cannot be honoured.',
+      }
     : {
         status: 'unavailable',
-        detail: 'No external witness or transparency log has countersigned this digest.',
+        detail:
+          'No external witness or transparency log has countersigned this digest. Internal consistency is not third-party attestation.',
       };
 
   return {

@@ -265,3 +265,16 @@ accountable forecasting should not begin with an inflated account of itself.
 32. **`npm run validate` cannot detect a full internal rebuild.** Recomputing every payload
     digest, the publication event and the whole chain produces a consistent archive that
     passes. Only the git history contradicts it. Closing this needs an external anchor.
+
+33. **`anchored` is rejected, not trusted.** No anchoring mechanism exists, so a record that
+    sets `integrity.anchored: true` fails validation and the panel reports the claim as
+    unhonoured. This must stay until a verifiable external proof exists — and when it does,
+    the check becomes "the proof verifies", never "the flag says so".
+34. **`observed` is a declared provenance, not a demonstrated one.** The digest protects the
+    claim from being edited; it cannot show the claim is true. A full rebuild can mint any
+    `origin` and `recordedAt`. Only an external witness closes this.
+35. **Seven legacy records are permanently unresolvable.** `0001`–`0006` and `0008` are open
+    and sealed under `legacy-record`, whose digest covers the outcome. `nextEvent` and
+    `appendEvent` refuse terminal events on them. This is the original sealing defect made
+    explicit; it is not repaired, because repairing it would mean re-sealing or rewriting
+    history.

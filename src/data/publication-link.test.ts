@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { predictionRecords } from './records';
 import {
+  AppendError,
   appendEvent,
   canonicalize,
   eventEnvelope,
@@ -254,6 +255,83 @@ describe('appending to a valid chain', () => {
     );
     // ...but the legacy digest it declares can no longer reproduce.
     expect(await recompute(withResolution)).not.toBe(withResolution.integrity.digest);
+  });
+});
+
+describe('anchoring is rejected, never trusted', () => {
+  it('rejects anchored: true because no external proof exists', async () => {
+    const claimed: PredictionRecord = {
+      ...target,
+      integrity: { ...target.integrity, anchored: true },
+    };
+    const problems = await validateArchive(archiveWith(claimed));
+    expect(problems.some((p) => p.includes('claims external anchoring'))).toBe(true);
+  });
+
+  it('rejects it on a legacy record too', async () => {
+    const closed = predictionRecords.find((r) => r.id === 'ORC-2025-0007')!;
+    const claimed: PredictionRecord = {
+      ...closed,
+      integrity: { ...closed.integrity, anchored: true },
+    };
+    const problems = await validateArchive(archiveWith(claimed));
+    expect(problems.some((p) => p.includes('claims external anchoring'))).toBe(true);
+  });
+
+  it('no shipped record claims anchoring', () => {
+    for (const record of predictionRecords) {
+      expect(record.integrity.anchored, record.id).toBe(false);
+    }
+  });
+});
+
+describe('the seven legacy records stay immutable demonstrations', () => {
+  const legacyOpenIds = ['ORC-2025-0001', 'ORC-2025-0002', 'ORC-2025-0003',
+    'ORC-2025-0004', 'ORC-2025-0005', 'ORC-2025-0006', 'ORC-2025-0008'];
+
+  it('are exactly seven, open, and legacy-scoped', () => {
+    const found = predictionRecords.filter(
+      (record) =>
+        record.integrity.payloadScope === 'legacy-record' && record.events.length === 1,
+    );
+    expect(found.map((r) => r.id).sort()).toEqual([...legacyOpenIds].sort());
+  });
+
+  it('each refuses a resolution through appendEvent', () => {
+    for (const id of legacyOpenIds) {
+      const record = predictionRecords.find((r) => r.id === id)!;
+      expect(
+        () =>
+          appendEvent(record, {
+            ...record.events[0],
+            seq: 'e1',
+            kind: 'resolved',
+            body: { outcome: 'yes', basis: 'x', note: 'x', evidenceIds: [] },
+            recordedAt: '2030-01-01T00:00:00.000Z',
+            origin: 'observed',
+            scope: 'event-envelope',
+          }),
+        `should refuse ${id}`,
+      ).toThrow(AppendError);
+    }
+  });
+
+  it('keep their exact legacy digest', () => {
+    // Pinned to the values on main a45348a: the whole point of leaving them
+    // alone is that these numbers never change again.
+    const expected: Record<string, string> = {
+      'ORC-2025-0001': '2c3c0206265888468d5ce4dc253351c2f2d5703e1d26ab067b36183fac2340e1',
+      'ORC-2025-0002': 'ef3a72926fec5d04bf488c226f8a2ea52ee1b1618d49ac251cf83b85085c660c',
+      'ORC-2025-0003': 'bbf8f62996189aa828f2edd19100e5b24ae7385119df91f331722aecd912a546',
+      'ORC-2025-0004': '4efacfd19030cd04e7bde1dfa539b89835bbaff14766dd1c79fcefa2fdbe63c7',
+      'ORC-2025-0005': 'cd89e5cc9446767284d146c3801ccceb49aaac80597f6f2bc520f37f441e09b3',
+      'ORC-2025-0006': '75065f05a0087da606e9550e663e03a3a113d4d2036a31ccfb1b20219122c832',
+      'ORC-2025-0008': '8dee59310bcd60ee848816e62e1f2e6b1b3ae17db5664f9d8422ccea35bd52ac',
+    };
+    for (const [id, digest] of Object.entries(expected)) {
+      const record = predictionRecords.find((r) => r.id === id)!;
+      expect(record.integrity.digest, id).toBe(digest);
+    }
   });
 });
 

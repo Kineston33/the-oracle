@@ -157,13 +157,13 @@ export function IntegrityPanel({ record }: { record: PredictionRecord }) {
           </dd>
         </div>
         <div className={styles.field}>
-          <dt>Event chain</dt>
+          <dt>Provenance (declared)</dt>
           <dd>
             {chainOrigin === 'migrated'
               ? 'Migrated, not witnessed'
               : chainOrigin === 'mixed'
-                ? 'Mixed provenance'
-                : 'Recorded as events'}
+                ? 'Mixed: migrated and observed'
+                : 'Declared observed, not proven'}
           </dd>
         </div>
       </dl>
@@ -206,6 +206,20 @@ export function IntegrityPanel({ record }: { record: PredictionRecord }) {
               <CheckRow label="Event chain" check={result.checks.eventChain} />
               <CheckRow label="External anchoring" check={result.checks.anchoring} neutralWhenUnavailable />
             </ul>
+
+            {/*
+              Provenance is shown next to the verdict, never instead of it. The
+              digest protects what an event *declares*; only an external witness
+              could show the declaration was made when it says it was.
+            */}
+            <p className={[styles.verifyLine, styles.checking].join(' ')}>
+              <Minus size={13} aria-hidden="true" />
+              Provenance is <strong>declared</strong>, not demonstrated. An event marked{' '}
+              <em>observed</em> says it was written while the thing happened; nothing here
+              can prove that, because no external witness has countersigned it. A migrated
+              event makes the weaker, verifiable claim that it was written later than the
+              dates it records.
+            </p>
 
             {result.ok ? (
               <p className={[styles.verifyLine, styles.match].join(' ')}>
@@ -256,6 +270,13 @@ export function IntegrityPanel({ record }: { record: PredictionRecord }) {
         {chainIntact === false
           ? ' The event chain failed verification, so the record is not shown as intact.'
           : ''}
+      </p>
+
+      <p className={styles.caveat}>
+        <strong>What this cannot rule out.</strong> Anyone with write access to the archive
+        could rebuild every payload digest, the publication event and the whole chain, and
+        the result would verify. Nothing anchors these hashes outside the repository, so
+        internal consistency is evidence of care, not independent proof.
       </p>
     </section>
   );

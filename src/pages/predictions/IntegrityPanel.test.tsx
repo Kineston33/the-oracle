@@ -106,6 +106,52 @@ describe('the panel never overstates integrity', () => {
     }
   });
 
+  it('never reports anchoring as passed, even when the record claims it', async () => {
+    const claiming: PredictionRecord = {
+      ...open,
+      integrity: { ...open.integrity, anchored: true },
+    };
+    const { container } = await renderPanel(claiming);
+    const text = panelText(container);
+
+    expect(text).not.toMatch(/External anchoring verified/);
+    expect(text).toMatch(/External anchoring failed/);
+    expect(text).toMatch(/cannot be honoured/i);
+    // And the overall verdict must not be positive either.
+    expect(text).not.toMatch(/all verify against the shipped bytes/i);
+  });
+
+  it('reports anchoring as not verified for an honest record', async () => {
+    const { container } = await renderPanel(open);
+    const text = panelText(container);
+
+    expect(text).toMatch(/External anchoring not verified/);
+    expect(text).not.toMatch(/External anchoring verified/);
+    expect(text).toMatch(/not third-party attestation/i);
+  });
+
+  it('presents observed provenance as declared, never as demonstrated', async () => {
+    // Build a record whose chain claims to have been observed contemporaneously.
+    const observedChain: PredictionRecord = {
+      ...open,
+      events: open.events.map((event) => ({ ...event, origin: 'observed' as const })),
+    };
+    const { container } = await renderPanel(observedChain);
+    const text = panelText(container);
+
+    expect(text).toMatch(/Declared observed, not proven/i);
+    expect(text).toMatch(/Provenance is declared, not demonstrated/i);
+    expect(text).toMatch(/nothing here\s+can prove that/i);
+    // It must never state that the event is proven to predate anything.
+    expect(text).not.toMatch(/proven contemporaneous/i);
+    expect(text).not.toMatch(/witnessed at/i);
+  });
+
+  it('keeps the full-rebuild warning visible', async () => {
+    const { container } = await renderPanel(open);
+    expect(panelText(container)).toMatch(/rebuild every payload digest, the publication event and the\s+whole chain/i);
+  });
+
   it('keeps the migration caveat visible with a closed record', async () => {
     const { container } = await renderPanel(resolved);
     const text = panelText(container);
