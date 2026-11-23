@@ -370,6 +370,29 @@ export type PublicationOutcome =
       detail: string;
       match?: IdentityMatch;
     }
+  /**
+   * `request.candidateDigest` is missing, malformed, or does not match
+   * `candidateContentDigest(candidate, aliases)`. Rejected before any registry
+   * lookup or mutation.
+   */
+  | {
+      kind: 'candidate-digest-mismatch';
+      reason: 'missing' | 'malformed' | 'mismatch';
+      expectedDigest: string;
+      receivedDigest: string;
+      detail: string;
+    }
+  /**
+   * The injected publication/recording clock returned an invalid UTC timestamp
+   * or a non-increasing `(publishedAt, recordedAt)` pair. Rejected before any
+   * registry mutation.
+   */
+  | {
+      kind: 'invalid-clock';
+      publishedAt: string;
+      recordedAt: string;
+      detail: string;
+    }
   /** Identity resolution was not confident enough to publish. */
   | { kind: 'identity-conflict'; match: IdentityMatch }
   /** Evaluation did not pass. */

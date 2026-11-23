@@ -116,11 +116,11 @@ accountable forecasting should not begin with an inflated account of itself.
 - Strict TypeScript and automated test suite across UI, integrity, canonical identity, and
   publication protocol rules; successful production build.
 
-### Official Publication Protocol v1.1 (domain layer)
+### Official Publication Protocol v1.2 (domain layer)
 
 - **Three-tier separation and attested lifecycle (`src/data/publication-types.ts`, `src/data/publication.ts`)**:
   explicit domain types separating `exploratory-query`, `CandidateProposition`, and official
-  `PredictionRecord` instances, with `LIFECYCLE`, `TERMINAL_STAGES`
+  `PredictionRecord` instances (`demo: false`), with `LIFECYCLE`, `TERMINAL_STAGES`
   (`['rejected-candidate', 'resolved', 'annulled']`), and `PUBLISHABLE_STAGE`
   (`'eligible-for-publication'`) exported as data, plus module-private `WeakMap` stage
   attestations (`advanceCandidate`, `qualifyCandidate`, `isVerifiedEligibleCandidate`) so
@@ -131,20 +131,26 @@ accountable forecasting should not begin with an inflated account of itself.
   `AliasTable` with self-inclusion and conflict checks, three-valued `compareIdentities`
   (`distinct` → `uncertain` → `equivalent`, with no numeric similarity threshold), and
   scheme-prefixed `identityDigest` (`oracle.identity/1\n`).
-- **Eleven-requirement candidate evaluation with strict temporal checks (`src/data/publication.ts`)**:
-  `evaluateCandidate` and `verdictIsComplete` checking all eleven
+- **Eleven-requirement candidate evaluation bound to `publishedAt` (`src/data/publication.ts`)**:
+  `evaluateCandidate(candidate, { publishedAt })` and `verdictIsComplete` checking all eleven
   `EVALUATION_REQUIREMENTS` without silent defaults, including strict UTC calendar date
   validation (`parseIsoDateTimeMs`, `isValidIsoDateTime`) that rejects impossible calendar
   dates (`2026-02-29`, `2030-02-30`, `2030-04-31`), reversed horizons (`startsAt >= endsAt`),
-  and resolution dates preceding `horizon.endsAt` or disagreeing with
-  `resolutionCriteria.resolveOn`.
-- **Seven-step publication gate (`publishCandidate`), domain record sealing (`buildSealedPredictionRecord`), and `InMemoryRegistry`**:
-  enforces candidate-to-request identity/ID binding (`candidate-mismatch`), stage check,
-  content-bound idempotency (`publicationRequestDigest`, `replayed`, `idempotency-conflict`),
-  identity self-check (`identity-conflict`), evaluation gate (`rejected`), anti-forgery
+  expired horizons (`publishedAt >= horizon.endsAt`), resolution dates preceding
+  `horizon.endsAt` or disagreeing with `resolutionCriteria.resolveOn`, and post-publication
+  evidence (`evidence[i].publishedAt > publishedAt`).
+- **Honest clock contract, `candidateDigest` verification, official record validation, and nine-step publication gate (`publishCandidate`)**:
+  enforces candidate-to-request identity/ID binding (`candidate-mismatch`), cryptographic
+  `request.candidateDigest` verification against `candidateContentDigest(candidate, aliases)`
+  (`candidate-digest-mismatch`), stage check, injected clock validation (`invalid-clock` /
+  `InvalidClockError` requiring valid UTC `publishedAt` and `recordedAt` with
+  `recordedAt > publishedAt` and no `+1ms` fabrication), content-bound idempotency
+  (`publicationRequestDigest`, `replayed`, `idempotency-conflict`), identity self-check
+  (`identity-conflict`), evaluation gate at `publishedAt` (`rejected`), anti-forgery
   lifecycle attestation (`wrong-stage` with `reason: 'forged-stage'`), and atomic
-  `commitPublication` with a complete `validateArchive`-compliant sealed `PredictionRecord`,
-  leaving `src/data/records.json` untouched.
+  `commitPublication` producing a `demo: false` official `PredictionRecord` verified by
+  `validateOfficialRecord` / `validateOfficialArchive` while leaving `src/data/records.json`
+  and `src/data/validate.ts` untouched.
 
 ---
 
@@ -349,13 +355,14 @@ accountable forecasting should not begin with an inflated account of itself.
     can still produce this failure. If it appears in CI, run that file in isolation rather than
     raising the number again.
 
-### Official Publication Protocol v1.1 (domain layer)
+### Official Publication Protocol v1.2 (domain layer)
 
 37. **The publication protocol is a domain specification and reference implementation, not a
     live server.** `src/data/publication-types.ts`, `src/data/canonical-identity.ts`, and
     `src/data/publication.ts` define and test the attested lifecycle, canonical identity,
     evaluation gate, domain-level sealed record construction (`buildSealedPredictionRecord`),
-    and `PublicationRegistry` contract in pure TypeScript. No HTTP API, worker process, or
+    official record validator (`validateOfficialRecord` / `validateOfficialArchive`), and
+    `PublicationRegistry` contract in pure TypeScript. No HTTP API, worker process, or
     persistent database exists in this repository; `docs/PUBLICATION-API-CONTRACT.md`
     specifies the storage and transaction requirements a future backend must implement.
 38. **`InMemoryRegistry` is single-process and ephemeral; single-threaded tests do not prove
@@ -364,19 +371,36 @@ accountable forecasting should not begin with an inflated account of itself.
     idempotency binding in a single synchronous critical section inside one JavaScript event
     loop. That proves the domain contract and state-machine invariants in unit tests, but it
     provides no crash durability and no multi-process or multi-node concurrency control.
-    Production uniqueness and atomic idempotency+publication commit depend on a relational
-    database enforcing `PRIMARY KEY (idempotency_key)` and `UNIQUE (identity_digest)` inside
-    a single ACID transaction (`docs/PUBLICATION-API-CONTRACT.md` §2.3).
-39. **`AliasTable` is curated editorial data, not semantic inference.** `compareIdentities`
+    Production uniqueness and atomic idempotency+publication commit depend on PostgreSQL
+    enforcing `PRIMARY KEY (idempotency_key)` (`INSERT ... ON CONFLICT (idempotency_key) DO NOTHING`),
+    a deferred `CHECK (outcome IS NOT NULL)` constraint, and `UNIQUE (identity_digest)` inside
+    a single `READ COMMITTED` ACID transaction (`docs/PUBLICATION-API-CONTRACT.md` §2.3).
+39. **Historical DEMO validation (`validateArchive`) and official publication validation
+    (`validateOfficialRecord` / `validateOfficialArchive`) are intentionally separate.**
+    Protected `src/data/validate.ts` (`validateArchive`) is the build-time gate for the 10
+    illustrative records in `src/data/records.json` and requires `record.demo === true`.
+    Newly constructed official records have `record.demo === false` and are validated by
+    `validateOfficialRecord` / `validateOfficialArchive` (`src/data/publication.ts`), which
+    reuse the underlying cryptographic and event-chain checks (`eventChainProblems`,
+    `publishedLinkProblems`, `digestProblems`) while enforcing `demo === false`,
+    `payloadScope === 'sealed-payload'`, `sealClaim === 'published-before-outcome'`,
+    `anchored === false`, `publishedAt < horizon.endsAt`, and `evidence[i].publishedAt <= publishedAt`.
+40. **`AliasTable` is curated editorial data, not semantic inference.** `compareIdentities`
     and `identityDigest` merge two different identifiers (`albiceleste` and `fifa-argentina`)
     only when an explicit `AliasEntry` lists both under the same namespace. Nothing in
     `src/data/canonical-identity.ts` parses free-text questions into `PropositionIdentity`
     components or infers synonymy from prose.
-40. **Falsifiability is a recorded review assertion, not an automated proof, and stage
+41. **Falsifiability is a recorded review assertion, not an automated proof, and stage
     attestation is in-memory (`WeakMap`).** Requirement `falsifiable-proposition` checks
     that `candidate.inferences` contains a recorded `falsifiability-review` entry. Similarly,
     `advanceCandidate` / `qualifyCandidate` track verified stage transitions in a
     module-private `WeakMap`; across HTTP requests in a future backend, candidate stage
     transitions must be persisted and verified by the server rather than trusted from client
     JSON.
-
+42. **Clock honesty is enforced structurally (`recordedAt > publishedAt`), not attested by an
+    external time authority.** `buildSealedPredictionRecord` and `publishCandidate` require
+    injected `publishedAt` and `recordedAt` UTC timestamps with `recordedAt > publishedAt`
+    and verify `publishedAt < horizon.endsAt` and `evidence[i].publishedAt <= publishedAt`,
+    refusing invalid or non-increasing clocks (`InvalidClockError` / `invalid-clock`). However,
+    without an external RFC 3161 timestamp authority or transparency log (`anchored: false`),
+    a party controlling the server clock could still supply a backdated clock at sealing time.

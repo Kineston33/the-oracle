@@ -40,7 +40,7 @@ ORACLE is organised around how auditable it will be *later*:
 | SHA-256 digest sealing + in-browser verification | ✅ Built |
 | Deterministic question reading (subject, horizon, archive match) | ✅ Built |
 | Local drafts (no account, no transmission) | ✅ Built |
-| Official Publication Protocol v1 (lifecycle, canonical identity, 11-point evaluation, registry contract) | ✅ Built (domain layer only — no server or database) |
+| Official Publication Protocol v1.2 (lifecycle, canonical identity, 11-point evaluation, registry contract) | ✅ Built (domain layer only — no server or database) |
 | Forecast generation of any kind | ❌ Not built |
 | Server, database, shared resolution service | ❌ Not built |
 | Public transparency log / external anchoring | ❌ Not built |
@@ -108,7 +108,7 @@ the-oracle/
     │   └── ui/                  # button, badge, callout, field, empty state…
     ├── data/
     │   ├── types.ts             # domain model (the heart of the product)
-    │   ├── publication-types.ts # Official Publication Protocol v1 vocabulary & LIFECYCLE
+    │   ├── publication-types.ts # Official Publication Protocol v1.2 vocabulary & LIFECYCLE
     │   ├── canonical-identity.ts # structured identity, AliasTable, compareIdentities, identityDigest
     │   ├── publication.ts       # stage transitions, evaluateCandidate, publishCandidate, InMemoryRegistry
     │   ├── records.json         # 10 illustrative sealed records

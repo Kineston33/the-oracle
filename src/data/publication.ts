@@ -1,10 +1,10 @@
 /**
- * Publication evaluation, lifecycle, and atomic registry rules.
+ * Publication evaluation, lifecycle, and atomic registry rules (v1.2).
  *
- * Everything in this file is a pure function over a candidate and a registry
- * contract. There is no persistent storage, no network and no clock of its own:
- * the clock is injected, so the same rules produce the same verdicts in tests,
- * in a future backend, and in any audit.
+ * Everything in this file is a pure function over a candidate, injected clocks,
+ * and a registry contract. There is no persistent storage, no network and no
+ * machine clock of its own: the clock is injected, so the same rules produce
+ * the same verdicts in tests, in a future backend, and in any audit.
  *
  * The rules this file enforces:
  *   · a plausible-sounding candidate is not a publishable one;
@@ -12,8 +12,15 @@
  *     transitions, identity matching, and evaluation;
  *   · a candidate for one proposition cannot publish another proposition's
  *     identity;
+ *   · `request.candidateDigest` is verified against `candidateContentDigest`;
  *   · an idempotency key is permanently bound to the canonical digest of the
  *     publication-relevant candidate and request content;
+ *   · `publishedAt` and `recordedAt` come from injected clocks with
+ *     `recordedAt > publishedAt` (never synthesized by adding +1ms);
+ *   · `publishedAt < candidate.horizon.endsAt` and every evidence item's
+ *     `publishedAt <= publishedAt`;
+ *   · newly constructed official records carry `demo: false` and are validated
+ *     separately from the historical demo archive (`validateOfficialRecord`);
  *   · claiming an identity, sealing the initial `PredictionRecord`, and binding
  *     the idempotency outcome occur through a single atomic registry boundary.
  */
@@ -28,11 +35,13 @@ import {
   EVENT_ALGORITHM,
   EVENT_SCHEMA_VERSION,
   PUBLISHED_SCOPE,
+   SUPPORTED_SCHEMA_VERSIONS,
   canonicalize,
   eventEnvelope,
   sealedPayload,
 } from './events.ts';
 import { sha256Hex } from './hash.ts';
+import { deriveLifecycle } from './lifecycle.ts';
 import {
   EVALUATION_REQUIREMENTS,
   LIFECYCLE,
@@ -51,6 +60,13 @@ import {
   type RequirementResult,
 } from './publication-types.ts';
 import type { PredictionRecord, RecordEvent } from './types.ts';
+import {
+  canonicalKey,
+  eventChainProblems,
+  findCanonicalCollisions,
+  publishedLinkProblems,
+  recomputeDeclaredDigest,
+} from './validate.ts';
 
 /* -------------------------------------------------------------------------
    Temporal validation
@@ -110,6 +126,20 @@ export function isValidIsoDateTime(value: string): boolean {
    ------------------------------------------------------------------------- */
 
 export class TransitionError extends Error {}
+export class InvalidClockError extends Error {}
+
+export interface EvaluationOptions {
+  /**
+   * The UTC timestamp at which publication is being evaluated.
+   *
+   * When supplied (as `publishCandidate` always does from the injected
+   * publication clock), `fixed-horizon` requires `publishedAt < horizon.endsAt`
+   * and `preserved-evidence-provenance` requires every evidence item's
+   * `publishedAt <= publishedAt`. When omitted in standalone evaluation,
+   * `candidate.createdAt` is used as the reference timestamp.
+   */
+  publishedAt?: string;
+}
 
 interface LifecycleAttestation {
   stage: PropositionStage;
@@ -182,21 +212,12 @@ export function isVerifiedEligibleCandidate(candidate: CandidateProposition): bo
 /**
  * Advance a candidate proposition one step along `LIFECYCLE`, enforcing gate
  * preconditions and recording an unforgeable attestation for the new stage.
- *
- * - Entry stages (`exploratory-query` and `candidate-proposition`) may begin
- *   unattested.
- * - Any later stage (`identity-matching`, `evaluation`,
- *   `eligible-for-publication`) must carry a valid attestation from the previous
- *   step, so a caller cannot forge `stage: 'evaluation'` and advance from there.
- * - Advancing `identity-matching → evaluation` requires every component of
- *   `proposedIdentity` to resolve without ambiguity (`equivalent`).
- * - Advancing `evaluation → eligible-for-publication` requires
- *   `evaluateCandidate(candidate).eligible === true`.
  */
 export function advanceCandidate(
   candidate: CandidateProposition,
   to: PropositionStage,
   aliases?: AliasTable,
+  options?: EvaluationOptions,
 ): CandidateProposition {
   if (!canTransition(candidate.stage, to)) {
     throw new TransitionError(`Lifecycle does not allow ${candidate.stage} → ${to}`);
@@ -229,7 +250,7 @@ export function advanceCandidate(
   }
 
   if (candidate.stage === 'evaluation' && to === 'eligible-for-publication') {
-    const verdict = evaluateCandidate(candidate);
+    const verdict = evaluateCandidate(candidate, options);
     if (!verdict.eligible) {
       const failed = verdict.results
         .filter((entry) => !entry.passed)
@@ -259,19 +280,20 @@ export function advanceCandidate(
 export function qualifyCandidate(
   candidate: CandidateProposition,
   aliases?: AliasTable,
+  options?: EvaluationOptions,
 ): CandidateProposition {
   let current = candidate;
   if (current.stage === 'exploratory-query') {
-    current = advanceCandidate(current, 'candidate-proposition', aliases);
+    current = advanceCandidate(current, 'candidate-proposition', aliases, options);
   }
   if (current.stage === 'candidate-proposition') {
-    current = advanceCandidate(current, 'identity-matching', aliases);
+    current = advanceCandidate(current, 'identity-matching', aliases, options);
   }
   if (current.stage === 'identity-matching') {
-    current = advanceCandidate(current, 'evaluation', aliases);
+    current = advanceCandidate(current, 'evaluation', aliases, options);
   }
   if (current.stage === 'evaluation') {
-    current = advanceCandidate(current, 'eligible-for-publication', aliases);
+    current = advanceCandidate(current, 'eligible-for-publication', aliases, options);
     return current;
   }
   if (isVerifiedEligibleCandidate(current)) {
@@ -303,11 +325,17 @@ function result(
  *   · no probability is a failure, not a default of 0.5;
  *   · no evidence is a failure, not "evidence-free but plausible";
  *   · an unresolved deciding authority is a failure, not "unknown but fine";
- *   · impossible calendar dates, reversed horizons, or inconsistent resolution
- *     dates fail outright.
+ *   · impossible calendar dates, reversed horizons, expired horizons
+ *     (`publishedAt >= horizon.endsAt`), inconsistent resolution dates, or
+ *     evidence dated after `publishedAt` fail outright.
  */
-export function evaluateCandidate(candidate: CandidateProposition): EvaluationVerdict {
+export function evaluateCandidate(
+  candidate: CandidateProposition,
+  options?: EvaluationOptions,
+): EvaluationVerdict {
   const results: RequirementResult[] = [];
+  const referencePublishedAt = options?.publishedAt ?? candidate.createdAt;
+  const publishedMs = parseIsoDateTimeMs(referencePublishedAt);
 
   results.push(
     result(
@@ -342,7 +370,9 @@ export function evaluateCandidate(candidate: CandidateProposition): EvaluationVe
   const horizonLabelValid = horizon !== null && horizon.label.trim().length > 0;
   const horizonDatesValid = startMs !== null && endMs !== null;
   const horizonOrdered = horizonDatesValid && startMs < endMs;
-  const horizonPassed = horizonLabelValid && horizonOrdered;
+  const horizonOpenAtPublication =
+    horizonOrdered && publishedMs !== null && publishedMs < endMs;
+  const horizonPassed = horizonLabelValid && horizonOpenAtPublication;
   let horizonReason: string;
   if (horizon === null) {
     horizonReason = 'No time horizon was fixed.';
@@ -352,8 +382,12 @@ export function evaluateCandidate(candidate: CandidateProposition): EvaluationVe
     horizonReason = `Time horizon contains an invalid UTC ISO-8601 timestamp (startsAt='${horizon.startsAt}', endsAt='${horizon.endsAt}').`;
   } else if (!horizonOrdered) {
     horizonReason = `Time horizon start (${horizon.startsAt}) must strictly precede its end (${horizon.endsAt}).`;
+  } else if (publishedMs === null) {
+    horizonReason = `Publication timestamp '${referencePublishedAt}' is not a valid calendar UTC ISO-8601 timestamp.`;
+  } else if (!horizonOpenAtPublication) {
+    horizonReason = `Publication timestamp (${referencePublishedAt}) must precede the horizon end (${horizon.endsAt}); the forecast window has already closed.`;
   } else {
-    horizonReason = 'Time horizon is fixed with valid start and end timestamps in chronological order.';
+    horizonReason = 'Time horizon is fixed, chronologically ordered, and open at publication time.';
   }
   results.push(result('fixed-horizon', horizonPassed, horizonReason));
 
@@ -367,7 +401,7 @@ export function evaluateCandidate(candidate: CandidateProposition): EvaluationVe
     (criteriaResolveMs !== null && criteriaResolveOn === resolutionDate);
   const afterHorizonEnd =
     resolutionMs !== null &&
-    (endMs === null || ( resolutionMs >= endMs && (startMs === null || resolutionMs > startMs)));
+    (endMs === null || (resolutionMs >= endMs && (startMs === null || resolutionMs > startMs)));
   const resolutionDatePassed =
     resolutionMs !== null && afterHorizonEnd && criteriaAgrees;
   let resolutionDateReason: string;
@@ -447,21 +481,40 @@ export function evaluateCandidate(candidate: CandidateProposition): EvaluationVe
     ),
   );
 
-  const provenanceComplete = candidate.evidence.every(
+  const provenanceFieldsComplete = candidate.evidence.every(
     (item) =>
       isValidIsoDateTime(item.publishedAt) &&
       item.publisher.trim().length > 0 &&
       item.title.trim().length > 0,
   );
+  const futureEvidence =
+    provenanceFieldsComplete && publishedMs !== null
+      ? candidate.evidence.find((item) => {
+          const itemMs = parseIsoDateTimeMs(item.publishedAt);
+          return itemMs === null || itemMs > publishedMs;
+        })
+      : undefined;
+  const provenanceChronologyValid =
+    provenanceFieldsComplete && publishedMs !== null && futureEvidence === undefined;
+  let provenanceReason: string;
+  if (candidate.evidence.length === 0) {
+    provenanceReason = 'No evidence exists, so no provenance can be preserved.';
+  } else if (!provenanceFieldsComplete) {
+    provenanceReason =
+      'At least one evidence item is missing its publisher, title, or a valid UTC publishedAt timestamp.';
+  } else if (publishedMs === null) {
+    provenanceReason = `Publication timestamp '${referencePublishedAt}' is not a valid calendar UTC ISO-8601 timestamp.`;
+  } else if (futureEvidence !== undefined) {
+    provenanceReason = `Evidence item '${futureEvidence.id}' publishedAt (${futureEvidence.publishedAt}) is later than the publication timestamp (${referencePublishedAt}).`;
+  } else {
+    provenanceReason =
+      'Every evidence item carries a publisher, a title, and a valid UTC timestamp on or before publication.';
+  }
   results.push(
     result(
       'preserved-evidence-provenance',
-      candidate.evidence.length > 0 && provenanceComplete,
-      candidate.evidence.length === 0
-        ? 'No evidence exists, so no provenance can be preserved.'
-        : provenanceComplete
-          ? 'Every evidence item carries a publisher, a title and a valid UTC timestamp.'
-          : 'At least one evidence item is missing its publisher, title, or a valid UTC publishedAt timestamp.',
+      candidate.evidence.length > 0 && provenanceChronologyValid,
+      provenanceReason,
     ),
   );
 
@@ -509,7 +562,7 @@ export function verdictIsComplete(verdict: EvaluationVerdict): boolean {
 }
 
 /* -------------------------------------------------------------------------
-   Versioned candidate & request digests + sealed record construction
+   Versioned candidate & request digests + official sealed record construction
    ------------------------------------------------------------------------- */
 
 export const CANDIDATE_CONTENT_SCHEMA = 'oracle.candidate/1' as const;
@@ -577,20 +630,44 @@ export async function publicationRequestDigest(
 }
 
 /**
- * Construct a complete, domain-sealed `PredictionRecord` and initial `e0`
- * (`published`) event from an eligible candidate.
+ * Construct a complete, domain-sealed official `PredictionRecord` (`demo: false`)
+ * and initial `e0` (`published`) event from an eligible candidate.
  *
- * The returned record satisfies `validateArchive` under
- * `payloadScope: 'sealed-payload'` and `sealClaim: 'published-before-outcome'`,
- * with `anchored: false` (since no external witness is implemented in v0.1).
+ * Requires explicit, valid UTC ISO-8601 `publishedAt` and `recordedAt`
+ * timestamps with `recordedAt > publishedAt` (never synthesized by adding +1ms
+ * or reading the machine clock).
+ *
+ * Note on validation boundaries:
+ *   · `validateArchive` in `src/data/validate.ts` is the build-time gate for the
+ *     static v0.1 illustrative dataset (`src/data/records.json`) and enforces
+ *     `demo: true` on every shipped demo record.
+ *   · Newly constructed official records carry `demo: false` (they are not
+ *     illustrative demos) and are validated by `validateOfficialRecord` /
+ *     `validateOfficialArchive` below.
  */
 export async function buildSealedPredictionRecord(
   candidate: CandidateProposition,
   predictionId: string,
   publishedAt: string,
+  recordedAt: string,
 ): Promise<PredictionRecord> {
-  const publishedMs = parseIsoDateTimeMs(publishedAt) ?? Date.now();
-  const recordedAt = new Date(publishedMs + 1).toISOString();
+  const publishedMs = parseIsoDateTimeMs(publishedAt);
+  if (publishedMs === null) {
+    throw new InvalidClockError(
+      `publishedAt '${publishedAt}' is not a valid calendar UTC ISO-8601 timestamp.`,
+    );
+  }
+  const recordedMs = parseIsoDateTimeMs(recordedAt);
+  if (recordedMs === null) {
+    throw new InvalidClockError(
+      `recordedAt '${recordedAt}' is not a valid calendar UTC ISO-8601 timestamp.`,
+    );
+  }
+  if (recordedMs <= publishedMs) {
+    throw new InvalidClockError(
+      `recordedAt (${recordedAt}) must be strictly later than publishedAt/occurredAt (${publishedAt}).`,
+    );
+  }
 
   const baseRecord: PredictionRecord = {
     id: predictionId,
@@ -602,7 +679,7 @@ export async function buildSealedPredictionRecord(
     horizon: candidate.horizon!,
     resolutionCriteria: candidate.resolutionCriteria!,
     evidence: candidate.evidence,
-    demo: true,
+    demo: false,
     sealClaim: 'published-before-outcome',
     events: [],
     integrity: {
@@ -630,7 +707,7 @@ export async function buildSealedPredictionRecord(
       payloadDigest,
       payloadScope: 'sealed-payload',
       sealClaim: 'published-before-outcome',
-      note: 'Initial official publication sealed under Official Publication Protocol v1.1.',
+      note: 'Initial official publication sealed under Official Publication Protocol v1.2.',
     },
     digest: '',
     prevDigest: null,
@@ -652,6 +729,147 @@ export async function buildSealedPredictionRecord(
   });
 }
 
+/**
+ * Validate a newly constructed official `PredictionRecord` (`demo: false`).
+ *
+ * Distinct from `validateArchive` in `src/data/validate.ts`, which is the
+ * static demo-archive build gate (`demo: true` required). Official records
+ * constructed through the publication protocol must carry:
+ *   · `demo: false` (never mislabelled as an illustrative demo);
+ *   · `integrity.payloadScope === 'sealed-payload'`;
+ *   · `sealClaim === 'published-before-outcome'`;
+ *   · `integrity.anchored === false` (until a verifiable external witness proof
+ *     is implemented);
+ *   · valid UTC timestamps with `horizon.startsAt < horizon.endsAt`,
+ *     `publishedAt < horizon.endsAt`, `resolutionCriteria.resolveOn >= horizon.endsAt`,
+ *     and every `evidence[i].publishedAt <= publishedAt`;
+ *   · a reproducing `integrity.digest`, valid publication link (`e0`), and
+ *     reproducing schema-2 event digests.
+ */
+export async function validateOfficialRecord(
+  record: PredictionRecord,
+): Promise<string[]> {
+  return validateOfficialArchive([record]);
+}
+
+export async function validateOfficialArchive(
+  records: readonly PredictionRecord[],
+): Promise<string[]> {
+  const problems: string[] = [];
+  const ids = new Set<string>();
+
+  for (const record of records) {
+    if (ids.has(record.id)) problems.push(`Duplicate record id: ${record.id}`);
+    ids.add(record.id);
+
+    if (!/^ORC-\d{4}-\d{4}$/.test(record.id)) {
+      problems.push(`Malformed record id: ${record.id}`);
+    }
+    if (record.demo !== false) {
+      problems.push(
+        `Official record ${record.id} must have demo: false (demo: true is reserved for illustrative records)`,
+      );
+    }
+    if (record.evidence.length === 0) {
+      problems.push(`Record ${record.id} has no evidence`);
+    }
+    if (record.probability <= 0 || record.probability >= 1) {
+      problems.push(`Record ${record.id} has an out-of-range probability`);
+    }
+    if (!/^[0-9a-f]{64}$/.test(record.integrity.digest)) {
+      problems.push(`Record ${record.id} has no valid SHA-256 digest`);
+    }
+
+    const publishedMs = parseIsoDateTimeMs(record.publishedAt);
+    const startMs = parseIsoDateTimeMs(record.horizon.startsAt);
+    const endMs = parseIsoDateTimeMs(record.horizon.endsAt);
+    const resolveOnMs = parseIsoDateTimeMs(record.resolutionCriteria.resolveOn);
+
+    if (publishedMs === null) {
+      problems.push(`Record ${record.id} has an invalid publishedAt timestamp`);
+    }
+    if (startMs === null || endMs === null || startMs >= endMs) {
+      problems.push(`Record ${record.id} has an invalid or reversed horizon`);
+    }
+    if (publishedMs !== null && endMs !== null && endMs <= publishedMs) {
+      problems.push(`Record ${record.id} ends at or before it was published`);
+    }
+    if (resolveOnMs === null || (endMs !== null && resolveOnMs < endMs)) {
+      problems.push(`Record ${record.id} resolves before its horizon ends`);
+    }
+
+    for (const item of record.evidence) {
+      const itemMs = parseIsoDateTimeMs(item.publishedAt);
+      if (itemMs === null) {
+        problems.push(
+          `Record ${record.id} evidence '${item.id}' has an invalid publishedAt timestamp`,
+        );
+      } else if (publishedMs !== null && itemMs > publishedMs) {
+        problems.push(
+          `Record ${record.id} evidence '${item.id}' postdates publication (${item.publishedAt} > ${record.publishedAt})`,
+        );
+      }
+    }
+
+    const lifecycle = deriveLifecycle(record);
+    if (lifecycle.status === 'resolved' && lifecycle.resolution?.outcome === 'indeterminate') {
+      problems.push(`Record ${record.id} is resolved with an indeterminate outcome`);
+    }
+    if (!canonicalKey(record.canonicalQuestion)) {
+      problems.push(`Record ${record.id} has an empty canonical question`);
+    }
+    if (record.integrity.payloadScope !== 'sealed-payload') {
+      problems.push(
+        `Official record ${record.id} must use payloadScope 'sealed-payload', got '${record.integrity.payloadScope}'`,
+      );
+    }
+    if (record.sealClaim !== 'published-before-outcome') {
+      problems.push(
+        `Official record ${record.id} must declare sealClaim 'published-before-outcome', got '${record.sealClaim}'`,
+      );
+    }
+    if (record.integrity.algorithm !== 'SHA-256') {
+      problems.push(
+        `Record ${record.id} declares unknown digest algorithm '${record.integrity.algorithm}'`,
+      );
+    }
+    if (record.integrity.anchored) {
+      problems.push(
+        `Record ${record.id} claims external anchoring, but no verifiable external witness is implemented`,
+      );
+    }
+
+    problems.push(...eventChainProblems(record));
+
+    const recomputed = await recomputeDeclaredDigest(record);
+    const matches = recomputed === record.integrity.digest;
+    problems.push(...publishedLinkProblems(record, matches, recomputed));
+
+    for (const event of record.events) {
+      if (
+        event.algorithm !== EVENT_ALGORITHM ||
+        !(SUPPORTED_SCHEMA_VERSIONS as readonly number[]).includes(event.schemaVersion)
+      ) {
+        continue;
+      }
+      const recomputedEvent = await sha256Hex(canonicalize(eventEnvelope(event)));
+      if (recomputedEvent !== event.digest) {
+        problems.push(
+          `Record ${record.id} event ${event.seq} digest does not reproduce from its contents`,
+        );
+      }
+    }
+  }
+
+  for (const collision of findCanonicalCollisions(records)) {
+    problems.push(
+      `Canonical question claimed by more than one record without supersession: ${collision.ids.join(', ')}`,
+    );
+  }
+
+  return problems;
+}
+
 /* -------------------------------------------------------------------------
    Publication
    ------------------------------------------------------------------------- */
@@ -659,8 +877,19 @@ export async function buildSealedPredictionRecord(
 export interface PublicationDeps {
   registry: PublicationRegistry;
   aliases?: AliasTable;
-  /** Injected so the protocol has no hidden clock. */
+  /**
+   * Injected clock returning UTC ISO-8601 timestamps.
+   *
+   * Read for `publishedAt` (`e0.occurredAt`) and — when `recordedAt` is not
+   * supplied separately — read a second time when recording `e0`.
+   */
   now: () => string;
+  /**
+   * Optional explicit clock for the moment `e0` is recorded into the chain.
+   * When omitted, `now()` is invoked a second time. Never synthesized by adding
+   * an arbitrary millisecond.
+   */
+  recordedAt?: () => string;
   /** Produces the id a newly created record will carry. */
   newPredictionId: (identityDigest: string) => string;
 }
@@ -674,18 +903,24 @@ export interface PublicationDeps {
  *      `request.identity` must match `candidate.proposedIdentity` under the
  *      alias table before any registry lookup or mutation;
  *   2. stage value — only `eligible-for-publication` may proceed;
- *   3. idempotency lookup — a repeated key with identical request digest
+ *   3. candidate digest — `request.candidateDigest` must be a 64-char hex
+ *      SHA-256 matching `candidateContentDigest(candidate, aliases)`;
+ *   4. clock validation — `publishedAt` and `recordedAt` from the injected
+ *      clocks must be valid UTC ISO-8601 timestamps with
+ *      `recordedAt > publishedAt`;
+ *   5. idempotency lookup — a repeated key with identical request digest
  *      replays the original outcome; a repeated key with different content
  *      returns `idempotency-conflict`;
- *   4. identity self-check — any unresolved component blocks publication with
+ *   6. identity self-check — any unresolved component blocks publication with
  *      `identity-conflict`;
- *   5. evaluation — any failed requirement blocks publication with `rejected`;
- *   6. lifecycle attestation — a manually forged `eligible-for-publication`
+ *   7. evaluation bound to `publishedAt` — any failed requirement (including
+ *      `publishedAt >= horizon.endsAt` or `evidence[i].publishedAt > publishedAt`)
+ *      blocks publication with `rejected`;
+ *   8. lifecycle attestation — a manually forged `eligible-for-publication`
  *      stage that did not traverse `advanceCandidate` / `qualifyCandidate` is
  *      rejected with `wrong-stage` (`reason: 'forged-stage'`);
- *   7. atomic commit — `registry.commitPublication` atomically checks/binds the
- *      idempotency key, claims `identityDigest` (or observes the existing
- *      winner), and stores the sealed `PredictionRecord`.
+ *   9. atomic commit — constructs the `demo: false` sealed `PredictionRecord`
+ *      with `(publishedAt, recordedAt)` and calls `registry.commitPublication`.
  */
 export async function publishCandidate(
   candidate: CandidateProposition,
@@ -736,12 +971,67 @@ export async function publishCandidate(
     };
   }
 
-  const [requestDigest, digest] = await Promise.all([
+  // 3. Verify request.candidateDigest against candidateContentDigest before
+  // touching the registry.
+  const [expectedCandidateDigest, requestDigest, digest] = await Promise.all([
+    candidateContentDigest(candidate, aliases),
     publicationRequestDigest(candidate, request, aliases),
     identityDigest(request.identity, aliases),
   ]);
 
-  // 3. Idempotency check bound to requestDigest.
+  if (request.candidateDigest.trim().length === 0) {
+    return {
+      kind: 'candidate-digest-mismatch',
+      reason: 'missing',
+      expectedDigest: expectedCandidateDigest,
+      receivedDigest: request.candidateDigest,
+      detail: 'PublicationRequest.candidateDigest is missing.',
+    };
+  }
+  if (!/^[0-9a-f]{64}$/.test(request.candidateDigest)) {
+    return {
+      kind: 'candidate-digest-mismatch',
+      reason: 'malformed',
+      expectedDigest: expectedCandidateDigest,
+      receivedDigest: request.candidateDigest,
+      detail: `PublicationRequest.candidateDigest '${request.candidateDigest}' is not a 64-character lowercase hex SHA-256 digest.`,
+    };
+  }
+  if (request.candidateDigest !== expectedCandidateDigest) {
+    return {
+      kind: 'candidate-digest-mismatch',
+      reason: 'mismatch',
+      expectedDigest: expectedCandidateDigest,
+      receivedDigest: request.candidateDigest,
+      detail:
+        'PublicationRequest.candidateDigest does not match candidateContentDigest(candidate, aliases).',
+    };
+  }
+
+  // 4. Obtain and validate injected publication and recording timestamps before
+  // touching the registry.
+  const publishedAt = deps.now();
+  const recordedAt = deps.recordedAt ? deps.recordedAt() : deps.now();
+  const publishedMs = parseIsoDateTimeMs(publishedAt);
+  const recordedMs = parseIsoDateTimeMs(recordedAt);
+  if (publishedMs === null || recordedMs === null || recordedMs <= publishedMs) {
+    let clockDetail: string;
+    if (publishedMs === null) {
+      clockDetail = `Injected clock returned invalid publishedAt timestamp '${publishedAt}'.`;
+    } else if (recordedMs === null) {
+      clockDetail = `Injected clock returned invalid recordedAt timestamp '${recordedAt}'.`;
+    } else {
+      clockDetail = `Injected clock returned non-increasing timestamps: recordedAt (${recordedAt}) must be strictly later than publishedAt (${publishedAt}).`;
+    }
+    return {
+      kind: 'invalid-clock',
+      publishedAt,
+      recordedAt,
+      detail: clockDetail,
+    };
+  }
+
+  // 5. Idempotency check bound to requestDigest.
   const prior = await deps.registry.findByIdempotencyKey(
     request.idempotencyKey,
     requestDigest,
@@ -759,7 +1049,7 @@ export async function publishCandidate(
     };
   }
 
-  // 4. Identity self-check: uncertainty blocks publication.
+  // 6. Identity self-check: uncertainty blocks publication.
   const selfCheck = compareIdentities(request.identity, request.identity, aliases);
   if (selfCheck.outcome !== 'equivalent') {
     const outcome: PublicationOutcome = { kind: 'identity-conflict', match: selfCheck };
@@ -783,8 +1073,8 @@ export async function publishCandidate(
     return outcome;
   }
 
-  // 5. Evaluation gate: every requirement must pass.
-  const verdict = evaluateCandidate(candidate);
+  // 7. Evaluation gate bound to the actual publication timestamp `publishedAt`.
+  const verdict = evaluateCandidate(candidate, { publishedAt });
   if (!verdict.eligible) {
     const outcome: PublicationOutcome = { kind: 'rejected', verdict };
     const recorded = await deps.registry.recordIdempotencyKey(
@@ -807,7 +1097,7 @@ export async function publishCandidate(
     return outcome;
   }
 
-  // 6. Anti-forgery lifecycle attestation check.
+  // 8. Anti-forgery lifecycle attestation check.
   if (!isVerifiedEligibleCandidate(candidate)) {
     return {
       kind: 'wrong-stage',
@@ -819,12 +1109,14 @@ export async function publishCandidate(
     };
   }
 
-  // 7. Build the sealed record and execute the single atomic registry commit.
+  // 9. Build the non-demo sealed official record with `(publishedAt, recordedAt)`
+  // and execute the single atomic registry commit.
   const predictionId = deps.newPredictionId(digest);
   const sealedRecord = await buildSealedPredictionRecord(
     candidate,
     predictionId,
-    deps.now(),
+    publishedAt,
+    recordedAt,
   );
 
   const commitResult = await deps.registry.commitPublication({

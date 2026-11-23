@@ -1,6 +1,8 @@
+import { createHash } from 'node:crypto';
 import { describe, expect, it } from 'vitest';
 import {
   AliasTable,
+  canonicalIdentity,
   compareIdentities,
   identityDigest,
   normalizeTermValue,
@@ -9,7 +11,9 @@ import {
   type AliasEntry,
 } from './canonical-identity';
 import {
+  CANDIDATE_CONTENT_SCHEMA,
   InMemoryRegistry,
+  InvalidClockError,
   TransitionError,
   advance,
   advanceCandidate,
@@ -24,6 +28,8 @@ import {
   publicationRequestDigest,
   publishCandidate,
   qualifyCandidate,
+  validateOfficialArchive,
+  validateOfficialRecord,
   verdictIsComplete,
   type PublicationDeps,
 } from './publication';
@@ -37,7 +43,7 @@ import {
   type PublicationRequest,
 } from './publication-types';
 import { predictionRecords } from './records';
-import { appendEvent, payloadBytes, sealedPayload } from './events';
+import { appendEvent, canonicalize, payloadBytes, sealedPayload } from './events';
 import { sha256Hex } from './hash';
 import { validateArchive } from './validate';
 import type { PredictionRecord, RecordEvent } from './types';
@@ -114,9 +120,9 @@ function rawCandidate(overrides: Partial<CandidateProposition> = {}): CandidateP
     evidence: [
       {
         id: 'ev-1',
-        title: 'FIFA world ranking, December 2029',
+        title: 'FIFA world ranking, October 2026',
         publisher: 'FIFA',
-        publishedAt: '2029-12-20T00:00:00.000Z',
+        publishedAt: '2026-10-20T00:00:00.000Z',
         kind: 'dataset',
         note: 'Ranking position at the time of publication.',
       },
@@ -156,24 +162,56 @@ function validCandidate(overrides: Partial<CandidateProposition> = {}): Candidat
   }
 }
 
-function request(overrides: Partial<PublicationRequest> = {}): PublicationRequest {
+/**
+ * Synchronously compute the exact same versioned digest as
+ * `await candidateContentDigest(candidate, aliasTable())` for test fixtures.
+ */
+function syncCandidateDigest(candidate: CandidateProposition): string {
+  const body = canonicalize({
+    candidateId: candidate.candidateId,
+    submittedQuery: candidate.submittedQuery,
+    proposedQuestion: candidate.proposedQuestion,
+    proposedIdentity: canonicalIdentity(candidate.proposedIdentity, aliasTable()),
+    category: candidate.category,
+    probability: candidate.probability,
+    rationale: candidate.rationale,
+    horizon: candidate.horizon,
+    resolutionCriteria: candidate.resolutionCriteria,
+    evidence: candidate.evidence,
+    disclosedLimitations: candidate.disclosedLimitations,
+    inferences: candidate.inferences,
+  });
+  return createHash('sha256')
+    .update(`${CANDIDATE_CONTENT_SCHEMA}\n${body}`, 'utf8')
+    .digest('hex');
+}
+
+function request(
+  overrides: Partial<PublicationRequest> = {},
+  forCandidate: CandidateProposition = rawCandidate(),
+): PublicationRequest {
   return {
-    candidateId: 'cand-1',
+    candidateId: forCandidate.candidateId,
     idempotencyKey: 'key-1',
-    identity: argentinaWins2030(),
-    candidateDigest: 'a'.repeat(64),
+    identity: forCandidate.proposedIdentity,
+    candidateDigest: syncCandidateDigest(forCandidate),
     requestedAt: '2026-11-22T00:00:00.000Z',
     ...overrides,
   };
 }
 
-function deps(registry = new InMemoryRegistry()): PublicationDeps {
+function deps(
+  registry = new InMemoryRegistry(),
+  overrides: Partial<PublicationDeps> = {},
+): PublicationDeps {
+  let step = 0;
   return {
     registry,
     aliases: aliasTable(),
-    now: () => '2026-11-22T00:00:00.000Z',
+    now: () => new Date(Date.UTC(2026, 10, 22, 0, 0, step++)).toISOString(),
     newPredictionId: (digest) =>
       `ORC-2030-${(parseInt(digest.slice(0, 4), 16) % 10000).toString().padStart(4, '0')}`,
+    ...overrides,
   };
 }
 
@@ -465,9 +503,10 @@ describe('publication', () => {
 
   it('refuses to publish an invalid candidate', async () => {
     const registry = new InMemoryRegistry();
+    const invalid = validCandidate({ probability: null });
     const outcome = await publishCandidate(
-      validCandidate({ probability: null }),
-      request(),
+      invalid,
+      request({}, invalid),
       deps(registry),
     );
     expect(outcome.kind).toBe('rejected');
@@ -480,9 +519,10 @@ describe('publication', () => {
       ...argentinaWins2030(),
       subject: unresolvedTerm(),
     };
+    const candidate = validCandidate({ proposedIdentity: uncertain });
     const outcome = await publishCandidate(
-      validCandidate({ proposedIdentity: uncertain }),
-      request({ identity: uncertain }),
+      candidate,
+      request({ identity: uncertain }, candidate),
       deps(registry),
     );
     expect(outcome.kind).toBe('identity-conflict');
@@ -492,9 +532,10 @@ describe('publication', () => {
   it('returns the existing record for a duplicate publication', async () => {
     const registry = new InMemoryRegistry();
     const first = await publishCandidate(validCandidate(), request({ idempotencyKey: 'k1' }), deps(registry));
+    const secondCand = validCandidate({ candidateId: 'cand-2' });
     const second = await publishCandidate(
-      validCandidate({ candidateId: 'cand-2' }),
-      request({ candidateId: 'cand-2', idempotencyKey: 'k2' }),
+      secondCand,
+      request({ candidateId: 'cand-2', idempotencyKey: 'k2' }, secondCand),
       deps(registry),
     );
 
@@ -520,8 +561,8 @@ describe('publication', () => {
 
   it('keeps a rejected replay rejected instead of reshaping it', async () => {
     const registry = new InMemoryRegistry();
-    const request1 = request({ idempotencyKey: 'same' });
     const invalid = validCandidate({ probability: null });
+    const request1 = request({ idempotencyKey: 'same' }, invalid);
     const rejected = await publishCandidate(invalid, request1, deps(registry));
     const replay = await publishCandidate(invalid, request1, deps(registry));
 
@@ -582,7 +623,7 @@ describe('publication', () => {
     });
     const second = await publishCandidate(
       rephrased,
-      request({ idempotencyKey: 'b', identity: rephrased.proposedIdentity }),
+      request({ idempotencyKey: 'b', identity: rephrased.proposedIdentity }, rephrased),
       deps(registry),
     );
 
@@ -762,14 +803,16 @@ describe('the sealed payload', () => {
     const registry = new InMemoryRegistry();
     const digest = await identityDigest(argentinaWins2030(), aliasTable());
 
+    const invalidCand = validCandidate({ probability: null, evidence: [] });
     const rejectedByEval = await publishCandidate(
-      validCandidate({ probability: null, evidence: [] }),
-      request({ idempotencyKey: 'rej-eval' }),
+      invalidCand,
+      request({ idempotencyKey: 'rej-eval' }, invalidCand),
       deps(registry),
     );
+    const rejectedStageCand = validCandidate({ stage: 'rejected-candidate' });
     const rejectedByStage = await publishCandidate(
-      validCandidate({ stage: 'rejected-candidate' }),
-      request({ idempotencyKey: 'rej-stage' }),
+      rejectedStageCand,
+      request({ idempotencyKey: 'rej-stage' }, rejectedStageCand),
       deps(registry),
     );
 
@@ -788,9 +831,10 @@ describe('protocol v1.1 integrity regressions', () => {
   // 1. Candidate ID mismatch
   it('rejects a candidateId mismatch before any registry lookup or mutation', async () => {
     const registry = new InMemoryRegistry();
+    const candAlpha = validCandidate({ candidateId: 'cand-alpha' });
     const outcome = await publishCandidate(
-      validCandidate({ candidateId: 'cand-alpha' }),
-      request({ candidateId: 'cand-beta', idempotencyKey: 'k-mismatch-id' }),
+      candAlpha,
+      request({ candidateId: 'cand-beta', idempotencyKey: 'k-mismatch-id' }, candAlpha),
       deps(registry),
     );
 
@@ -835,7 +879,7 @@ describe('protocol v1.1 integrity regressions', () => {
   it('replays the original outcome when the same idempotency key is reused with identical content', async () => {
     const registry = new InMemoryRegistry();
     const candidate = validCandidate();
-    const req = request({ idempotencyKey: 'k-identical' });
+    const req = request({ idempotencyKey: 'k-identical' }, candidate);
 
     const first = await publishCandidate(candidate, req, deps(registry));
     const second = await publishCandidate(candidate, req, deps(registry));
@@ -849,14 +893,16 @@ describe('protocol v1.1 integrity regressions', () => {
   it('returns idempotency-conflict when the same key is reused with different candidate or request content', async () => {
     const registry = new InMemoryRegistry();
     const key = 'k-reused-diff';
+    const candA = validCandidate({ probability: 0.18 });
+    const candB = validCandidate({ probability: 0.42 });
     const first = await publishCandidate(
-      validCandidate({ probability: 0.18 }),
-      request({ idempotencyKey: key }),
+      candA,
+      request({ idempotencyKey: key }, candA),
       deps(registry),
     );
     const second = await publishCandidate(
-      validCandidate({ probability: 0.42 }),
-      request({ idempotencyKey: key }),
+      candB,
+      request({ idempotencyKey: key }, candB),
       deps(registry),
     );
 
@@ -888,20 +934,26 @@ describe('protocol v1.1 integrity regressions', () => {
     const [outA, outB] = await Promise.all([
       publishCandidate(
         candWin,
-        request({
-          candidateId: 'cand-win',
-          idempotencyKey: sharedKey,
-          identity: argentinaWins2030(),
-        }),
+        request(
+          {
+            candidateId: 'cand-win',
+            idempotencyKey: sharedKey,
+            identity: argentinaWins2030(),
+          },
+          candWin,
+        ),
         deps(registry),
       ),
       publishCandidate(
         candFinal,
-        request({
-          candidateId: 'cand-final',
-          idempotencyKey: sharedKey,
-          identity: argentinaReachesFinal(),
-        }),
+        request(
+          {
+            candidateId: 'cand-final',
+            idempotencyKey: sharedKey,
+            identity: argentinaReachesFinal(),
+          },
+          candFinal,
+        ),
         deps(registry),
       ),
     ]);
@@ -928,12 +980,18 @@ describe('protocol v1.1 integrity regressions', () => {
     const [out1, out2] = await Promise.all([
       publishCandidate(
         cand1,
-        request({ candidateId: 'cand-1', idempotencyKey: 'k-race-1', identity: cand1.proposedIdentity }),
+        request(
+          { candidateId: 'cand-1', idempotencyKey: 'k-race-1', identity: cand1.proposedIdentity },
+          cand1,
+        ),
         deps(registry),
       ),
       publishCandidate(
         cand2,
-        request({ candidateId: 'cand-2', idempotencyKey: 'k-race-2', identity: cand2.proposedIdentity }),
+        request(
+          { candidateId: 'cand-2', idempotencyKey: 'k-race-2', identity: cand2.proposedIdentity },
+          cand2,
+        ),
         deps(registry),
       ),
     ]);
@@ -958,7 +1016,7 @@ describe('protocol v1.1 integrity regressions', () => {
 
     const outcome = await publishCandidate(
       forged,
-      request({ idempotencyKey: 'k-forged' }),
+      request({ idempotencyKey: 'k-forged' }, forged),
       deps(registry),
     );
 
@@ -1005,7 +1063,7 @@ describe('protocol v1.1 integrity regressions', () => {
     const registry = new InMemoryRegistry();
     const outcome = await publishCandidate(
       clonedAndModified,
-      request({ idempotencyKey: 'k-cloned' }),
+      request({ idempotencyKey: 'k-cloned' }, clonedAndModified),
       deps(registry),
     );
     expect(outcome.kind).toBe('wrong-stage');
@@ -1142,8 +1200,8 @@ describe('protocol v1.1 integrity regressions', () => {
   });
 
   // 12. No rejected or conflicting candidate creates an official identity claim,
-  // and a valid publication builds a complete validateArchive-clean PredictionRecord
-  it('never claims an identity for any rejected, mismatched, forged, or conflicting request, and seals a valid record when eligible', async () => {
+  // and a valid publication builds a complete validateOfficialRecord-clean PredictionRecord
+  it('never claims an identity for any rejected, mismatched, forged, or conflicting request, and seals a valid official record when eligible', async () => {
     const registry = new InMemoryRegistry();
     const digest = await identityDigest(argentinaWins2030(), aliasTable());
 
@@ -1160,30 +1218,33 @@ describe('protocol v1.1 integrity regressions', () => {
       deps(registry),
     );
     // Forged stage
+    const forged = rawCandidate({ stage: 'eligible-for-publication' });
     await publishCandidate(
-      rawCandidate({ stage: 'eligible-for-publication' }),
-      request({ idempotencyKey: 'k-3' }),
+      forged,
+      request({ idempotencyKey: 'k-3' }, forged),
       deps(registry),
     );
     // Uncertain identity
     const uncertain = { ...argentinaWins2030(), subject: unresolvedTerm() };
+    const uncertainCand = validCandidate({ proposedIdentity: uncertain });
     await publishCandidate(
-      validCandidate({ proposedIdentity: uncertain }),
-      request({ identity: uncertain, idempotencyKey: 'k-4' }),
+      uncertainCand,
+      request({ identity: uncertain, idempotencyKey: 'k-4' }, uncertainCand),
       deps(registry),
     );
     // Evaluation failure
+    const invalidCand = validCandidate({ probability: null });
     await publishCandidate(
-      validCandidate({ probability: null }),
-      request({ idempotencyKey: 'k-5' }),
+      invalidCand,
+      request({ idempotencyKey: 'k-5' }, invalidCand),
       deps(registry),
     );
 
     expect(registry.size).toBe(0);
     expect(await registry.findByIdentity(digest)).toBeNull();
 
-    // Now publish a genuinely qualified candidate and verify the sealed record
-    // passes the archive validator with zero problems.
+    // Now publish a genuinely qualified candidate and verify the sealed official
+    // record has demo: false and passes validateOfficialRecord with zero problems.
     const created = await publishCandidate(
       validCandidate(),
       request({ idempotencyKey: 'k-valid' }),
@@ -1191,7 +1252,8 @@ describe('protocol v1.1 integrity regressions', () => {
     );
     expect(created.kind).toBe('created');
     if (created.kind === 'created') {
-      expect(await validateArchive([created.record])).toEqual([]);
+      expect(created.record.demo).toBe(false);
+      expect(await validateOfficialRecord(created.record)).toEqual([]);
       expect(created.record.integrity.payloadScope).toBe('sealed-payload');
       expect(created.record.sealClaim).toBe('published-before-outcome');
       expect(created.record.integrity.anchored).toBe(false);
@@ -1214,8 +1276,480 @@ describe('protocol v1.1 integrity regressions', () => {
       validCandidate(),
       'ORC-2030-0042',
       '2026-11-22T00:00:00.000Z',
+      '2026-11-22T00:00:01.000Z',
     );
-    expect(await validateArchive([standaloneRecord])).toEqual([]);
+    expect(standaloneRecord.demo).toBe(false);
+    expect(await validateOfficialRecord(standaloneRecord)).toEqual([]);
   });
 });
+
+/* -------------------------------------------------------------------------
+   8. Protocol v1.2 publication semantics and transaction hardening
+   ------------------------------------------------------------------------- */
+
+describe('protocol v1.2 publication semantics and hardening', () => {
+  // Requirement 2: Demo vs official record semantics
+  describe('demo versus official record semantics', () => {
+    it('constructs newly published official records with demo: false, never demo: true', async () => {
+      const registry = new InMemoryRegistry();
+      const outcome = await publishCandidate(
+        validCandidate(),
+        request({ idempotencyKey: 'k-nondemo' }),
+        deps(registry),
+      );
+      expect(outcome.kind).toBe('created');
+      if (outcome.kind === 'created') {
+        expect(outcome.record.demo).toBe(false);
+        expect(await validateOfficialRecord(outcome.record)).toEqual([]);
+        expect(await validateOfficialArchive([outcome.record])).toEqual([]);
+      }
+    });
+
+    it('distinguishes historical demo archive validation (demo: true) from official record validation (demo: false)', async () => {
+      const officialRecord = await buildSealedPredictionRecord(
+        validCandidate(),
+        'ORC-2030-0101',
+        '2026-11-22T00:00:00.000Z',
+        '2026-11-22T00:00:01.000Z',
+      );
+
+      // The official validator accepts the non-demo record and rejects demo: true.
+      expect(await validateOfficialRecord(officialRecord)).toEqual([]);
+      const mislabelledAsDemo: PredictionRecord = { ...officialRecord, demo: true };
+      const officialProblems = await validateOfficialRecord(mislabelledAsDemo);
+      expect(officialProblems.some((p) => p.includes('demo: false'))).toBe(true);
+
+      // Conversely, the protected historical demo-archive gate (`validateArchive`
+      // in `src/data/validate.ts`) requires `demo: true` and therefore rejects
+      // `officialRecord` while continuing to accept all 10 historical records.
+      const demoGateOnOfficial = await validateArchive([officialRecord]);
+      expect(demoGateOnOfficial).toContain(
+        `Record ${officialRecord.id} is missing the demo flag`,
+      );
+      expect(await validateArchive(predictionRecords)).toEqual([]);
+    });
+  });
+
+  // Requirement 3: Fix publication and recording timestamps (honest clock contract)
+  describe('publication and recording clock contract', () => {
+    it('uses the exact injected publishedAt and recordedAt timestamps without synthesizing +1ms', async () => {
+      const registry = new InMemoryRegistry();
+      const outcome = await publishCandidate(
+        validCandidate(),
+        request({ idempotencyKey: 'k-clock-exact' }),
+        deps(registry, {
+          now: () => '2026-11-22T09:15:00.000Z',
+          recordedAt: () => '2026-11-22T09:15:07.500Z',
+        }),
+      );
+
+      expect(outcome.kind).toBe('created');
+      if (outcome.kind === 'created') {
+        expect(outcome.record.publishedAt).toBe('2026-11-22T09:15:00.000Z');
+        expect(outcome.record.events[0].occurredAt).toBe('2026-11-22T09:15:00.000Z');
+        expect(outcome.record.events[0].recordedAt).toBe('2026-11-22T09:15:07.500Z');
+      }
+    });
+
+    it.each([
+      ['invalid publishedAt', () => 'not-a-timestamp', () => '2026-11-22T00:00:05.000Z'],
+      ['impossible calendar publishedAt', () => '2026-02-29T00:00:00.000Z', () => '2026-11-22T00:00:05.000Z'],
+      ['invalid recordedAt', () => '2026-11-22T00:00:00.000Z', () => 'bad-recorded-at'],
+      ['non-increasing (equal) timestamps', () => '2026-11-22T00:00:00.000Z', () => '2026-11-22T00:00:00.000Z'],
+      ['decreasing timestamps (recordedAt < publishedAt)', () => '2026-11-22T00:00:05.000Z', () => '2026-11-22T00:00:01.000Z'],
+    ])('fails without committing when the injected clock provides %s', async (_label, nowFn, recFn) => {
+      const registry = new InMemoryRegistry();
+      const outcome = await publishCandidate(
+        validCandidate(),
+        request({ idempotencyKey: 'k-bad-clock' }),
+        deps(registry, { now: nowFn, recordedAt: recFn }),
+      );
+
+      expect(outcome.kind).toBe('invalid-clock');
+      expect(registry.size).toBe(0);
+    });
+
+    it('rejects a static single-function clock that returns the same timestamp on both reads', async () => {
+      const registry = new InMemoryRegistry();
+      const outcome = await publishCandidate(
+        validCandidate(),
+        request({ idempotencyKey: 'k-static-clock' }),
+        deps(registry, { now: () => '2026-11-22T00:00:00.000Z' }),
+      );
+
+      expect(outcome.kind).toBe('invalid-clock');
+      expect(registry.size).toBe(0);
+    });
+
+    it('throws InvalidClockError from buildSealedPredictionRecord on invalid or non-increasing timestamps', async () => {
+      await expect(
+        buildSealedPredictionRecord(
+          validCandidate(),
+          'ORC-2030-0001',
+          '2026-11-22T00:00:00.000Z',
+          '2026-11-22T00:00:00.000Z',
+        ),
+      ).rejects.toThrow(InvalidClockError);
+
+      await expect(
+        buildSealedPredictionRecord(
+          validCandidate(),
+          'ORC-2030-0001',
+          'invalid',
+          '2026-11-22T00:00:01.000Z',
+        ),
+      ).rejects.toThrow(InvalidClockError);
+    });
+  });
+
+  // Requirement 4: Prevent publication after the forecast horizon
+  describe('forecast horizon enforcement at publication time', () => {
+    it('allows publication strictly before horizon.endsAt', async () => {
+      const registry = new InMemoryRegistry();
+      const candidate = validCandidate(); // horizon.endsAt is 2030-12-31T00:00:00.000Z
+      const outcome = await publishCandidate(
+        candidate,
+        request({ idempotencyKey: 'k-before-horizon' }, candidate),
+        deps(registry, {
+          now: () => '2030-12-30T23:59:59.000Z',
+          recordedAt: () => '2030-12-30T23:59:59.500Z',
+        }),
+      );
+
+      expect(outcome.kind).toBe('created');
+      if (outcome.kind === 'created') {
+        expect(outcome.record.publishedAt).toBe('2030-12-30T23:59:59.000Z');
+        expect(outcome.record.events[0].occurredAt).toBe(outcome.record.publishedAt);
+      }
+      expect(registry.size).toBe(1);
+    });
+
+    it('refuses publication when publishedAt is exactly at horizon.endsAt', async () => {
+      const registry = new InMemoryRegistry();
+      const candidate = validCandidate(); // horizon.endsAt is 2030-12-31T00:00:00.000Z
+      const outcome = await publishCandidate(
+        candidate,
+        request({ idempotencyKey: 'k-at-horizon' }, candidate),
+        deps(registry, {
+          now: () => '2030-12-31T00:00:00.000Z',
+          recordedAt: () => '2030-12-31T00:00:01.000Z',
+        }),
+      );
+
+      expect(outcome.kind).toBe('rejected');
+      if (outcome.kind === 'rejected') {
+        const horizonCheck = outcome.verdict.results.find((r) => r.id === 'fixed-horizon')!;
+        expect(horizonCheck.passed).toBe(false);
+        expect(horizonCheck.reason).toMatch(/forecast window has already closed/i);
+      }
+      expect(registry.size).toBe(0);
+    });
+
+    it('refuses publication when publishedAt is after horizon.endsAt', async () => {
+      const registry = new InMemoryRegistry();
+      const candidate = validCandidate(); // horizon.endsAt is 2030-12-31T00:00:00.000Z
+      const outcome = await publishCandidate(
+        candidate,
+        request({ idempotencyKey: 'k-after-horizon' }, candidate),
+        deps(registry, {
+          now: () => '2031-01-01T00:00:00.000Z',
+          recordedAt: () => '2031-01-01T00:00:01.000Z',
+        }),
+      );
+
+      expect(outcome.kind).toBe('rejected');
+      if (outcome.kind === 'rejected') {
+        const horizonCheck = outcome.verdict.results.find((r) => r.id === 'fixed-horizon')!;
+        expect(horizonCheck.passed).toBe(false);
+        expect(horizonCheck.reason).toMatch(/forecast window has already closed/i);
+      }
+      expect(registry.size).toBe(0);
+    });
+  });
+
+  // Requirement 5: Require evidence to predate publication
+  describe('evidence chronology relative to publication time', () => {
+    it('accepts evidence published strictly before publishedAt', async () => {
+      const registry = new InMemoryRegistry();
+      const candidate = validCandidate({
+        evidence: [
+          {
+            id: 'ev-before',
+            title: 'Prior ranking dataset',
+            publisher: 'FIFA',
+            publishedAt: '2026-11-21T23:59:59.000Z',
+            kind: 'dataset',
+            note: 'Published the day before the forecast.',
+          },
+        ],
+      });
+      const outcome = await publishCandidate(
+        candidate,
+        request({ idempotencyKey: 'k-ev-before' }, candidate),
+        deps(registry, {
+          now: () => '2026-11-22T00:00:00.000Z',
+          recordedAt: () => '2026-11-22T00:00:01.000Z',
+        }),
+      );
+
+      expect(outcome.kind).toBe('created');
+      expect(registry.size).toBe(1);
+    });
+
+    it('accepts evidence published at the exact same timestamp as publishedAt', async () => {
+      const registry = new InMemoryRegistry();
+      const candidate = validCandidate({
+        evidence: [
+          {
+            id: 'ev-exact',
+            title: 'Contemporaneous release',
+            publisher: 'FIFA',
+            publishedAt: '2026-11-22T00:00:00.000Z',
+            kind: 'dataset',
+            note: 'Published at the exact publication timestamp.',
+          },
+        ],
+      });
+      const outcome = await publishCandidate(
+        candidate,
+        request({ idempotencyKey: 'k-ev-exact' }, candidate),
+        deps(registry, {
+          now: () => '2026-11-22T00:00:00.000Z',
+          recordedAt: () => '2026-11-22T00:00:01.000Z',
+        }),
+      );
+
+      expect(outcome.kind).toBe('created');
+      expect(registry.size).toBe(1);
+    });
+
+    it('blocks publication when any evidence item is dated after publishedAt', async () => {
+      const registry = new InMemoryRegistry();
+      const futureEvidenceCandidate = validCandidate({
+        createdAt: '2026-11-25T00:00:00.000Z',
+        evidence: [
+          {
+            id: 'ev-future',
+            title: 'Post-publication report',
+            publisher: 'FIFA',
+            publishedAt: '2026-11-23T00:00:00.000Z',
+            kind: 'report',
+            note: 'Dated after the attempted publication clock.',
+          },
+        ],
+      });
+
+      const outcome = await publishCandidate(
+        futureEvidenceCandidate,
+        request({ idempotencyKey: 'k-ev-after' }, futureEvidenceCandidate),
+        deps(registry, {
+          now: () => '2026-11-22T00:00:00.000Z',
+          recordedAt: () => '2026-11-22T00:00:01.000Z',
+        }),
+      );
+
+      expect(outcome.kind).toBe('rejected');
+      if (outcome.kind === 'rejected') {
+        const prov = outcome.verdict.results.find(
+          (r) => r.id === 'preserved-evidence-provenance',
+        )!;
+        expect(prov.passed).toBe(false);
+        expect(prov.reason).toMatch(/later than the publication timestamp/i);
+      }
+      expect(registry.size).toBe(0);
+    });
+  });
+
+  // Requirement 6: Verify candidateDigest
+  describe('candidateDigest verification', () => {
+    it('accepts a request whose candidateDigest matches candidateContentDigest(candidate, aliases)', async () => {
+      const registry = new InMemoryRegistry();
+      const candidate = validCandidate();
+      const expected = await candidateContentDigest(candidate, aliasTable());
+      const outcome = await publishCandidate(
+        candidate,
+        request({ idempotencyKey: 'k-digest-ok', candidateDigest: expected }, candidate),
+        deps(registry),
+      );
+
+      expect(outcome.kind).toBe('created');
+      expect(registry.size).toBe(1);
+    });
+
+    it('rejects an altered candidateDigest before any registry lookup or mutation', async () => {
+      const registry = new InMemoryRegistry();
+      const candidate = validCandidate({ probability: 0.18 });
+      const digestForDifferentProb = await candidateContentDigest(
+        validCandidate({ probability: 0.55 }),
+        aliasTable(),
+      );
+
+      const outcome = await publishCandidate(
+        candidate,
+        request(
+          { idempotencyKey: 'k-digest-altered', candidateDigest: digestForDifferentProb },
+          candidate,
+        ),
+        deps(registry),
+      );
+
+      expect(outcome.kind).toBe('candidate-digest-mismatch');
+      if (outcome.kind === 'candidate-digest-mismatch') {
+        expect(outcome.reason).toBe('mismatch');
+        expect(outcome.receivedDigest).toBe(digestForDifferentProb);
+        expect(outcome.expectedDigest).toBe(
+          await candidateContentDigest(candidate, aliasTable()),
+        );
+      }
+      expect(registry.size).toBe(0);
+      expect(
+        await registry.findByIdempotencyKey('k-digest-altered', 'any'),
+      ).toEqual({ status: 'miss' });
+    });
+
+    it('rejects a missing candidateDigest before any registry lookup or mutation', async () => {
+      const registry = new InMemoryRegistry();
+      const candidate = validCandidate();
+      const outcome = await publishCandidate(
+        candidate,
+        request({ idempotencyKey: 'k-digest-missing', candidateDigest: '   ' }, candidate),
+        deps(registry),
+      );
+
+      expect(outcome.kind).toBe('candidate-digest-mismatch');
+      if (outcome.kind === 'candidate-digest-mismatch') {
+        expect(outcome.reason).toBe('missing');
+      }
+      expect(registry.size).toBe(0);
+    });
+
+    it.each(['not-hex', 'A'.repeat(64), 'a'.repeat(63), 'a'.repeat(65)])(
+      'rejects malformed candidateDigest %s before any registry lookup or mutation',
+      async (badDigest) => {
+        const registry = new InMemoryRegistry();
+        const candidate = validCandidate();
+        const outcome = await publishCandidate(
+          candidate,
+          request({ idempotencyKey: 'k-digest-malformed', candidateDigest: badDigest }, candidate),
+          deps(registry),
+        );
+
+        expect(outcome.kind).toBe('candidate-digest-mismatch');
+        if (outcome.kind === 'candidate-digest-mismatch') {
+          expect(outcome.reason).toBe('malformed');
+        }
+        expect(registry.size).toBe(0);
+      },
+    );
+  });
+
+  // Requirement 7: All nine rejection paths leave zero identity claims
+  it('guarantees none of the nine rejection paths ever reserve an official identity', async () => {
+    const registry = new InMemoryRegistry();
+    const digest = await identityDigest(argentinaWins2030(), aliasTable());
+    const valid = validCandidate();
+
+    // 1. Candidate ID mismatch
+    const r1 = await publishCandidate(
+      valid,
+      request({ candidateId: 'wrong-id', idempotencyKey: 'r-1' }, valid),
+      deps(registry),
+    );
+    expect(r1.kind).toBe('candidate-mismatch');
+
+    // 2. Proposed identity mismatch
+    const r2 = await publishCandidate(
+      valid,
+      request({ identity: argentinaReachesFinal(), idempotencyKey: 'r-2' }, valid),
+      deps(registry),
+    );
+    expect(r2.kind).toBe('candidate-mismatch');
+
+    // 3. Forged lifecycle stage
+    const forged = rawCandidate({ stage: 'eligible-for-publication' });
+    const r3 = await publishCandidate(
+      forged,
+      request({ idempotencyKey: 'r-3' }, forged),
+      deps(registry),
+    );
+    expect(r3.kind).toBe('wrong-stage');
+
+    // 4. Candidate digest mismatch
+    const r4 = await publishCandidate(
+      valid,
+      request({ idempotencyKey: 'r-4', candidateDigest: 'f'.repeat(64) }, valid),
+      deps(registry),
+    );
+    expect(r4.kind).toBe('candidate-digest-mismatch');
+
+    // 5. Unresolved identity
+    const uncertainId = { ...argentinaWins2030(), subject: unresolvedTerm() };
+    const uncertainCand = validCandidate({ proposedIdentity: uncertainId });
+    const r5 = await publishCandidate(
+      uncertainCand,
+      request({ idempotencyKey: 'r-5', identity: uncertainId }, uncertainCand),
+      deps(registry),
+    );
+    expect(r5.kind).toBe('identity-conflict');
+
+    // 6. Failed evaluation
+    const invalidProb = validCandidate({ probability: null });
+    const r6 = await publishCandidate(
+      invalidProb,
+      request({ idempotencyKey: 'r-6' }, invalidProb),
+      deps(registry),
+    );
+    expect(r6.kind).toBe('rejected');
+
+    // 7. Expired horizon
+    const r7 = await publishCandidate(
+      valid,
+      request({ idempotencyKey: 'r-7' }, valid),
+      deps(registry, {
+        now: () => '2030-12-31T00:00:00.000Z',
+        recordedAt: () => '2030-12-31T00:00:01.000Z',
+      }),
+    );
+    expect(r7.kind).toBe('rejected');
+
+    // 8. Invalid clock timestamps
+    const r8 = await publishCandidate(
+      valid,
+      request({ idempotencyKey: 'r-8' }, valid),
+      deps(registry, {
+        now: () => '2026-11-22T00:00:00.000Z',
+        recordedAt: () => '2026-11-22T00:00:00.000Z',
+      }),
+    );
+    expect(r8.kind).toBe('invalid-clock');
+
+    // 9. Evidence dated after publication
+    const futureEvCand = validCandidate({
+      createdAt: '2026-12-01T00:00:00.000Z',
+      evidence: [
+        {
+          id: 'ev-late',
+          title: 'Late report',
+          publisher: 'FIFA',
+          publishedAt: '2026-11-25T00:00:00.000Z',
+          kind: 'report',
+          note: 'Dated after the attempted publication time.',
+        },
+      ],
+    });
+    const r9 = await publishCandidate(
+      futureEvCand,
+      request({ idempotencyKey: 'r-9' }, futureEvCand),
+      deps(registry, {
+        now: () => '2026-11-22T00:00:00.000Z',
+        recordedAt: () => '2026-11-22T00:00:01.000Z',
+      }),
+    );
+    expect(r9.kind).toBe('rejected');
+
+    expect(registry.size).toBe(0);
+    expect(await registry.findByIdentity(digest)).toBeNull();
+  });
+});
+
 
