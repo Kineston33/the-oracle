@@ -40,7 +40,6 @@ ORACLE is organised around how auditable it will be *later*:
 | SHA-256 digest sealing + in-browser verification | ✅ Built |
 | Deterministic question reading (subject, horizon, archive match) | ✅ Built |
 | Local drafts (no account, no transmission) | ✅ Built |
-| Official Publication Protocol v1 (lifecycle, canonical identity, 11-point evaluation, registry contract) | ✅ Built (domain layer only — no server or database) |
 | Forecast generation of any kind | ❌ Not built |
 | Server, database, shared resolution service | ❌ Not built |
 | Public transparency log / external anchoring | ❌ Not built |
@@ -92,10 +91,7 @@ the-oracle/
 │   └── seal-records.mjs         # computes and writes record digests
 ├── docs/
 │   ├── FEATURES-AND-LIMITATIONS.md
-│   ├── DEPLOYMENT.md                  # host config, placeholders, pre-launch checklist
-│   ├── OFFICIAL-PUBLICATION-PROTOCOL.md # lifecycle, 11-point evaluation, publication gate
-│   ├── CANONICAL-IDENTITY.md          # structured proposition identity & alias resolution
-│   └── PUBLICATION-API-CONTRACT.md    # DB uniqueness constraints & read/write separation
+│   └── DEPLOYMENT.md         # host config, placeholders, pre-launch checklist
 └── src/
     ├── main.tsx                 # fonts + global styles + router mount
     ├── App.tsx                  # shell, route table, focus/scroll management
@@ -108,9 +104,6 @@ the-oracle/
     │   └── ui/                  # button, badge, callout, field, empty state…
     ├── data/
     │   ├── types.ts             # domain model (the heart of the product)
-    │   ├── publication-types.ts # Official Publication Protocol v1 vocabulary & LIFECYCLE
-    │   ├── canonical-identity.ts # structured identity, AliasTable, compareIdentities, identityDigest
-    │   ├── publication.ts       # stage transitions, evaluateCandidate, publishCandidate, InMemoryRegistry
     │   ├── records.json         # 10 illustrative sealed records
     │   ├── records.ts           # archive queries and aggregates
     │   ├── trends.ts            # 9 illustrative trend signals

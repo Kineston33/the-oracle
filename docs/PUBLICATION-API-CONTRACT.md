@@ -14,18 +14,28 @@ and `src/data/publication.ts`) with a persistent database and HTTP service.
 
 ## 1. Separation of reads and writes
 
-Exploration, identity comparison, and candidate evaluation are **read/analysis**
-operations. Official publication and terminal resolution are **write** commands. No read or
-evaluation endpoint may ever call `claimIdentity` or insert a row into the official archive.
+Exploration, identity comparison, candidate evaluation, and archive/event retrieval are
+**read or non-publishing** operations. Official publication and terminal resolution are
+**write** commands against the official ledger. No read, exploration, or evaluation
+endpoint may ever call `claimIdentity` or insert a row into `official_predictions`.
 
-| Operation class | Endpoint (target) | Domain function | Mutates official archive? |
+### 1.1 Read, exploration, and analysis operations (never mutate the official archive)
+
+| Conceptual operation | Target endpoint | Domain contract / module | Mutates official archive? |
 | --- | --- | --- | --- |
-| Read — archive lookup | `GET /v1/predictions` / `GET /v1/predictions/:id` | Archive query / `findByIdentity` | **No** |
-| Read — identity check | `POST /v1/identities:compare` | `compareIdentities`, `identityDigest` | **No** |
-| Read — dry-run evaluation | `POST /v1/candidates:evaluate` | `evaluateCandidate` | **No** |
-| Write — candidate staging | `POST /v1/candidates` / `PATCH /v1/candidates/:id` | `advance` (`exploratory-query` → … → `eligible-for-publication`) | **No** (writes only to draft candidate storage) |
-| Write — official publication | `POST /v1/publications` | `publishCandidate` | **Yes** — sole entry point that may call `claimIdentity` |
-| Write — terminal event | `POST /v1/predictions/:id/events` | `appendEvent` (`resolved` \| `annulled`) | **Appends event only** — never updates `sealed_payload` |
+| **Submit exploratory query** | `POST /v1/queries:explore` | `readQuestion` (`src/lib/question.ts`); stage remains `exploratory-query` | **No** — returns lexical reading and matching archive records; never creates a prediction |
+| **Match canonical proposition** | `POST /v1/identities:match` | `compareIdentities`, `identityDigest` (`src/data/canonical-identity.ts`), `registry.findByIdentity` | **No** — returns `IdentityMatch` (`equivalent` \| `distinct` \| `uncertain`) and any existing `predictionId` |
+| **Evaluate candidate** | `POST /v1/candidates:evaluate` | `evaluateCandidate`, `verdictIsComplete` (`src/data/publication.ts`) | **No** — returns `EvaluationVerdict` (all 11 `RequirementResult` items and `clarificationsRequired`) |
+| **Retrieve official prediction** | `GET /v1/predictions/:id` (and `GET /v1/predictions`) | `PredictionRecord` (`src/data/types.ts`), `registry.findByIdentity` | **No** — read-only lookup by `predictionId` or `identityDigest` |
+| **Retrieve public event history** | `GET /v1/predictions/:id/events` | `RecordEvent[]`, `eventChainProblems`, `verifyPublicationLink` (`src/data/events.ts`) | **No** — returns the ordered append-only chain (`e0`, `e1`, …) with schema-2 envelopes and digests |
+
+### 1.2 Candidate staging and official publication/event commands
+
+| Conceptual operation | Target endpoint | Domain contract / module | Mutates official archive? |
+| --- | --- | --- | --- |
+| **Create candidate** | `POST /v1/candidates` (and `PATCH /v1/candidates/:id/stage`) | `CandidateProposition`, `advance` (`exploratory-query` → `candidate-proposition` → `identity-matching` → `evaluation` → `eligible-for-publication`) | **No** — writes only to draft candidate storage; `candidateId` never becomes a `PredictionId` |
+| **Publish official prediction** | `POST /v1/publications` | `publishCandidate(candidate, request, deps)` (`src/data/publication.ts`) | **Yes** — sole entry point permitted to call `registry.claimIdentity` and seal `e0` (`published`) |
+| **Append resolution event** | `POST /v1/predictions/:id/events` | `appendEvent(record, event)` (`src/data/events.ts`, `resolved` \| `annulled`) | **Appends event only** — inserts `e1` into `prediction_events`; never modifies `sealed_payload` or `probability` |
 
 ---
 
