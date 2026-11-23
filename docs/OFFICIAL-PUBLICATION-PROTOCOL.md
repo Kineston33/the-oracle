@@ -1,6 +1,6 @@
-# THE ORACLE — Official Publication Protocol v1.2
+# THE ORACLE — Official Publication Protocol v1.3
 
-This document specifies **Official Publication Protocol v1.2**: the domain rules that
+This document specifies **Official Publication Protocol v1.3**: the domain rules that
 separate an exploratory visitor query from a candidate proposition and from an official,
 sealed prediction record, together with the clock, horizon, evidence-chronology,
 candidate-digest, and record-validation guarantees enforced at publication time.
@@ -245,14 +245,20 @@ All protocol digests use recursive key-sorted canonical JSON (`canonicalize` fro
      `{ kind: 'idempotency-conflict', idempotencyKey, existingRequestDigest, incomingRequestDigest, detail }`.
 6. **Identity self-check (`identity-conflict`)** — runs
    `compareIdentities(request.identity, request.identity, deps.aliases)`. If any component
-   is unresolved (`outcome !== 'uncertain'` fails), records the non-publishing outcome for
-   `idempotencyKey` and returns `{ kind: 'identity-conflict', match }` without touching the
-   identity registry.
+   is unresolved (`outcome === 'uncertain'`), records the non-publishing outcome for
+   `idempotencyKey` via `recordIdempotencyKey` and returns `{ kind: 'identity-conflict', match }`
+   without touching the identity registry. Because `idempotencyKey` is now bound to the
+   rejected `requestDigest`, retrying the identical broken request replays `identity-conflict`,
+   and submitting a corrected candidate requires a new `idempotencyKey` (reusing the old key
+   with modified candidate content returns `idempotency-conflict`).
 7. **Evaluation gate at `publishedAt` (`rejected`)** — runs
    `evaluateCandidate(candidate, { publishedAt })` (which enforces `publishedAt < horizon.endsAt`
    and `evidence[i].publishedAt <= publishedAt` alongside all other requirements). If
-   `!verdict.eligible`, records the non-publishing outcome for `idempotencyKey` and returns
-   `{ kind: 'rejected', verdict }` without touching the identity registry.
+   `!verdict.eligible`, records the non-publishing outcome for `idempotencyKey` via
+   `recordIdempotencyKey` and returns `{ kind: 'rejected', verdict }` without touching the
+   identity registry. As with `identity-conflict`, the rejected attempt consumes
+   `idempotencyKey` for that `requestDigest` while never claiming an official identity, so a
+   corrected/retried candidate submission must use a new `idempotencyKey`.
 8. **Lifecycle attestation check (`wrong-stage`, `reason: 'forged-stage'`)** — verifies
    `isVerifiedEligibleCandidate(candidate, deps.aliases)`. A manually constructed or
    post-qualification mutated candidate is rejected without touching the identity registry.

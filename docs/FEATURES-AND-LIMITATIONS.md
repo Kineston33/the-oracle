@@ -116,7 +116,7 @@ accountable forecasting should not begin with an inflated account of itself.
 - Strict TypeScript and automated test suite across UI, integrity, canonical identity, and
   publication protocol rules; successful production build.
 
-### Official Publication Protocol v1.2 (domain layer)
+### Official Publication Protocol v1.3 (domain layer)
 
 - **Three-tier separation and attested lifecycle (`src/data/publication-types.ts`, `src/data/publication.ts`)**:
   explicit domain types separating `exploratory-query`, `CandidateProposition`, and official
@@ -355,7 +355,7 @@ accountable forecasting should not begin with an inflated account of itself.
     can still produce this failure. If it appears in CI, run that file in isolation rather than
     raising the number again.
 
-### Official Publication Protocol v1.2 (domain layer)
+### Official Publication Protocol v1.3 (domain layer)
 
 37. **The publication protocol is a domain specification and reference implementation, not a
     live server.** `src/data/publication-types.ts`, `src/data/canonical-identity.ts`, and
@@ -373,8 +373,10 @@ accountable forecasting should not begin with an inflated account of itself.
     provides no crash durability and no multi-process or multi-node concurrency control.
     Production uniqueness and atomic idempotency+publication commit depend on PostgreSQL
     enforcing `PRIMARY KEY (idempotency_key)` (`INSERT ... ON CONFLICT (idempotency_key) DO NOTHING`),
-    a deferred `CHECK (outcome IS NOT NULL)` constraint, and `UNIQUE (identity_digest)` inside
-    a single `READ COMMITTED` ACID transaction (`docs/PUBLICATION-API-CONTRACT.md` §2.3).
+    a transaction-local `'{"kind":"__pending__"}'::jsonb` sentinel validated at `COMMIT` by a
+    `DEFERRABLE INITIALLY DEFERRED` `CONSTRAINT TRIGGER`
+    (`publication_idempotency_outcome_complete_trg`), and `UNIQUE (identity_digest)` inside a
+    single `READ COMMITTED` ACID transaction (`docs/PUBLICATION-API-CONTRACT.md` §2.1–§2.4).
 39. **Historical DEMO validation (`validateArchive`) and official publication validation
     (`validateOfficialRecord` / `validateOfficialArchive`) are intentionally separate.**
     Protected `src/data/validate.ts` (`validateArchive`) is the build-time gate for the 10

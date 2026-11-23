@@ -1,4 +1,6 @@
 import { createHash } from 'node:crypto';
+import { readFileSync } from 'node:fs';
+import { resolve } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import {
   AliasTable,
@@ -1751,5 +1753,122 @@ describe('protocol v1.2 publication semantics and hardening', () => {
     expect(await registry.findByIdentity(digest)).toBeNull();
   });
 });
+
+// ---------------------------------------------------------------------------
+// 9. Protocol v1.3 — PostgreSQL transaction contract & retry semantics
+// ---------------------------------------------------------------------------
+
+describe('protocol v1.3 PostgreSQL transaction contract and retry semantics', () => {
+  it('consumes idempotencyKey on identity-conflict and rejected without claiming identity, requiring a new key for a corrected retry', async () => {
+    const registry = new InMemoryRegistry();
+    const digest = await identityDigest(argentinaWins2030(), aliasTable());
+
+    // 1. Ambiguous identity attempt consumes key-conflict
+    const uncertainId = { ...argentinaWins2030(), subject: unresolvedTerm() };
+    const uncertainCand = validCandidate({ proposedIdentity: uncertainId });
+    const firstConflict = await publishCandidate(
+      uncertainCand,
+      request({ idempotencyKey: 'key-conflict', identity: uncertainId }, uncertainCand),
+      deps(registry),
+    );
+    expect(firstConflict.kind).toBe('identity-conflict');
+    expect(registry.size).toBe(0);
+    expect(await registry.findByIdentity(digest)).toBeNull();
+
+    // Retrying identical ambiguous request replays identity-conflict
+    const replayedConflict = await publishCandidate(
+      uncertainCand,
+      request({ idempotencyKey: 'key-conflict', identity: uncertainId }, uncertainCand),
+      deps(registry),
+    );
+    expect(replayedConflict.kind).toBe('replayed');
+    if (replayedConflict.kind === 'replayed') {
+      expect(replayedConflict.original.kind).toBe('identity-conflict');
+    }
+
+    // Reusing key-conflict with a corrected candidate returns idempotency-conflict
+    const fixedCand = validCandidate();
+    const reusedKeyConflict = await publishCandidate(
+      fixedCand,
+      request({ idempotencyKey: 'key-conflict' }, fixedCand),
+      deps(registry),
+    );
+    expect(reusedKeyConflict.kind).toBe('idempotency-conflict');
+    expect(registry.size).toBe(0);
+
+    // 2. Failed evaluation attempt consumes key-rejected
+    const invalidCand = validCandidate({ probability: null });
+    const firstRejected = await publishCandidate(
+      invalidCand,
+      request({ idempotencyKey: 'key-rejected' }, invalidCand),
+      deps(registry),
+    );
+    expect(firstRejected.kind).toBe('rejected');
+    expect(registry.size).toBe(0);
+
+    // Reusing key-rejected with the corrected candidate returns idempotency-conflict
+    const reusedKeyRejected = await publishCandidate(
+      fixedCand,
+      request({ idempotencyKey: 'key-rejected' }, fixedCand),
+      deps(registry),
+    );
+    expect(reusedKeyRejected.kind).toBe('idempotency-conflict');
+    expect(registry.size).toBe(0);
+
+    // 3. Submitting the corrected candidate with a fresh idempotencyKey succeeds
+    const created = await publishCandidate(
+      fixedCand,
+      request({ idempotencyKey: 'key-fresh-fixed' }, fixedCand),
+      deps(registry),
+    );
+    expect(created.kind).toBe('created');
+    expect(registry.size).toBe(1);
+    expect(await registry.findByIdentity(digest)).not.toBeNull();
+  });
+
+  it('verifies PUBLICATION-API-CONTRACT.md contains valid PostgreSQL DDL and eliminates invalid CHECK DEFERRABLE syntax', () => {
+    const contractDoc = readFileSync(
+      resolve(process.cwd(), 'docs/PUBLICATION-API-CONTRACT.md'),
+      'utf8',
+    );
+    const limitationsDoc = readFileSync(
+      resolve(process.cwd(), 'docs/FEATURES-AND-LIMITATIONS.md'),
+      'utf8',
+    );
+
+    // Extract SQL code blocks from docs/PUBLICATION-API-CONTRACT.md
+    const sqlBlocks = Array.from(
+      contractDoc.matchAll(/```sql\r?\n([\s\S]*?)```/g),
+      (m) => m[1],
+    ).join('\n');
+    expect(sqlBlocks.length).toBeGreaterThan(0);
+
+    // 1. PostgreSQL never allows DEFERRABLE on a CHECK constraint
+    expect(sqlBlocks).not.toMatch(/CHECK\s*\([^)]*\)\s*DEFERRABLE/i);
+    expect(limitationsDoc).not.toMatch(/deferred\s+`?CHECK/i);
+
+    // 2. Uses immediate CHECK with transaction-local '__pending__' sentinel
+    expect(sqlBlocks).toContain('CONSTRAINT publication_idempotency_outcome_valid_shape CHECK');
+    expect(sqlBlocks).toContain("'__pending__'");
+    expect(sqlBlocks).toContain('\'{"kind":"__pending__"}\'::jsonb');
+
+    // 3. Uses valid PostgreSQL CREATE CONSTRAINT TRIGGER ... DEFERRABLE INITIALLY DEFERRED
+    expect(sqlBlocks).toContain(
+      'CREATE OR REPLACE FUNCTION enforce_publication_idempotency_outcome_complete()',
+    );
+    expect(sqlBlocks).toContain(
+      'SELECT outcome\n    INTO current_outcome\n    FROM publication_idempotency_keys\n   WHERE idempotency_key = NEW.idempotency_key;',
+    );
+    expect(sqlBlocks).toContain(
+      'CREATE CONSTRAINT TRIGGER publication_idempotency_outcome_complete_trg\n  AFTER INSERT OR UPDATE ON publication_idempotency_keys\n  DEFERRABLE INITIALLY DEFERRED\n  FOR EACH ROW\n  EXECUTE FUNCTION enforce_publication_idempotency_outcome_complete();',
+    );
+
+    // 4. Retains READ COMMITTED and ON CONFLICT unique-index arbitration
+    expect(sqlBlocks).toContain('BEGIN ISOLATION LEVEL READ COMMITTED;');
+    expect(sqlBlocks).toContain('ON CONFLICT (idempotency_key) DO NOTHING');
+    expect(sqlBlocks).toContain('ON CONFLICT (identity_digest) DO NOTHING');
+  });
+});
+
 
 
