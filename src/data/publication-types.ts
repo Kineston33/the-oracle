@@ -20,6 +20,7 @@
 import type {
   IsoDateTime,
   PredictionCategory,
+  PredictionRecord,
   ResolutionCriteria,
   EvidenceReference,
 } from './types.ts';
@@ -153,7 +154,7 @@ export type PropositionStage =
   | 'annulled';
 
 /** Stages from which no further transition is possible. */
-export const TERMINAL_STAGES = ['resolved', 'annulled'] as const;
+export const TERMINAL_STAGES = ['rejected-candidate', 'resolved', 'annulled'] as const;
 
 /**
  * The allowed transitions, stated as data.
@@ -322,28 +323,105 @@ export interface PublicationRequest {
 }
 
 export type PublicationOutcome =
-  /** A new official record was sealed by this command. */
-  | { kind: 'created'; predictionId: string; identityDigest: string }
+  /** A new official record was sealed and committed by this command. */
+  | {
+      kind: 'created';
+      predictionId: string;
+      identityDigest: string;
+      requestDigest: string;
+      record: PredictionRecord;
+    }
   /** An official record already existed for this identity. First wins. */
-  | { kind: 'existing'; predictionId: string; identityDigest: string }
+  | {
+      kind: 'existing';
+      predictionId: string;
+      identityDigest: string;
+      requestDigest: string;
+      record?: PredictionRecord;
+    }
   /**
-   * This exact idempotency key already produced a result.
+   * This exact idempotency key and identical request digest already produced a
+   * result.
    *
    * Carries the original outcome verbatim rather than a flattened copy: a replay
    * of a rejection must stay a rejection, and must not be reshaped into something
    * that looks like a publication.
    */
   | { kind: 'replayed'; original: PublicationOutcome }
+  /**
+   * The idempotency key was reused with different candidate or request content.
+   *
+   * Never interpreted as a replay and never creates or returns a publication.
+   */
+  | {
+      kind: 'idempotency-conflict';
+      idempotencyKey: string;
+      existingRequestDigest: string;
+      incomingRequestDigest: string;
+      detail: string;
+    }
+  /**
+   * The publication request does not match the candidate's id or proposed
+   * canonical identity. Rejected before any registry lookup or mutation.
+   */
+  | {
+      kind: 'candidate-mismatch';
+      reason: 'candidate-id' | 'proposed-identity';
+      detail: string;
+      match?: IdentityMatch;
+    }
   /** Identity resolution was not confident enough to publish. */
   | { kind: 'identity-conflict'; match: IdentityMatch }
   /** Evaluation did not pass. */
   | { kind: 'rejected'; verdict: EvaluationVerdict }
-  /** The candidate is not in a publishable stage. */
-  | { kind: 'wrong-stage'; stage: PropositionStage; required: typeof PUBLISHABLE_STAGE };
+  /** The candidate is not in a verified publishable stage. */
+  | {
+      kind: 'wrong-stage';
+      stage: PropositionStage;
+      required: typeof PUBLISHABLE_STAGE;
+      reason: 'invalid-stage' | 'forged-stage';
+      detail: string;
+    };
 
 /* -------------------------------------------------------------------------
    Registry contract (domain-level, storage-agnostic)
    ------------------------------------------------------------------------- */
+
+export type IdempotencyLookupResult =
+  | { status: 'miss' }
+  | { status: 'match'; requestDigest: string; outcome: PublicationOutcome }
+  | {
+      status: 'conflict';
+      existingRequestDigest: string;
+      incomingRequestDigest: string;
+    };
+
+export type IdempotencyRecordResult =
+  | { status: 'recorded'; outcome: PublicationOutcome }
+  | { status: 'replayed'; original: PublicationOutcome }
+  | {
+      status: 'idempotency-conflict';
+      existingRequestDigest: string;
+      incomingRequestDigest: string;
+    };
+
+export interface AtomicPublicationCommit {
+  idempotencyKey: string;
+  requestDigest: string;
+  identityDigest: string;
+  predictionId: string;
+  record: PredictionRecord;
+}
+
+export type AtomicPublicationResult =
+  | { status: 'created'; outcome: Extract<PublicationOutcome, { kind: 'created' }> }
+  | { status: 'existing'; outcome: Extract<PublicationOutcome, { kind: 'existing' }> }
+  | { status: 'replayed'; original: PublicationOutcome }
+  | {
+      status: 'idempotency-conflict';
+      existingRequestDigest: string;
+      incomingRequestDigest: string;
+    };
 
 /**
  * What a store must be able to answer for the protocol to hold.
@@ -354,22 +432,50 @@ export type PublicationOutcome =
  */
 export interface PublicationRegistry {
   /**
+   * Atomically bind the idempotency key to `requestDigest`, claim `identityDigest`
+   * (or observe the existing winner), persist the sealed `PredictionRecord` +
+   * initial `published` event when claiming, and commit the idempotency outcome
+   * in a single indivisible operation.
+   */
+  commitPublication(commit: AtomicPublicationCommit): Promise<AtomicPublicationResult>;
+
+  /**
    * Atomically claim an identity for a new record.
    *
    * MUST be atomic: two concurrent calls with the same `identityDigest` must
    * never both return `claimed`. Exactly one wins; the other observes the winner.
    */
-  claimIdentity(identityDigest: string, predictionId: string): Promise<
+  claimIdentity(
+    identityDigest: string,
+    predictionId: string,
+    record?: PredictionRecord,
+  ): Promise<
     | { status: 'claimed' }
     | { status: 'already-claimed'; predictionId: string }
   >;
 
   /** Look up the official record for an identity, if one exists. */
-  findByIdentity(identityDigest: string): Promise<{ predictionId: string } | null>;
+  findByIdentity(
+    identityDigest: string,
+  ): Promise<{ predictionId: string; record?: PredictionRecord } | null>;
 
-  /** Look up a prior result for an idempotency key. */
-  findByIdempotencyKey(key: string): Promise<PublicationOutcome | null>;
+  /**
+   * Look up a prior result for an idempotency key and verify that the bound
+   * `requestDigest` matches the incoming request.
+   */
+  findByIdempotencyKey(
+    key: string,
+    requestDigest: string,
+  ): Promise<IdempotencyLookupResult>;
 
-  /** Record the outcome for an idempotency key. */
-  recordIdempotencyKey(key: string, outcome: PublicationOutcome): Promise<void>;
+  /**
+   * Atomically record a non-publishing outcome for an idempotency key, bound to
+   * `requestDigest`. If the key was already bound, returns `replayed` (same
+   * digest) or `idempotency-conflict` (different digest) without overwriting.
+   */
+  recordIdempotencyKey(
+    key: string,
+    requestDigest: string,
+    outcome: PublicationOutcome,
+  ): Promise<IdempotencyRecordResult>;
 }

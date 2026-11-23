@@ -1,21 +1,26 @@
-# THE ORACLE — Official Publication Protocol v1
+# THE ORACLE — Official Publication Protocol v1.1
 
-This document specifies **Official Publication Protocol v1**: the domain rules that
+This document specifies **Official Publication Protocol v1.1**: the domain rules that
 separate an exploratory visitor query from a candidate proposition and from an official,
 sealed prediction record.
 
 The executable domain reference lives in:
 
-- `src/data/publication-types.ts` — vocabulary, lifecycle table (`LIFECYCLE`), evaluation
-  requirement identifiers (`EVALUATION_REQUIREMENTS`), candidate and request shapes, and
-  the storage-agnostic `PublicationRegistry` interface.
+- `src/data/publication-types.ts` — vocabulary, lifecycle table (`LIFECYCLE`), terminal
+  stages (`TERMINAL_STAGES`), evaluation requirement identifiers
+  (`EVALUATION_REQUIREMENTS`), candidate and request shapes, `PublicationOutcome`
+  (8 variants), and the storage-agnostic `PublicationRegistry` interface.
 - `src/data/canonical-identity.ts` — structured proposition identity, deterministic alias
   resolution (`AliasTable`), three-valued identity comparison (`compareIdentities`), and
   the scheme-prefixed identity digest (`identityDigest`).
-- `src/data/publication.ts` — stage transitions (`canTransition`, `advance`,
-  `isPublishable`), the eleven-point evaluator (`evaluateCandidate`,
-  `verdictIsComplete`), the six-step publication gate (`publishCandidate`), and the
-  single-process reference store (`InMemoryRegistry`).
+- `src/data/publication.ts` — strict calendar UTC timestamp parsing
+  (`parseIsoDateTimeMs`, `isValidIsoDateTime`), attested stage transitions
+  (`canTransition`, `advance`, `advanceCandidate`, `qualifyCandidate`,
+  `isVerifiedEligibleCandidate`), the eleven-point evaluator (`evaluateCandidate`,
+  `verdictIsComplete`), versioned candidate/request digests (`candidateContentDigest`,
+  `publicationRequestDigest`), domain-level sealed record construction
+  (`buildSealedPredictionRecord`), the seven-step publication gate (`publishCandidate`),
+  and the single-process reference store (`InMemoryRegistry`).
 
 ---
 
@@ -23,16 +28,17 @@ The executable domain reference lives in:
 
 | Layer | Status in this repository |
 | --- | --- |
-| Domain types, lifecycle graph, and transition rules | **Implemented and tested** (`src/data/publication-types.ts`, `src/data/publication.ts`) |
+| Domain types, lifecycle graph, `TERMINAL_STAGES`, and attested transitions | **Implemented and tested** (`src/data/publication-types.ts`, `src/data/publication.ts`) |
 | Structured canonical identity and alias resolution | **Implemented and tested** (`src/data/canonical-identity.ts`) |
-| Eleven-requirement candidate evaluation | **Implemented and tested** (`src/data/publication.ts`) |
-| Publication gate order, idempotency replay, and race contract | **Implemented against `PublicationRegistry`** (`src/data/publication.ts`) |
-| Persistent database, HTTP API server, and multi-process atomicity | **Not implemented** — specified in `docs/PUBLICATION-API-CONTRACT.md` |
+| Eleven-requirement candidate evaluation with strict calendar/temporal checks | **Implemented and tested** (`src/data/publication.ts`) |
+| Candidate-to-request binding, content-bound idempotency, and sealed `PredictionRecord` construction | **Implemented and tested** (`src/data/publication.ts`) |
+| Atomic publication & idempotency contract (`commitPublication`) | **Implemented against `PublicationRegistry` (`InMemoryRegistry` in-process)** |
+| Persistent database, HTTP API server, and multi-process ACID atomicity | **Not implemented** — specified in `docs/PUBLICATION-API-CONTRACT.md` |
 | Automatic extraction from free text into `CandidateProposition` | **Not implemented** — the Explore page remains a local lexical heuristic |
 
 Nothing in this protocol modifies `src/data/records.json`. The ten shipped records remain
 illustrative (`demo: true`, `anchored: false`), and no visitor interaction in the browser
-can create an official record.
+can create a persistent official record.
 
 ---
 
@@ -51,14 +57,16 @@ types:
    `probability`, `rationale`, `horizon`, `resolutionCriteria`, `evidence`,
    `disclosedLimitations`, and an explicit list of `inferences` recording any component
    supplied by a rule rather than by the author.
-3. **Official prediction (`PredictionRecord`)** — a record sealed only after a candidate
-   reaches `eligible-for-publication`, passes all eleven evaluation requirements, resolves
-   every component of its `PropositionIdentity` without ambiguity, and wins the atomic
-   `claimIdentity` operation for its `identityDigest`.
+3. **Official prediction (`PredictionRecord`)** — a sealed record constructed by
+   `buildSealedPredictionRecord` only after a candidate traverses the verified lifecycle to
+   `eligible-for-publication`, passes all eleven evaluation requirements, resolves every
+   component of its `PropositionIdentity` without ambiguity, matches the
+   `PublicationRequest` identity, and wins the atomic `commitPublication` operation for its
+   `identityDigest`.
 
 ---
 
-## 3. Lifecycle state machine
+## 3. Lifecycle state machine and anti-forgery attestation
 
 Every proposition stage is a member of `PropositionStage`, and the allowed edges are
 defined as data in `LIFECYCLE` (`src/data/publication-types.ts`):
@@ -78,96 +86,128 @@ exploratory-query
                                 └─► annulled (terminal)
 ```
 
-### Invariants enforced by `LIFECYCLE`, `canTransition`, and `advance`
+### Invariants enforced by `LIFECYCLE`, `TERMINAL_STAGES`, `advanceCandidate`, and `qualifyCandidate`
 
-- **Single entry to publication**: `eligible-for-publication` is the only stage whose
-  outgoing edges include `officially-published` (`PUBLISHABLE_STAGE`).
+- **Single entry to publication**: `eligible-for-publication` (`PUBLISHABLE_STAGE`) is the
+  only stage whose outgoing edges include `officially-published`.
 - **Mandatory gates on every simple path**: every path from `exploratory-query` to
   `officially-published` passes through `identity-matching`, then `evaluation`, then
   `eligible-for-publication` in that order.
-- **Terminal stages have no outgoing edges**: `rejected-candidate`, `resolved`, and
-  `annulled` map to `[]`. A rejected candidate cannot be rehabilitated in place; a new
-  candidate must be drafted and evaluated from the beginning.
-- **No arbitrary stage setter**: `advance(from, to)` throws `TransitionError` if
-  `LIFECYCLE[from]` does not contain `to`.
+- **Terminal stages (`TERMINAL_STAGES`)**: `['rejected-candidate', 'resolved', 'annulled']`
+  matches the exact set of stages in `LIFECYCLE` with empty outgoing transition lists.
+- **Unforgeable stage attestation**: `advanceCandidate(candidate, to, aliases)` and
+  `qualifyCandidate(candidate, aliases)` enforce identity resolution on
+  `identity-matching → evaluation` and full evaluation on
+  `evaluation → eligible-for-publication`, freeze the resulting `CandidateProposition`, and
+  record its canonical content snapshot in a module-private `WeakMap`. A caller that
+  manually constructs `{ ...candidate, stage: 'eligible-for-publication' }` — or clones and
+  modifies a qualified candidate — fails `isVerifiedEligibleCandidate(candidate)` and is
+  rejected by `publishCandidate` with
+  `{ kind: 'wrong-stage', reason: 'forged-stage', ... }`.
 
 ---
 
-## 4. The eleven evaluation requirements
+## 4. The eleven evaluation requirements and strict temporal validation
 
 `evaluateCandidate(candidate)` checks every requirement in `EVALUATION_REQUIREMENTS`
 independently and returns an `EvaluationVerdict` whose `results` array always contains all
 eleven items in canonical order (`verdictIsComplete(verdict) === true`).
 
-Missing data is always recorded as a failure, never filled in with a silent default:
+Timestamps are validated with `parseIsoDateTimeMs` / `isValidIsoDateTime`, which require
+`YYYY-MM-DDTHH:mm:ss(.sss)Z` and verify `getUTCFullYear()`, `getUTCMonth()`, and
+`getUTCDate()` against the parsed calendar components so impossible dates (`2026-02-29`,
+`2030-02-30`, `2030-04-31`) cannot silently roll over into the next month.
 
 | Requirement ID | What `evaluateCandidate` checks | Why a default is refused |
 | --- | --- | --- |
 | `unambiguous-question` | `proposedQuestion` is non-empty after trimming and contains no hedging words (`maybe`, `possibly`, `might`, `unclear`, `either`). | A hedged question cannot be resolved Yes or No on a fixed date. |
 | `falsifiable-proposition` | `candidate.inferences` contains an entry with `rule === 'falsifiability-review'`. | Falsifiability is an editorial judgment, not a property a regex can prove from prose. |
-| `fixed-horizon` | `horizon !== null` with non-empty `startsAt` and `endsAt`. | "Eventually" is not a forecast horizon. |
-| `fixed-resolution-date` | `proposedIdentity.resolutionDate` matches `^\d{4}-\d{2}-\d{2}T`. | Without a decision date, a forecast can wait indefinitely to be right. |
+| `fixed-horizon` | `horizon !== null`, non-empty `label`, both `startsAt` and `endsAt` are valid calendar UTC ISO-8601 timestamps, and `startsAt < endsAt`. | Reversed, zero-length, or impossible calendar horizons cannot bound an outcome. |
+| `fixed-resolution-date` | `proposedIdentity.resolutionDate` is a valid calendar UTC ISO-8601 timestamp, `resolutionDate >= horizon.endsAt`, and matches `resolutionCriteria.resolveOn`. | A question cannot resolve before its horizon ends or disagree with its own criteria. |
 | `identified-authority` | `proposedIdentity.decidingAuthority` is not marked `unresolved: true` and its `id` is not `'unknown'`. | Someone must decide the outcome without consulting the forecaster. |
-| `objective-criteria` | `resolutionCriteria !== null` with non-empty `rule` and `authority`. | Criteria must be stated before the outcome is known. |
+| `objective-criteria` | `resolutionCriteria !== null` with non-empty `rule`, non-empty `authority`, and a valid UTC `resolveOn` timestamp. | Criteria must be stated before the outcome is known. |
 | `probability-in-range` | `probability !== null`, finite, and strictly `0 < probability < 1`. | `null` is not `0.5`, and `0` or `1` denies uncertainty rather than pricing it. |
 | `documented-rationale` | `rationale !== null` and non-empty after trimming. | A bare number without reasoning cannot be audited. |
 | `recorded-evidence` | `evidence.length > 0`. | An official forecast must cite the inputs available at publication time. |
-| `preserved-evidence-provenance` | Every item in `evidence` has non-empty `publisher`, `title`, and `publishedAt`. | Unattributed citations cannot be checked against post-outcome sources. |
+| `preserved-evidence-provenance` | Every item in `evidence` has non-empty `publisher`, non-empty `title`, and a valid calendar UTC `publishedAt` timestamp. | Unattributed or undated citations cannot be checked against post-outcome sources. |
 | `disclosed-limitations` | `disclosedLimitations.length > 0`. | Every forecast has blind spots; omitting them overstates precision. |
 
-`verdict.eligible` is `true` only when all eleven checks pass. Failed checks that could be
-satisfied by supplying missing information are listed in `verdict.clarificationsRequired`
-so an operator can distinguish "needs clarification" from "already published".
+---
+
+## 5. Canonical serialization and versioned request digests
+
+Idempotency keys are bound to the immutable digest of the publication command, computed
+using recursive key-sorted canonical JSON (`canonicalize` from `src/data/events.ts`):
+
+- **Candidate content digest (`candidateContentDigest`)**:
+  `SHA-256( UTF-8( "oracle.candidate/1\n" + canonicalize(canonicalCandidateContent) ) )`
+- **Publication request digest (`publicationRequestDigest`)**:
+  `SHA-256( UTF-8( "oracle.publication-request/1\n" + canonicalize({ schema: "oracle.publication-request/1", candidate: canonicalCandidateContent, request: { candidateId, identity, candidateDigest } }) ) )`
+
+Because `publicationRequestDigest` covers all publication-relevant fields of the candidate
+(including its alias-resolved `proposedIdentity`, `proposedQuestion`, `probability`,
+`rationale`, `horizon`, `resolutionCriteria`, `evidence`, `disclosedLimitations`, and
+`inferences`) alongside the request's `candidateId`, alias-resolved `identity`, and
+`candidateDigest`, reusing an `idempotencyKey` with any modified field produces a different
+`requestDigest` and returns `{ kind: 'idempotency-conflict', ... }`.
 
 ---
 
-## 5. Publication gate order (`publishCandidate`)
+## 6. Seven-step publication gate (`publishCandidate`)
 
-`publishCandidate(candidate, request, deps)` executes six checks in strict order:
+`publishCandidate(candidate, request, deps)` executes seven checks in strict order:
 
-1. **Stage check** — if `!isPublishable(candidate.stage)`, returns
-   `{ kind: 'wrong-stage', stage: candidate.stage, required: 'eligible-for-publication' }`
-   without touching the registry.
-2. **Idempotency replay** — looks up `request.idempotencyKey` via
-   `registry.findByIdempotencyKey`. If present, returns
-   `{ kind: 'replayed', original }` verbatim. A replayed rejection stays a rejection; it
-   is never reshaped into a publication.
-3. **Existing identity lookup** — computes `digest = await identityDigest(request.identity, deps.aliases)`
-   and calls `registry.findByIdentity(digest)`. If found, records the idempotency outcome
-   and returns `{ kind: 'existing', predictionId, identityDigest: digest }`.
-4. **Identity self-check** — runs `compareIdentities(request.identity, request.identity, deps.aliases)`.
-   If any component of the identity is unresolved (`outcome !== 'equivalent'`), records
-   the idempotency outcome and returns `{ kind: 'identity-conflict', match }`. Uncertainty
-   blocks publication rather than minting a duplicate record.
-5. **Evaluation gate** — runs `evaluateCandidate(candidate)`. If `!verdict.eligible`,
-   records the idempotency outcome and returns `{ kind: 'rejected', verdict }`.
-6. **Atomic identity claim** — generates a candidate `predictionId` and calls
-   `registry.claimIdentity(digest, predictionId)`.
-   - If the registry returns `{ status: 'claimed' }`, records and returns
-     `{ kind: 'created', predictionId, identityDigest: digest }`.
-   - If a concurrent caller won the race between steps 3 and 6, the registry returns
-     `{ status: 'already-claimed', predictionId: winnerId }`, and `publishCandidate`
-     records and returns `{ kind: 'existing', predictionId: winnerId, identityDigest: digest }`.
-
-Steps 1–5 are local and side-effect-free (except for recording idempotency keys on
-deterministic rejections). Step 6 is the single point that requires storage-level
-atomicity.
+1. **Candidate-to-request binding (`candidate-mismatch`)** — before any registry lookup or
+   mutation, verifies `request.candidateId === candidate.candidateId`
+   (`reason: 'candidate-id'`) and verifies that `request.identity` matches
+   `candidate.proposedIdentity` under `deps.aliases` (`reason: 'proposed-identity'`). A
+   candidate about one proposition can never publish another proposition's identity.
+2. **Stage value check (`wrong-stage`, `reason: 'invalid-stage'`)** — if
+   `!isPublishable(candidate.stage)`, returns immediately without touching the registry.
+3. **Content-bound idempotency lookup** — computes `requestDigest` and `identityDigest` and
+   calls `registry.findByIdempotencyKey(request.idempotencyKey, requestDigest)`:
+   - If the key is bound to the exact same `requestDigest`, returns
+     `{ kind: 'replayed', original }` verbatim.
+   - If the key is bound to a different `requestDigest`, returns
+     `{ kind: 'idempotency-conflict', idempotencyKey, existingRequestDigest, incomingRequestDigest, detail }`.
+4. **Identity self-check (`identity-conflict`)** — runs
+   `compareIdentities(request.identity, request.identity, deps.aliases)`. If any component
+   is unresolved (`outcome !== 'equivalent'`), atomically records the non-publishing
+   outcome for `idempotencyKey` and returns `{ kind: 'identity-conflict', match }`.
+5. **Evaluation gate (`rejected`)** — runs `evaluateCandidate(candidate)`. If
+   `!verdict.eligible`, atomically records the non-publishing outcome for `idempotencyKey`
+   and returns `{ kind: 'rejected', verdict }`.
+6. **Lifecycle attestation check (`wrong-stage`, `reason: 'forged-stage'`)** — verifies
+   `isVerifiedEligibleCandidate(candidate)`. A manually constructed or post-qualification
+   mutated candidate is rejected without touching the identity registry.
+7. **Domain record sealing and atomic commit (`commitPublication`)** — constructs the
+   complete sealed `PredictionRecord` and initial `e0` (`published`) event via
+   `buildSealedPredictionRecord(candidate, predictionId, deps.now())` and calls
+   `registry.commitPublication({ idempotencyKey, requestDigest, identityDigest, predictionId, record })`:
+   - If the idempotency key was concurrently bound to the same `requestDigest`, returns
+     `{ kind: 'replayed', original }`; if bound to a different `requestDigest`, returns
+     `{ kind: 'idempotency-conflict', ... }` without claiming the identity.
+   - If `identityDigest` was unclaimed, commits the identity claim, the sealed
+     `PredictionRecord`, and the idempotency binding together and returns
+     `{ kind: 'created', predictionId, identityDigest, requestDigest, record }`.
+   - If `identityDigest` was already claimed by an earlier or concurrent winner, commits
+     the idempotency binding for the existing winner and returns
+     `{ kind: 'existing', predictionId: winnerId, identityDigest, requestDigest, record }`.
 
 ---
 
-## 6. Immutability after publication
+## 7. Official record creation boundary and post-publication immutability
 
-Once a candidate becomes an official `PredictionRecord` under `payloadScope: 'sealed-payload'`
-(`src/data/events.ts`):
-
-- **Probability is sealed at publication**: `sealedPayload(record)` includes `probability`,
+- **Domain record construction vs persistent storage**: `buildSealedPredictionRecord`
+  constructs a complete `PredictionRecord` (`payloadScope: 'sealed-payload'`,
+  `sealClaim: 'published-before-outcome'`, `anchored: false`, `demo: true`) and its
+  schema-2 `e0` (`published`) event that passes `validateArchive([record])` with zero
+  problems. In this repository, `InMemoryRegistry` holds sealed records only in process
+  memory for domain testing and never writes to `src/data/records.json`. Persistent
+  storage and cross-process atomicity require the relational ACID transaction specified in
+  `docs/PUBLICATION-API-CONTRACT.md`.
+- **Immutability after publication**: `sealedPayload(record)` includes `probability`,
   `canonicalQuestion`, `title`, `category`, `publishedAt`, `horizon`, `resolutionCriteria`,
-  `evidence`, `demo`, and `sealClaim`. Any post-publication edit to `probability` changes
-  `payloadBytes(record)` and invalidates `integrity.digest` and the `e0` publication event.
-- **Resolution does not touch the sealed payload**: `sealedPayload(record)` excludes
-  `events`, `status`, and `resolution`. Appending a `resolved` or `annulled` event via
-  `appendEvent(record, event)` adds an `e1` link to `record.events` while leaving
-  `payloadBytes(record)` and `record.probability` byte-for-byte identical.
-- **Rejected candidates leave no official trace**: when `publishCandidate` returns
-  `wrong-stage`, `identity-conflict`, or `rejected`, `claimIdentity` is never called and
-  no entry is created in the identity table.
+  `evidence`, `demo`, and `sealClaim`, and excludes `events`, `status`, and `resolution`.
+  Appending a `resolved` or `annulled` event via `appendEvent` leaves `payloadBytes(record)`
+  and `record.probability` byte-for-byte identical.

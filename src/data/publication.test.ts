@@ -10,17 +10,28 @@ import {
 } from './canonical-identity';
 import {
   InMemoryRegistry,
+  TransitionError,
   advance,
+  advanceCandidate,
+  buildSealedPredictionRecord,
   canTransition,
+  candidateContentDigest,
   evaluateCandidate,
   isPublishable,
+  isValidIsoDateTime,
+  isVerifiedEligibleCandidate,
+  parseIsoDateTimeMs,
+  publicationRequestDigest,
   publishCandidate,
+  qualifyCandidate,
   verdictIsComplete,
   type PublicationDeps,
 } from './publication';
 import {
   EVALUATION_REQUIREMENTS,
   LIFECYCLE,
+  PUBLISHABLE_STAGE,
+  TERMINAL_STAGES,
   type CandidateProposition,
   type PropositionIdentity,
   type PublicationRequest,
@@ -28,6 +39,7 @@ import {
 import { predictionRecords } from './records';
 import { appendEvent, payloadBytes, sealedPayload } from './events';
 import { sha256Hex } from './hash';
+import { validateArchive } from './validate';
 import type { PredictionRecord, RecordEvent } from './types';
 
 /* -------------------------------------------------------------------------
@@ -72,7 +84,13 @@ function aliasTable(): AliasTable {
   return new AliasTable(ALIASES);
 }
 
-function validCandidate(overrides: Partial<CandidateProposition> = {}): CandidateProposition {
+/**
+ * Construct an unattested candidate object literal.
+ *
+ * Used to test raw drafts or manually forged stages (`stage: 'eligible-for-publication'`)
+ * that have NOT passed through `advanceCandidate` / `qualifyCandidate`.
+ */
+function rawCandidate(overrides: Partial<CandidateProposition> = {}): CandidateProposition {
   return {
     candidateId: 'cand-1',
     submittedQuery: 'will argentina win the 2030 world cup?',
@@ -114,10 +132,28 @@ function validCandidate(overrides: Partial<CandidateProposition> = {}): Candidat
         rule: 'falsifiability-review',
       },
     ],
-    stage: 'eligible-for-publication',
+    stage: 'candidate-proposition',
     createdAt: '2026-11-22T00:00:00.000Z',
     ...overrides,
   };
+}
+
+/**
+ * Construct a candidate that has genuinely stepped through the lifecycle
+ * (`candidate-proposition → identity-matching → evaluation → eligible-for-publication`)
+ * when valid, or an unattested candidate when overrides deliberately break
+ * evaluation/identity/stage to exercise defense-in-depth checks.
+ */
+function validCandidate(overrides: Partial<CandidateProposition> = {}): CandidateProposition {
+  const draft = rawCandidate({ stage: 'candidate-proposition', ...overrides });
+  if (overrides.stage !== undefined && overrides.stage !== 'eligible-for-publication') {
+    return draft;
+  }
+  try {
+    return qualifyCandidate({ ...draft, stage: 'candidate-proposition' }, aliasTable());
+  } catch {
+    return { ...draft, stage: overrides.stage ?? 'eligible-for-publication' };
+  }
 }
 
 function request(overrides: Partial<PublicationRequest> = {}): PublicationRequest {
@@ -136,7 +172,8 @@ function deps(registry = new InMemoryRegistry()): PublicationDeps {
     registry,
     aliases: aliasTable(),
     now: () => '2026-11-22T00:00:00.000Z',
-    newPredictionId: (digest) => `ORC-2030-${digest.slice(0, 4).toUpperCase()}`,
+    newPredictionId: (digest) =>
+      `ORC-2030-${(parseInt(digest.slice(0, 4), 16) % 10000).toString().padStart(4, '0')}`,
   };
 }
 
@@ -457,7 +494,7 @@ describe('publication', () => {
     const first = await publishCandidate(validCandidate(), request({ idempotencyKey: 'k1' }), deps(registry));
     const second = await publishCandidate(
       validCandidate({ candidateId: 'cand-2' }),
-      request({ idempotencyKey: 'k2' }),
+      request({ candidateId: 'cand-2', idempotencyKey: 'k2' }),
       deps(registry),
     );
 
@@ -484,12 +521,9 @@ describe('publication', () => {
   it('keeps a rejected replay rejected instead of reshaping it', async () => {
     const registry = new InMemoryRegistry();
     const request1 = request({ idempotencyKey: 'same' });
-    const rejected = await publishCandidate(
-      validCandidate({ probability: null }),
-      request1,
-      deps(registry),
-    );
-    const replay = await publishCandidate(validCandidate(), request1, deps(registry));
+    const invalid = validCandidate({ probability: null });
+    const rejected = await publishCandidate(invalid, request1, deps(registry));
+    const replay = await publishCandidate(invalid, request1, deps(registry));
 
     expect(rejected.kind).toBe('rejected');
     expect(replay.kind).toBe('replayed');
@@ -745,3 +779,443 @@ describe('the sealed payload', () => {
     expect(await registry.findByIdentity(digest)).toBeNull();
   });
 });
+
+/* -------------------------------------------------------------------------
+   7. Protocol v1.1 integrity regression suite
+   ------------------------------------------------------------------------- */
+
+describe('protocol v1.1 integrity regressions', () => {
+  // 1. Candidate ID mismatch
+  it('rejects a candidateId mismatch before any registry lookup or mutation', async () => {
+    const registry = new InMemoryRegistry();
+    const outcome = await publishCandidate(
+      validCandidate({ candidateId: 'cand-alpha' }),
+      request({ candidateId: 'cand-beta', idempotencyKey: 'k-mismatch-id' }),
+      deps(registry),
+    );
+
+    expect(outcome).toEqual({
+      kind: 'candidate-mismatch',
+      reason: 'candidate-id',
+      detail: expect.stringContaining('cand-beta'),
+    });
+    expect(registry.size).toBe(0);
+    expect(await registry.findByIdempotencyKey('k-mismatch-id', 'any')).toEqual({
+      status: 'miss',
+    });
+  });
+
+  // 2. Candidate identity versus request identity mismatch
+  it('rejects a mismatch between candidate.proposedIdentity and request.identity before touching the registry', async () => {
+    const registry = new InMemoryRegistry();
+    // Candidate is about Argentina winning the tournament; request tries to claim
+    // the identity for Argentina reaching the final.
+    const outcome = await publishCandidate(
+      validCandidate({ proposedIdentity: argentinaWins2030() }),
+      request({
+        identity: argentinaReachesFinal(),
+        idempotencyKey: 'k-mismatch-identity',
+      }),
+      deps(registry),
+    );
+
+    expect(outcome.kind).toBe('candidate-mismatch');
+    if (outcome.kind === 'candidate-mismatch') {
+      expect(outcome.reason).toBe('proposed-identity');
+      expect(outcome.match?.outcome).toBe('distinct');
+      expect(outcome.match?.because).toEqual(['event']);
+    }
+    expect(registry.size).toBe(0);
+    expect(await registry.findByIdempotencyKey('k-mismatch-identity', 'any')).toEqual({
+      status: 'miss',
+    });
+  });
+
+  // 3. Same idempotency key and same content
+  it('replays the original outcome when the same idempotency key is reused with identical content', async () => {
+    const registry = new InMemoryRegistry();
+    const candidate = validCandidate();
+    const req = request({ idempotencyKey: 'k-identical' });
+
+    const first = await publishCandidate(candidate, req, deps(registry));
+    const second = await publishCandidate(candidate, req, deps(registry));
+
+    expect(first.kind).toBe('created');
+    expect(second).toEqual({ kind: 'replayed', original: first });
+    expect(registry.size).toBe(1);
+  });
+
+  // 4. Same idempotency key and different content
+  it('returns idempotency-conflict when the same key is reused with different candidate or request content', async () => {
+    const registry = new InMemoryRegistry();
+    const key = 'k-reused-diff';
+    const first = await publishCandidate(
+      validCandidate({ probability: 0.18 }),
+      request({ idempotencyKey: key }),
+      deps(registry),
+    );
+    const second = await publishCandidate(
+      validCandidate({ probability: 0.42 }),
+      request({ idempotencyKey: key }),
+      deps(registry),
+    );
+
+    expect(first.kind).toBe('created');
+    expect(second.kind).toBe('idempotency-conflict');
+    if (second.kind === 'idempotency-conflict') {
+      expect(second.idempotencyKey).toBe(key);
+      expect(second.existingRequestDigest).not.toBe(second.incomingRequestDigest);
+    }
+    expect(registry.size).toBe(1);
+  });
+
+  // 5. Concurrent same-key requests with different content
+  it('prevents concurrent requests with the same idempotency key and different content from both publishing', async () => {
+    const registry = new InMemoryRegistry();
+    const sharedKey = 'k-concurrent-conflict';
+
+    const candWin = validCandidate({
+      candidateId: 'cand-win',
+      proposedQuestion: 'Will Argentina win the 2030 FIFA World Cup?',
+      proposedIdentity: argentinaWins2030(),
+    });
+    const candFinal = validCandidate({
+      candidateId: 'cand-final',
+      proposedQuestion: 'Will Argentina reach the 2030 FIFA World Cup final?',
+      proposedIdentity: argentinaReachesFinal(),
+    });
+
+    const [outA, outB] = await Promise.all([
+      publishCandidate(
+        candWin,
+        request({
+          candidateId: 'cand-win',
+          idempotencyKey: sharedKey,
+          identity: argentinaWins2030(),
+        }),
+        deps(registry),
+      ),
+      publishCandidate(
+        candFinal,
+        request({
+          candidateId: 'cand-final',
+          idempotencyKey: sharedKey,
+          identity: argentinaReachesFinal(),
+        }),
+        deps(registry),
+      ),
+    ]);
+
+    const kinds = [outA.kind, outB.kind].sort();
+    expect(kinds).toEqual(['created', 'idempotency-conflict']);
+    expect(registry.size).toBe(1);
+  });
+
+  // 6. Concurrent different-key requests with identical canonical identity
+  it('elects one winner and returns existing for the loser when concurrent requests use different keys for the same canonical identity', async () => {
+    const registry = new InMemoryRegistry();
+    const cand1 = validCandidate({ candidateId: 'cand-1' });
+    const cand2 = validCandidate({
+      candidateId: 'cand-2',
+      proposedQuestion: 'Will the Albiceleste become world champions in 2030?',
+      proposedIdentity: {
+        ...argentinaWins2030(),
+        subject: term('team', 'albiceleste'),
+        event: term('outcome', 'become-world-champions'),
+      },
+    });
+
+    const [out1, out2] = await Promise.all([
+      publishCandidate(
+        cand1,
+        request({ candidateId: 'cand-1', idempotencyKey: 'k-race-1', identity: cand1.proposedIdentity }),
+        deps(registry),
+      ),
+      publishCandidate(
+        cand2,
+        request({ candidateId: 'cand-2', idempotencyKey: 'k-race-2', identity: cand2.proposedIdentity }),
+        deps(registry),
+      ),
+    ]);
+
+    const created = [out1, out2].filter((o) => o.kind === 'created');
+    const existing = [out1, out2].filter((o) => o.kind === 'existing');
+    expect(created).toHaveLength(1);
+    expect(existing).toHaveLength(1);
+    if (created[0].kind === 'created' && existing[0].kind === 'existing') {
+      expect(existing[0].predictionId).toBe(created[0].predictionId);
+      expect(existing[0].identityDigest).toBe(created[0].identityDigest);
+    }
+    expect(registry.size).toBe(1);
+  });
+
+  // 7. Forged 'eligible-for-publication' stage
+  it('refuses to publish a manually forged eligible-for-publication stage that bypassed lifecycle transitions', async () => {
+    const registry = new InMemoryRegistry();
+    const forged = rawCandidate({ stage: PUBLISHABLE_STAGE });
+
+    expect(isVerifiedEligibleCandidate(forged)).toBe(false);
+
+    const outcome = await publishCandidate(
+      forged,
+      request({ idempotencyKey: 'k-forged' }),
+      deps(registry),
+    );
+
+    expect(outcome).toEqual({
+      kind: 'wrong-stage',
+      stage: 'eligible-for-publication',
+      required: 'eligible-for-publication',
+      reason: 'forged-stage',
+      detail: expect.stringContaining('forged'),
+    });
+    expect(registry.size).toBe(0);
+  });
+
+  it('refuses to advance a manually forged intermediate stage or a cloned-and-modified qualified candidate', async () => {
+    const forgedEvaluation = rawCandidate({ stage: 'evaluation' });
+    expect(() =>
+      advanceCandidate(forgedEvaluation, 'eligible-for-publication', aliasTable()),
+    ).toThrow(TransitionError);
+
+    expect(() =>
+      qualifyCandidate(rawCandidate({ probability: null }), aliasTable()),
+    ).toThrow(TransitionError);
+
+    expect(() =>
+      qualifyCandidate(
+        rawCandidate({
+          proposedIdentity: { ...argentinaWins2030(), subject: unresolvedTerm() },
+        }),
+        aliasTable(),
+      ),
+    ).toThrow(TransitionError);
+
+    const legitimatelyQualified = validCandidate();
+    expect(isVerifiedEligibleCandidate(legitimatelyQualified)).toBe(true);
+
+    // Cloning a qualified candidate to alter its probability strips the WeakMap
+    // attestation so it cannot publish.
+    const clonedAndModified: CandidateProposition = {
+      ...legitimatelyQualified,
+      probability: 0.77,
+    };
+    expect(isVerifiedEligibleCandidate(clonedAndModified)).toBe(false);
+
+    const registry = new InMemoryRegistry();
+    const outcome = await publishCandidate(
+      clonedAndModified,
+      request({ idempotencyKey: 'k-cloned' }),
+      deps(registry),
+    );
+    expect(outcome.kind).toBe('wrong-stage');
+    if (outcome.kind === 'wrong-stage') {
+      expect(outcome.reason).toBe('forged-stage');
+    }
+    expect(registry.size).toBe(0);
+  });
+
+  // 8. Invalid calendar dates
+  it.each([
+    '2026-02-29T00:00:00.000Z', // 2026 is not a leap year
+    '2030-02-30T00:00:00.000Z', // Feb 30 never exists
+    '2030-04-31T00:00:00.000Z', // April has 30 days
+    '2030-13-01T00:00:00.000Z', // month 13
+    '2030-00-15T00:00:00.000Z', // month 0
+    '2030-01-32T00:00:00.000Z', // day 32
+    '2030-01-15T24:00:00.000Z', // hour 24
+    '2030-01-15T12:60:00.000Z', // minute 60
+    '2030-01-15',               // date-only without UTC time
+    'not-a-timestamp',
+  ])('rejects impossible or malformed ISO date %s', (badDate) => {
+    expect(isValidIsoDateTime(badDate)).toBe(false);
+    expect(parseIsoDateTimeMs(badDate)).toBeNull();
+
+    const badResolution = evaluateCandidate(
+      rawCandidate({
+        proposedIdentity: { ...argentinaWins2030(), resolutionDate: badDate },
+        resolutionCriteria: {
+          resolveOn: badDate,
+          rule: 'FIFA lists Argentina as the tournament winner.',
+          authority: 'FIFA official tournament record',
+          edgeCases: [],
+        },
+      }),
+    );
+    expect(badResolution.eligible).toBe(false);
+    expect(
+      badResolution.results.find((r) => r.id === 'fixed-resolution-date')!.passed,
+    ).toBe(false);
+
+    const badHorizon = evaluateCandidate(
+      rawCandidate({
+        horizon: {
+          startsAt: badDate,
+          endsAt: '2030-12-31T00:00:00.000Z',
+          label: 'By the end of 2030',
+        },
+      }),
+    );
+    expect(badHorizon.eligible).toBe(false);
+    expect(badHorizon.results.find((r) => r.id === 'fixed-horizon')!.passed).toBe(false);
+  });
+
+  // 9. Reversed time horizons
+  it('rejects reversed or zero-length time horizons', () => {
+    const reversed = evaluateCandidate(
+      rawCandidate({
+        horizon: {
+          startsAt: '2030-12-31T00:00:00.000Z',
+          endsAt: '2026-01-01T00:00:00.000Z',
+          label: 'Reversed window',
+        },
+      }),
+    );
+    expect(reversed.eligible).toBe(false);
+    const horizonResult = reversed.results.find((r) => r.id === 'fixed-horizon')!;
+    expect(horizonResult.passed).toBe(false);
+    expect(horizonResult.reason).toMatch(/precede/i);
+
+    const zeroLength = evaluateCandidate(
+      rawCandidate({
+        horizon: {
+          startsAt: '2030-01-01T00:00:00.000Z',
+          endsAt: '2030-01-01T00:00:00.000Z',
+          label: 'Zero-length window',
+        },
+      }),
+    );
+    expect(zeroLength.results.find((r) => r.id === 'fixed-horizon')!.passed).toBe(false);
+  });
+
+  // 10. Resolution date inconsistent with the declared horizon or criteria
+  it('rejects a resolution date that precedes the horizon end or disagrees with resolutionCriteria.resolveOn', () => {
+    const beforeHorizonEnd = evaluateCandidate(
+      rawCandidate({
+        proposedIdentity: {
+          ...argentinaWins2030(),
+          resolutionDate: '2029-06-01T00:00:00.000Z',
+        },
+        resolutionCriteria: {
+          resolveOn: '2029-06-01T00:00:00.000Z',
+          rule: 'FIFA lists Argentina as the tournament winner.',
+          authority: 'FIFA official tournament record',
+          edgeCases: [],
+        },
+      }),
+    );
+    expect(beforeHorizonEnd.eligible).toBe(false);
+    const check1 = beforeHorizonEnd.results.find((r) => r.id === 'fixed-resolution-date')!;
+    expect(check1.passed).toBe(false);
+    expect(check1.reason).toMatch(/cannot precede/i);
+
+    const mismatchedCriteriaDate = evaluateCandidate(
+      rawCandidate({
+        proposedIdentity: {
+          ...argentinaWins2030(),
+          resolutionDate: '2031-01-15T00:00:00.000Z',
+        },
+        resolutionCriteria: {
+          resolveOn: '2031-03-01T00:00:00.000Z',
+          rule: 'FIFA lists Argentina as the tournament winner.',
+          authority: 'FIFA official tournament record',
+          edgeCases: [],
+        },
+      }),
+    );
+    expect(mismatchedCriteriaDate.eligible).toBe(false);
+    const check2 = mismatchedCriteriaDate.results.find(
+      (r) => r.id === 'fixed-resolution-date',
+    )!;
+    expect(check2.passed).toBe(false);
+    expect(check2.reason).toMatch(/does not match/i);
+  });
+
+  // 11. TERMINAL_STAGES consistency with LIFECYCLE
+  it('keeps TERMINAL_STAGES in exact agreement with LIFECYCLE', () => {
+    const terminalFromLifecycle = Object.entries(LIFECYCLE)
+      .filter(([, next]) => next.length === 0)
+      .map(([stage]) => stage)
+      .sort();
+    expect([...TERMINAL_STAGES].sort()).toEqual(terminalFromLifecycle);
+    expect(TERMINAL_STAGES).toEqual(['rejected-candidate', 'resolved', 'annulled']);
+  });
+
+  // 12. No rejected or conflicting candidate creates an official identity claim,
+  // and a valid publication builds a complete validateArchive-clean PredictionRecord
+  it('never claims an identity for any rejected, mismatched, forged, or conflicting request, and seals a valid record when eligible', async () => {
+    const registry = new InMemoryRegistry();
+    const digest = await identityDigest(argentinaWins2030(), aliasTable());
+
+    // Candidate ID mismatch
+    await publishCandidate(
+      validCandidate({ candidateId: 'cand-1' }),
+      request({ candidateId: 'cand-other', idempotencyKey: 'k-1' }),
+      deps(registry),
+    );
+    // Identity mismatch
+    await publishCandidate(
+      validCandidate(),
+      request({ identity: argentinaReachesFinal(), idempotencyKey: 'k-2' }),
+      deps(registry),
+    );
+    // Forged stage
+    await publishCandidate(
+      rawCandidate({ stage: 'eligible-for-publication' }),
+      request({ idempotencyKey: 'k-3' }),
+      deps(registry),
+    );
+    // Uncertain identity
+    const uncertain = { ...argentinaWins2030(), subject: unresolvedTerm() };
+    await publishCandidate(
+      validCandidate({ proposedIdentity: uncertain }),
+      request({ identity: uncertain, idempotencyKey: 'k-4' }),
+      deps(registry),
+    );
+    // Evaluation failure
+    await publishCandidate(
+      validCandidate({ probability: null }),
+      request({ idempotencyKey: 'k-5' }),
+      deps(registry),
+    );
+
+    expect(registry.size).toBe(0);
+    expect(await registry.findByIdentity(digest)).toBeNull();
+
+    // Now publish a genuinely qualified candidate and verify the sealed record
+    // passes the archive validator with zero problems.
+    const created = await publishCandidate(
+      validCandidate(),
+      request({ idempotencyKey: 'k-valid' }),
+      deps(registry),
+    );
+    expect(created.kind).toBe('created');
+    if (created.kind === 'created') {
+      expect(await validateArchive([created.record])).toEqual([]);
+      expect(created.record.integrity.payloadScope).toBe('sealed-payload');
+      expect(created.record.sealClaim).toBe('published-before-outcome');
+      expect(created.record.integrity.anchored).toBe(false);
+    }
+
+    // Also verify candidateContentDigest and publicationRequestDigest sensitivity
+    const d1 = await candidateContentDigest(validCandidate({ probability: 0.18 }), aliasTable());
+    const d2 = await candidateContentDigest(validCandidate({ probability: 0.19 }), aliasTable());
+    expect(d1).not.toBe(d2);
+
+    const r1 = await publicationRequestDigest(validCandidate(), request(), aliasTable());
+    const r2 = await publicationRequestDigest(
+      validCandidate(),
+      request({ candidateDigest: 'b'.repeat(64) }),
+      aliasTable(),
+    );
+    expect(r1).not.toBe(r2);
+
+    const standaloneRecord = await buildSealedPredictionRecord(
+      validCandidate(),
+      'ORC-2030-0042',
+      '2026-11-22T00:00:00.000Z',
+    );
+    expect(await validateArchive([standaloneRecord])).toEqual([]);
+  });
+});
+
