@@ -1859,14 +1859,288 @@ describe('protocol v1.3 PostgreSQL transaction contract and retry semantics', ()
     expect(sqlBlocks).toContain(
       'SELECT outcome\n    INTO current_outcome\n    FROM publication_idempotency_keys\n   WHERE idempotency_key = NEW.idempotency_key;',
     );
+    // A disappearing reservation before COMMIT must raise an exception, never RETURN NULL
+    expect(sqlBlocks).not.toMatch(/IF\s+NOT\s+FOUND\s+THEN\s+RETURN\s+NULL/i);
+    expect(sqlBlocks).toContain(
+      "IF NOT FOUND THEN\n    RAISE EXCEPTION\n      'publication_idempotency_keys row % disappeared before commit'",
+    );
     expect(sqlBlocks).toContain(
       'CREATE CONSTRAINT TRIGGER publication_idempotency_outcome_complete_trg\n  AFTER INSERT OR UPDATE ON publication_idempotency_keys\n  DEFERRABLE INITIALLY DEFERRED\n  FOR EACH ROW\n  EXECUTE FUNCTION enforce_publication_idempotency_outcome_complete();',
     );
 
-    // 4. Retains READ COMMITTED and ON CONFLICT unique-index arbitration
+    // 4. Enforces BEFORE UPDATE OR DELETE immutability trigger on publication_idempotency_keys
+    expect(sqlBlocks).toContain(
+      'CREATE OR REPLACE FUNCTION enforce_publication_idempotency_immutability()',
+    );
+    expect(sqlBlocks).toContain(
+      "IF TG_OP = 'DELETE' THEN\n    RAISE EXCEPTION\n      'DELETE on publication_idempotency_keys is forbidden (idempotency_key = %)'",
+    );
+    expect(sqlBlocks).toContain(
+      "IF (OLD.outcome ->> 'kind') IS DISTINCT FROM '__pending__' THEN\n      RAISE EXCEPTION\n        'publication_idempotency_keys row % is already finalized (%) and cannot be updated'",
+    );
+    expect(sqlBlocks).toContain(
+      'IF NEW.idempotency_key IS DISTINCT FROM OLD.idempotency_key\n       OR NEW.request_digest IS DISTINCT FROM OLD.request_digest\n       OR NEW.recorded_at IS DISTINCT FROM OLD.recorded_at',
+    );
+    expect(sqlBlocks).toContain(
+      'CREATE TRIGGER publication_idempotency_immutability_trg\n  BEFORE UPDATE OR DELETE ON publication_idempotency_keys\n  FOR EACH ROW\n  EXECUTE FUNCTION enforce_publication_idempotency_immutability();',
+    );
+
+    // 5. Retains READ COMMITTED and ON CONFLICT unique-index arbitration
     expect(sqlBlocks).toContain('BEGIN ISOLATION LEVEL READ COMMITTED;');
     expect(sqlBlocks).toContain('ON CONFLICT (idempotency_key) DO NOTHING');
     expect(sqlBlocks).toContain('ON CONFLICT (identity_digest) DO NOTHING');
+  });
+
+  it('enforces the SQL trigger state-machine rules for pending reservation, immutability, column protection, DELETE prohibition, and commit rollback', () => {
+    interface IdempotencyRow {
+      idempotency_key: string;
+      request_digest: string;
+      outcome: { kind?: string; [k: string]: unknown } | null;
+      recorded_at: string;
+    }
+
+    const FINAL_KINDS = new Set(['created', 'existing', 'identity-conflict', 'rejected']);
+    const VALID_SHAPE_KINDS = new Set(['__pending__', ...FINAL_KINDS]);
+
+    // Models the immediate CHECK constraint + BEFORE UPDATE OR DELETE trigger
+    // + DEFERRABLE INITIALLY DEFERRED AFTER INSERT OR UPDATE constraint trigger
+    class SimulatedPgIdempotencyTable {
+      private committed = new Map<string, IdempotencyRow>();
+      private working = new Map<string, IdempotencyRow>();
+      private queuedTriggerKeys: string[] = [];
+
+      begin(): void {
+        this.working = new Map(
+          Array.from(this.committed.entries(), ([k, v]) => [k, structuredClone(v)]),
+        );
+        this.queuedTriggerKeys = [];
+      }
+
+      private checkValidShape(row: IdempotencyRow): void {
+        if (
+          row.outcome === null ||
+          typeof row.outcome !== 'object' ||
+          Array.isArray(row.outcome) ||
+          typeof row.outcome.kind !== 'string' ||
+          !VALID_SHAPE_KINDS.has(row.outcome.kind)
+        ) {
+          throw new Error('23514: publication_idempotency_outcome_valid_shape');
+        }
+      }
+
+      insert(row: IdempotencyRow): boolean {
+        this.checkValidShape(row);
+        if (this.working.has(row.idempotency_key)) {
+          // ON CONFLICT (idempotency_key) DO NOTHING
+          return false;
+        }
+        this.working.set(row.idempotency_key, structuredClone(row));
+        this.queuedTriggerKeys.push(row.idempotency_key);
+        return true;
+      }
+
+      update(key: string, patch: Partial<IdempotencyRow>): void {
+        const oldRow = this.working.get(key);
+        if (!oldRow) return;
+        const newRow: IdempotencyRow = {
+          ...structuredClone(oldRow),
+          ...structuredClone(patch),
+        };
+
+        // BEFORE UPDATE trigger: enforce_publication_idempotency_immutability()
+        if (oldRow.outcome?.kind !== '__pending__') {
+          throw new Error(
+            `23514: publication_idempotency_keys row ${oldRow.idempotency_key} is already finalized (${String(oldRow.outcome?.kind)}) and cannot be updated`,
+          );
+        }
+        if (
+          newRow.idempotency_key !== oldRow.idempotency_key ||
+          newRow.request_digest !== oldRow.request_digest ||
+          newRow.recorded_at !== oldRow.recorded_at
+        ) {
+          throw new Error(
+            `23514: publication_idempotency_keys immutable columns (idempotency_key, request_digest, recorded_at) cannot be modified for ${oldRow.idempotency_key}`,
+          );
+        }
+        if (
+          newRow.outcome === null ||
+          typeof newRow.outcome !== 'object' ||
+          Array.isArray(newRow.outcome) ||
+          typeof newRow.outcome.kind !== 'string' ||
+          !FINAL_KINDS.has(newRow.outcome.kind)
+        ) {
+          throw new Error(
+            `23514: publication_idempotency_keys row ${oldRow.idempotency_key} must transition from __pending__ to a valid final outcome`,
+          );
+        }
+
+        this.checkValidShape(newRow);
+        this.working.set(newRow.idempotency_key, newRow);
+        this.queuedTriggerKeys.push(newRow.idempotency_key);
+      }
+
+      delete(key: string): void {
+        const oldRow = this.working.get(key);
+        if (!oldRow) return;
+        // BEFORE DELETE trigger: enforce_publication_idempotency_immutability()
+        throw new Error(
+          `23514: DELETE on publication_idempotency_keys is forbidden (idempotency_key = ${oldRow.idempotency_key})`,
+        );
+      }
+
+      // Simulates a hypothetical bypass that removes a pending row before COMMIT
+      // to verify that the deferred trigger's IF NOT FOUND branch aborts COMMIT.
+      forceRemoveWorkingRowForTest(key: string): void {
+        this.working.delete(key);
+      }
+
+      commit(): void {
+        try {
+          // DEFERRABLE INITIALLY DEFERRED constraint trigger:
+          // enforce_publication_idempotency_outcome_complete()
+          for (const key of this.queuedTriggerKeys) {
+            const current = this.working.get(key);
+            if (!current) {
+              throw new Error(
+                `23514: publication_idempotency_keys row ${key} disappeared before commit`,
+              );
+            }
+            const kind = current.outcome?.kind;
+            if (
+              current.outcome === null ||
+              typeof current.outcome !== 'object' ||
+              typeof kind !== 'string' ||
+              kind === '__pending__' ||
+              !FINAL_KINDS.has(kind)
+            ) {
+              throw new Error(
+                `23514: publication_idempotency_keys row ${key} cannot commit with incomplete or sentinel outcome`,
+              );
+            }
+          }
+          this.committed = new Map(
+            Array.from(this.working.entries(), ([k, v]) => [k, structuredClone(v)]),
+          );
+        } catch (err) {
+          // Automatic rollback on deferred trigger failure
+          this.working = new Map(
+            Array.from(this.committed.entries(), ([k, v]) => [k, structuredClone(v)]),
+          );
+          throw err;
+        } finally {
+          this.queuedTriggerKeys = [];
+        }
+      }
+
+      getCommitted(key: string): IdempotencyRow | undefined {
+        return this.committed.get(key);
+      }
+    }
+
+    const table = new SimulatedPgIdempotencyTable();
+    const baseDigest = 'a'.repeat(64);
+    const recordedAt = '2026-11-22T00:00:01.000Z';
+
+    // Case 1: Pending reservation without finalization UPDATE rolls back at COMMIT
+    table.begin();
+    table.insert({
+      idempotency_key: 'k-unfinalized',
+      request_digest: baseDigest,
+      outcome: { kind: '__pending__' },
+      recorded_at: recordedAt,
+    });
+    expect(() => table.commit()).toThrow(/cannot commit with incomplete or sentinel outcome/);
+    expect(table.getCommitted('k-unfinalized')).toBeUndefined();
+
+    // Case 2: Pending reservation that disappears before COMMIT (NOT FOUND) rolls back at COMMIT
+    table.begin();
+    table.insert({
+      idempotency_key: 'k-disappeared',
+      request_digest: baseDigest,
+      outcome: { kind: '__pending__' },
+      recorded_at: recordedAt,
+    });
+    table.forceRemoveWorkingRowForTest('k-disappeared');
+    expect(() => table.commit()).toThrow(/disappeared before commit/);
+    expect(table.getCommitted('k-disappeared')).toBeUndefined();
+
+    // Case 3: DELETE of a pending row is rejected immediately by BEFORE DELETE trigger
+    table.begin();
+    table.insert({
+      idempotency_key: 'k-pending-del',
+      request_digest: baseDigest,
+      outcome: { kind: '__pending__' },
+      recorded_at: recordedAt,
+    });
+    expect(() => table.delete('k-pending-del')).toThrow(
+      /DELETE on publication_idempotency_keys is forbidden/,
+    );
+
+    // Case 4: Modifying idempotency_key, request_digest, or recorded_at during finalization is rejected
+    table.begin();
+    table.insert({
+      idempotency_key: 'k-col-protect',
+      request_digest: baseDigest,
+      outcome: { kind: '__pending__' },
+      recorded_at: recordedAt,
+    });
+    expect(() =>
+      table.update('k-col-protect', {
+        request_digest: 'b'.repeat(64),
+        outcome: { kind: 'created' },
+      }),
+    ).toThrow(/immutable columns \(idempotency_key, request_digest, recorded_at\) cannot be modified/);
+    expect(() =>
+      table.update('k-col-protect', {
+        recorded_at: '2026-11-22T00:00:09.000Z',
+        outcome: { kind: 'created' },
+      }),
+    ).toThrow(/immutable columns \(idempotency_key, request_digest, recorded_at\) cannot be modified/);
+    expect(() =>
+      table.update('k-col-protect', {
+        idempotency_key: 'k-col-renamed',
+        outcome: { kind: 'created' },
+      }),
+    ).toThrow(/immutable columns \(idempotency_key, request_digest, recorded_at\) cannot be modified/);
+
+    // Case 5: Updating '__pending__' to '__pending__' is rejected
+    expect(() =>
+      table.update('k-col-protect', {
+        outcome: { kind: '__pending__' },
+      }),
+    ).toThrow(/must transition from __pending__ to a valid final outcome/);
+
+    // Case 6: Valid transition '__pending__' -> 'created' in the same transaction commits cleanly
+    table.begin();
+    table.insert({
+      idempotency_key: 'k-valid',
+      request_digest: baseDigest,
+      outcome: { kind: '__pending__' },
+      recorded_at: recordedAt,
+    });
+    table.update('k-valid', {
+      outcome: { kind: 'created', predictionId: 'pred-0001' },
+    });
+    expect(() => table.commit()).not.toThrow();
+    expect(table.getCommitted('k-valid')?.outcome).toEqual({
+      kind: 'created',
+      predictionId: 'pred-0001',
+    });
+
+    // Case 7: Once finalized, any subsequent UPDATE or DELETE is rejected
+    table.begin();
+    expect(() =>
+      table.update('k-valid', {
+        outcome: { kind: 'existing', predictionId: 'pred-9999' },
+      }),
+    ).toThrow(/already finalized \(created\) and cannot be updated/);
+    expect(() => table.delete('k-valid')).toThrow(
+      /DELETE on publication_idempotency_keys is forbidden/,
+    );
+    expect(table.getCommitted('k-valid')?.outcome).toEqual({
+      kind: 'created',
+      predictionId: 'pred-0001',
+    });
   });
 });
 

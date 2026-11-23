@@ -56,13 +56,20 @@ their correctness depends on:
 1. `PRIMARY KEY` and `UNIQUE` constraints (`PRIMARY KEY (idempotency_key)` on
    `publication_idempotency_keys` and `UNIQUE (identity_digest)` on `official_predictions`),
 2. A non-null transaction-local reservation sentinel (`'{"kind":"__pending__"}'::jsonb`)
-   paired with an immediate `CHECK` constraint and a `DEFERRABLE INITIALLY DEFERRED`
-   `CONSTRAINT TRIGGER` (`publication_idempotency_outcome_complete_trg`) that validates the
-   final row state at `COMMIT`, and
+   paired with:
+   - an immediate `CHECK` constraint (`publication_idempotency_outcome_valid_shape`),
+   - an immediate `BEFORE UPDATE OR DELETE` trigger (`publication_idempotency_immutability_trg`)
+     that forbids `DELETE`, forbids any `UPDATE` on already-finalized rows, protects
+     `idempotency_key`, `request_digest`, and `recorded_at` from modification, and permits
+     only the transition `'__pending__' -> ('created' | 'existing' | 'identity-conflict' | 'rejected')`, and
+   - a `DEFERRABLE INITIALLY DEFERRED` `CONSTRAINT TRIGGER`
+     (`publication_idempotency_outcome_complete_trg`) that validates the live row state at
+     `COMMIT` and forces a rollback if the row disappeared (`NOT FOUND`) or remains
+     `'__pending__'`, and
 3. A single `READ COMMITTED` ACID transaction covering idempotency reservation, canonical
    identity claiming, initial `e0` event insertion, and idempotency outcome finalization.
 
-### 2.1 PostgreSQL schema and deferred constraint trigger
+### 2.1 PostgreSQL schema, immutability trigger, and deferred constraint trigger
 
 > **Why an ordinary `CHECK` constraint cannot be deferred in PostgreSQL**: PostgreSQL only
 > supports `DEFERRABLE` on `PRIMARY KEY`, `UNIQUE`, `EXCLUDE`, and `FOREIGN KEY` table
@@ -73,10 +80,11 @@ their correctness depends on:
 >
 > Instead, `publication_idempotency_keys.outcome` is declared `JSONB NOT NULL` with an
 > immediate `CHECK` constraint allowing the transaction-local sentinel
-> `'{"kind":"__pending__"}'::jsonb` during the reservation `INSERT`, and a
+> `'{"kind":"__pending__"}'::jsonb` during the reservation `INSERT`, an immediate
+> `BEFORE UPDATE OR DELETE` trigger enforces one-way finalization and row immutability, and a
 > `DEFERRABLE INITIALLY DEFERRED` `CONSTRAINT TRIGGER` queries the live row state at
-> `COMMIT` time and aborts the transaction if `outcome ->> 'kind'` is still `'__pending__'`
-> (or anything other than a complete replayable outcome).
+> `COMMIT` time and aborts the transaction if the row disappeared (`NOT FOUND`) or if
+> `outcome ->> 'kind'` is still `'__pending__'`.
 
 ```sql
 CREATE TABLE official_predictions (
@@ -121,6 +129,70 @@ CREATE TABLE publication_idempotency_keys (
   )
 );
 
+CREATE OR REPLACE FUNCTION enforce_publication_idempotency_immutability()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+AS $$
+BEGIN
+  IF TG_OP = 'DELETE' THEN
+    RAISE EXCEPTION
+      'DELETE on publication_idempotency_keys is forbidden (idempotency_key = %)',
+      OLD.idempotency_key
+      USING ERRCODE = '23514';
+  END IF;
+
+  IF TG_OP = 'UPDATE' THEN
+    -- Finalized idempotency rows are strictly immutable; only a row currently in
+    -- the transaction-local '__pending__' state may be updated.
+    IF (OLD.outcome ->> 'kind') IS DISTINCT FROM '__pending__' THEN
+      RAISE EXCEPTION
+        'publication_idempotency_keys row % is already finalized (%) and cannot be updated',
+        OLD.idempotency_key,
+        OLD.outcome ->> 'kind'
+        USING ERRCODE = '23514';
+    END IF;
+
+    -- Immutable identity and audit columns may never change during finalization.
+    IF NEW.idempotency_key IS DISTINCT FROM OLD.idempotency_key
+       OR NEW.request_digest IS DISTINCT FROM OLD.request_digest
+       OR NEW.recorded_at IS DISTINCT FROM OLD.recorded_at
+    THEN
+      RAISE EXCEPTION
+        'publication_idempotency_keys immutable columns (idempotency_key, request_digest, recorded_at) cannot be modified for %',
+        OLD.idempotency_key
+        USING ERRCODE = '23514';
+    END IF;
+
+    -- The only permitted UPDATE transition is '__pending__' -> valid final outcome.
+    IF NEW.outcome IS NULL
+       OR jsonb_typeof(NEW.outcome) <> 'object'
+       OR (NEW.outcome ->> 'kind') IS NULL
+       OR (NEW.outcome ->> 'kind') NOT IN (
+         'created',
+         'existing',
+         'identity-conflict',
+         'rejected'
+       )
+    THEN
+      RAISE EXCEPTION
+        'publication_idempotency_keys row % must transition from __pending__ to a valid final outcome, got: %',
+        OLD.idempotency_key,
+        NEW.outcome
+        USING ERRCODE = '23514';
+    END IF;
+
+    RETURN NEW;
+  END IF;
+
+  RETURN NULL;
+END;
+$$;
+
+CREATE TRIGGER publication_idempotency_immutability_trg
+  BEFORE UPDATE OR DELETE ON publication_idempotency_keys
+  FOR EACH ROW
+  EXECUTE FUNCTION enforce_publication_idempotency_immutability();
+
 CREATE OR REPLACE FUNCTION enforce_publication_idempotency_outcome_complete()
 RETURNS TRIGGER
 LANGUAGE plpgsql
@@ -137,9 +209,12 @@ BEGIN
     FROM publication_idempotency_keys
    WHERE idempotency_key = NEW.idempotency_key;
 
-  -- If the row was deleted before COMMIT, no row remains to validate.
+  -- If the reservation row disappeared before COMMIT, abort the transaction.
   IF NOT FOUND THEN
-    RETURN NULL;
+    RAISE EXCEPTION
+      'publication_idempotency_keys row % disappeared before commit',
+      NEW.idempotency_key
+      USING ERRCODE = '23514';
   END IF;
 
   IF current_outcome IS NULL
@@ -171,28 +246,48 @@ CREATE CONSTRAINT TRIGGER publication_idempotency_outcome_complete_trg
   EXECUTE FUNCTION enforce_publication_idempotency_outcome_complete();
 ```
 
-#### Why `enforce_publication_idempotency_outcome_complete()` is compatible with `INSERT` followed by `UPDATE` in the same transaction
+#### How the two triggers enforce intra-transaction finalization and permanent immutability
 
-1. **How PostgreSQL queues deferred row triggers**:
+1. **Compatible with `INSERT` followed by `UPDATE` in the same transaction**:
    When a transaction executes `INSERT INTO publication_idempotency_keys ... VALUES ($1, $2, '{"kind":"__pending__"}'::jsonb, $3)`
    and later in the same transaction executes `UPDATE publication_idempotency_keys SET outcome = $2 WHERE idempotency_key = $1`,
    PostgreSQL queues two deferred trigger invocations for `COMMIT`: one for the `INSERT`
    (whose `NEW` record holds the `INSERT`-time snapshot with `NEW.outcome = '{"kind":"__pending__"}'`)
-   and one for the `UPDATE` (whose `NEW` record holds the updated snapshot).
-2. **Why the trigger function re-selects by `NEW.idempotency_key`**:
-   If the trigger function inspected `NEW.outcome`, the `AFTER INSERT` invocation at `COMMIT`
-   would see the stale `INSERT`-time `'{"kind":"__pending__"}'` value and erroneously abort
-   the transaction even after the `UPDATE` succeeded. By executing
+   and one for the `UPDATE` (whose `NEW` record holds the updated snapshot). Because
+   `enforce_publication_idempotency_outcome_complete()` executes
    `SELECT outcome INTO current_outcome FROM publication_idempotency_keys WHERE idempotency_key = NEW.idempotency_key;`
-   when the deferred trigger fires at `COMMIT`, both queued invocations inspect the **live,
-   post-`UPDATE` tuple** at the end of the transaction and succeed when `current_outcome ->> 'kind'`
-   has been finalized to `'created'`, `'existing'`, `'identity-conflict'`, or `'rejected'`.
-3. **Why the `'{"kind":"__pending__"}'` sentinel can never be committed or mistaken for a replayable outcome**:
+   at `COMMIT`, both queued invocations inspect the **live, post-`UPDATE` tuple** at the end
+   of the transaction and succeed once `current_outcome ->> 'kind'` has been finalized to
+   `'created'`, `'existing'`, `'identity-conflict'`, or `'rejected'`.
+2. **Exclusively `pending -> final` within the same transaction, and strictly immutable thereafter**:
+   - `publication_idempotency_immutability_trg` (`BEFORE UPDATE OR DELETE`) rejects any
+     `UPDATE` unless `(OLD.outcome ->> 'kind') = '__pending__'` and
+     `(NEW.outcome ->> 'kind') IN ('created', 'existing', 'identity-conflict', 'rejected')`.
+   - During that single allowed transition (`'__pending__' -> final`), `NEW.idempotency_key`,
+     `NEW.request_digest`, and `NEW.recorded_at` must remain identical to `OLD`
+     (`IS NOT DISTINCT FROM`), so neither the key, the bound request digest, nor the
+     recording timestamp can ever be altered.
+   - Because `publication_idempotency_outcome_complete_trg` (`DEFERRABLE INITIALLY DEFERRED`)
+     aborts any transaction that attempts to `COMMIT` with `(current_outcome ->> 'kind') = '__pending__'`,
+     a `'__pending__'` row can never survive `COMMIT`: the transition `'__pending__' -> final`
+     can only happen **inside the same transaction** that inserted the `'__pending__'` row.
+   - Once finalized (`'created'`, `'existing'`, `'identity-conflict'`, or `'rejected'`), any
+     subsequent `UPDATE` (whether in the same transaction or a later transaction) is
+     immediately rejected because `(OLD.outcome ->> 'kind') IS DISTINCT FROM '__pending__'`.
+3. **`DELETE` is forbidden and disappearing reservations force a rollback**:
+   - `publication_idempotency_immutability_trg` (`BEFORE DELETE`) unconditionally rejects
+     `DELETE` on `publication_idempotency_keys` (`ERRCODE = '23514'`), preventing deletion of
+     consumed keys or pending reservations.
+   - As defense-in-depth, if a pending reservation row ever disappeared before `COMMIT`,
+     `enforce_publication_idempotency_outcome_complete()` detects `IF NOT FOUND` at `COMMIT`
+     and raises `ERRCODE = '23514'`, aborting the transaction and rolling back any writes to
+     `official_predictions` or `prediction_events`.
+4. **Why the `'{"kind":"__pending__"}'` sentinel can never be committed or mistaken for a replayable outcome**:
    - **Never committed**: If a transaction inserts `'{"kind":"__pending__"}'` and reaches
-     `COMMIT` without updating `outcome` to one of the four final kinds (or updates it back
-     to `'__pending__'`), `publication_idempotency_outcome_complete_trg` fires during
-     `COMMIT`, sees `(current_outcome ->> 'kind') = '__pending__'`, raises SQLSTATE `23514`
-     (`check_violation`), and PostgreSQL rolls back the entire transaction.
+     `COMMIT` without updating `outcome` to one of the four final kinds,
+     `publication_idempotency_outcome_complete_trg` fires during `COMMIT`, sees
+     `(current_outcome ->> 'kind') = '__pending__'`, raises SQLSTATE `23514`, and rolls back
+     the entire transaction.
    - **Never visible to other transactions**: PostgreSQL never allows dirty reads. While the
      reserving transaction is uncommitted, no other transaction can see its uncommitted
      `'{"kind":"__pending__"}'` tuple; and because the deferred trigger forbids committing
@@ -208,9 +303,9 @@ CREATE CONSTRAINT TRIGGER publication_idempotency_outcome_complete_trg
 | --- | --- | --- |
 | `findByIdempotencyKey(key, requestDigest)` | **Read** | `SELECT request_digest, outcome FROM publication_idempotency_keys WHERE idempotency_key = $1 AND (outcome ->> 'kind') IN ('created', 'existing', 'identity-conflict', 'rejected');`. Returns `{ status: 'miss' }` if absent, `{ status: 'match', requestDigest, outcome }` if `request_digest = $2`, or `{ status: 'conflict', existingRequestDigest: request_digest, incomingRequestDigest: $2 }` if `request_digest <> $2`. |
 | `findByIdentity(identityDigest)` | **Read** | `SELECT prediction_id, sealed_payload FROM official_predictions WHERE identity_digest = $1;`. Read-only lookup by canonical identity digest. |
-| `recordIdempotencyKey(key, requestDigest, outcome)` | **Write (atomic)** | Used in steps 6 (`identity-conflict`) and 7 (`rejected`) where the complete non-sentinel `outcome` is already known. Runs `INSERT INTO publication_idempotency_keys (idempotency_key, request_digest, outcome, recorded_at) VALUES ($1, $2, $3, $4) ON CONFLICT (idempotency_key) DO NOTHING RETURNING request_digest;` inside a `READ COMMITTED` transaction with `$3` having `kind IN ('identity-conflict', 'rejected')`. If 0 rows are returned, selects the committed `(request_digest, outcome)` in the next statement under `READ COMMITTED` and returns `replayed` (when `request_digest = $2`) or `idempotency-conflict` (when `request_digest <> $2`). |
+| `recordIdempotencyKey(key, requestDigest, outcome)` | **Write (atomic)** | Used in steps 6 (`identity-conflict`) and 7 (`rejected`) where the complete non-sentinel `outcome` is already known. Runs `INSERT INTO publication_idempotency_keys (idempotency_key, request_digest, outcome, recorded_at) VALUES ($1, $2, $3, $4) ON CONFLICT (idempotency_key) DO NOTHING RETURNING request_digest;` inside a `READ COMMITTED` transaction with `$3` having `kind IN ('identity-conflict', 'rejected')`. Immediately locked against any future `UPDATE` or `DELETE` by `publication_idempotency_immutability_trg`. If 0 rows are returned, selects the committed `(request_digest, outcome)` in the next statement under `READ COMMITTED` and returns `replayed` (when `request_digest = $2`) or `idempotency-conflict` (when `request_digest <> $2`). |
 | `claimIdentity(identityDigest, predictionId, record)` | **Write (atomic)** | Enforced by `UNIQUE (identity_digest)` on `official_predictions`. Low-level single-table claim used by direct contract tests. |
-| `commitPublication(commit)` | **Write (single ACID transaction)** | Enforced jointly by `PRIMARY KEY (idempotency_key)`, `publication_idempotency_outcome_complete_trg`, and `UNIQUE (identity_digest)`. Executes the four-step `READ COMMITTED` ACID transaction in §2.3 so the winning prediction, its initial `e0` event, and its finalized idempotency outcome are committed together. |
+| `commitPublication(commit)` | **Write (single ACID transaction)** | Enforced jointly by `PRIMARY KEY (idempotency_key)`, `publication_idempotency_immutability_trg`, `publication_idempotency_outcome_complete_trg`, and `UNIQUE (identity_digest)`. Executes the four-step `READ COMMITTED` ACID transaction in §2.3 so the winning prediction, its initial `e0` event, and its finalized, permanently immutable idempotency outcome are committed together. |
 
 ### 2.3 Single `READ COMMITTED` ACID transaction for `commitPublication`
 
@@ -319,16 +414,22 @@ BEGIN ISOLATION LEVEL READ COMMITTED;
    SET outcome = $2
    WHERE idempotency_key = $1;
    ```
+   When this `UPDATE` executes, `publication_idempotency_immutability_trg` (`BEFORE UPDATE`)
+   verifies that `OLD.outcome ->> 'kind' = '__pending__'`, that `idempotency_key`,
+   `request_digest`, and `recorded_at` are unchanged, and that `NEW.outcome ->> 'kind'` is a
+   valid final outcome (`'created'`, `'existing'`, `'identity-conflict'`, or `'rejected'`).
+   Once this `UPDATE` completes, the row is in a final state and any subsequent `UPDATE` or
+   `DELETE` is permanently rejected by `publication_idempotency_immutability_trg`.
 
 4. **Step 4 — Commit and run the deferred constraint trigger**:
    ```sql
    COMMIT;
    ```
    During `COMMIT`, PostgreSQL fires `publication_idempotency_outcome_complete_trg`, which
-   selects the live `outcome` for `idempotency_key = $1` and verifies that
-   `outcome ->> 'kind'` is in `('created', 'existing', 'identity-conflict', 'rejected')` and
-   is not `'__pending__'`. Only after the trigger succeeds does the transaction become
-   visible to other sessions.
+   selects the live `outcome` for `idempotency_key = $1` and verifies that the row still
+   exists (`IF NOT FOUND THEN RAISE EXCEPTION`) and that `outcome ->> 'kind'` is in
+   `('created', 'existing', 'identity-conflict', 'rejected')` and is not `'__pending__'`.
+   Only after the trigger succeeds does the transaction become visible to other sessions.
 
 ### 2.4 Exact concurrency, crash/rollback, and idempotency-key consumption guarantees
 
@@ -352,16 +453,20 @@ BEGIN ISOLATION LEVEL READ COMMITTED;
      statement snapshot, updates `key-2` to `outcome.kind = 'existing'` referencing A's
      winning `prediction_id`, and commits. Exactly one official prediction and one `e0`
      event are created.
-3. **Crash, rollback, or incomplete transaction state**:
+3. **Crash, rollback, incomplete transaction state, or attempted mutation/deletion**:
    - If a transaction crashes, loses its connection, encounters a runtime error, or executes
      `ROLLBACK` at any point after Step 1, PostgreSQL aborts the transaction, discards the
      uncommitted `'{"kind":"__pending__"}'` tuple (and any uncommitted Step 2 writes), and
      releases the unique-index lock so any waiting concurrent transaction immediately wins
      Step 1.
    - If a buggy caller executes Step 1 and attempts `COMMIT` without executing Step 3
-     (`UPDATE`), `publication_idempotency_outcome_complete_trg` raises SQLSTATE `23514` at
-     `COMMIT` and forces a full transaction rollback. An incomplete reservation can never
-     persist.
+     (`UPDATE`), or if the reservation row disappeared before `COMMIT` (`NOT FOUND`),
+     `publication_idempotency_outcome_complete_trg` raises SQLSTATE `23514` at `COMMIT` and
+     forces a full transaction rollback.
+   - If any caller attempts to `DELETE` a row from `publication_idempotency_keys`, modify
+     `idempotency_key`, `request_digest`, or `recorded_at`, or `UPDATE` an already-finalized
+     row, `publication_idempotency_immutability_trg` (`BEFORE UPDATE OR DELETE`) immediately
+     raises SQLSTATE `23514` and aborts the operation.
 4. **Why rejected publication attempts never claim an official identity — and when an `idempotency_key` is consumed**:
    - **Pre-idempotency rejections (steps 1–4 and step 8)**: `candidate-mismatch` (step 1),
      `candidate-digest-mismatch` (step 2), `wrong-stage` with `reason: 'invalid-stage'`
