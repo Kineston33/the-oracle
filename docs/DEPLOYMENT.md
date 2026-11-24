@@ -237,6 +237,8 @@ placeholder formats only:
 | GitHub Actions Neon PR workflow (`.github/workflows/neon-workflow.yml`) | `vars.NEON_PROJECT_ID` | Required in GitHub Actions | Repository variable storing the Neon project ID (`wispy-cell-45340306`) |
 | GitHub Actions Neon PR workflow (`.github/workflows/neon-workflow.yml`) | `secrets.NEON_API_KEY` | Required in GitHub Actions | Repository secret storing the Neon API key used to create/delete temporary PR branches and resolve branch identity |
 | GitHub Actions Neon PR workflow (`.github/workflows/neon-workflow.yml`) | `secrets.ORACLE_APP_PASSWORD` | Required in GitHub Actions | Repository secret storing the password assigned to `oracle_app` when running `npm run db:migrate` against temporary PR `preview/` branches |
+| GitHub Actions Production Migration (`production-migration` environment in `.github/workflows/neon-production-migration.yml`) | `secrets.PRODUCTION_MIGRATION_DATABASE_URL` | Required in `production-migration` environment | Direct (non-`-pooler`) PostgreSQL 16+ administrative (`neondb_owner`) connection string for the Neon `production` branch (`?sslmode=require`); never accepted as a workflow input |
+| GitHub Actions Production Migration (`production-migration` environment in `.github/workflows/neon-production-migration.yml`) | `vars.NEON_PRODUCTION_BRANCH_ID` | Required in repository or `production-migration` environment | Authoritative Neon branch ID (`br-...`) of the `production` branch in project `wispy-cell-45340306`, verified against the Neon API response |
 
 ---
 
@@ -293,3 +295,86 @@ build, and PostgreSQL 16 integration suite.
     `neondatabase/delete-branch-action@v3` when the pull request is closed or
     merged. If deletion is skipped for any reason, the 14-day `expires_at` TTL
     guarantees automatic cleanup in Neon.
+
+---
+
+## 6. Official Production Migration Protocol v1.0 (`.github/workflows/neon-production-migration.yml`)
+
+Ordinary migration invocations (`npm run db:migrate`) **always reject**
+`production`, `main`, `default`, `primary`, and `protected` Neon branches by
+default. Applying `0001_oracle_ledger_v1_10.sql` to the Neon `production` branch
+is restricted to a dedicated, manually dispatched (`workflow_dispatch` only) and
+fail-closed workflow: `.github/workflows/neon-production-migration.yml`.
+
+### Required one-time setup in GitHub (`Settings → Environments`)
+
+1. Create a dedicated GitHub Environment named **`production-migration`** (optionally
+   with required reviewers and a deployment branch restriction to `main` only).
+2. Configure the following secret inside the **`production-migration`**
+   environment:
+   - **`PRODUCTION_MIGRATION_DATABASE_URL`**: Direct (non-`-pooler`) PostgreSQL
+     16+ connection URI for `neondb_owner` on the Neon `production` branch
+     (`postgresql://neondb_owner:<password>@ep-<prod-endpoint>.<region>.aws.neon.tech/neondb?sslmode=require`).
+     This connection string is **never** accepted as a workflow input and must
+     never be placed in runtime `DATABASE_URL`.
+3. Ensure the following repository/environment variables and secrets are present:
+   - Variable **`NEON_PROJECT_ID`**: `wispy-cell-45340306` (must match `.neon`).
+   - Variable **`NEON_PRODUCTION_BRANCH_ID`**: The exact Neon branch ID
+     (`br-...`) of the `production` branch (obtainable via
+     `neon branches list --project-id wispy-cell-45340306`).
+   - Secret **`NEON_API_KEY`**: Neon API key used for authoritative control-plane
+     verification of the endpoint and branch.
+   - Secret **`ORACLE_APP_PASSWORD`**: Strong password (>= 60 bits of entropy)
+     provisioned for the restricted `oracle_app` runtime role.
+
+### Manual execution procedure
+
+1. In GitHub, open **Actions → Official Production Migration Protocol v1.0 (Neon)**.
+2. Select **Run workflow** on branch **`main`**.
+3. Enter the required inputs:
+   - `confirm_production`: Type **`APPLY_PRODUCTION_MIGRATION`** (exact match).
+   - `expected_branch`: **`production`** (exact match).
+4. Click **Run workflow** and approve the **`production-migration`** environment
+   gate if required reviewers are configured.
+
+### Mandatory fail-closed verification gates enforced on the production path
+
+The workflow and `verifyMigrationTargetIdentity()` abort before any DDL
+statement if **any** of the following checks fails:
+
+1. **Dedicated CLI flags required (never environment variables alone)**:
+   Requires `--allow-production-migration` and
+   `--confirm-production APPLY_PRODUCTION_MIGRATION` on the CLI. Setting
+   environment variables without the CLI flags is ignored and rejected.
+2. **Manual `workflow_dispatch` on `main` only**: Rejects any execution not
+   triggered via `workflow_dispatch` on `refs/heads/main`.
+3. **Exact branch name (`production`) and exact branch ID (`br-...`)**:
+   Requires `--expected-branch production` and requires `--expected-branch-id`
+   and `--production-branch-id` (`NEON_PRODUCTION_BRANCH_ID`) to be valid
+   `br-...` identifiers that match each other.
+4. **Exact project ID match across `.neon`, `NEON_PROJECT_ID`, and server GUC**:
+   Requires `--expected-project-id` (`NEON_PROJECT_ID`), `.neon` (`projectId`),
+   the Neon API response, and the PostgreSQL `neon.project_id` GUC (when
+   present) to match `wispy-cell-45340306`.
+5. **Direct (unpooled) Neon SSL endpoint**: Rejects `-pooler` hostnames,
+   `pgbouncer=true`, non-SSL URLs, and non-Neon / loopback hosts.
+6. **Authoritative Neon API verification required (GUC-only fallback forbidden)**:
+   Requires `NEON_API_KEY` and a live Neon API v2 verification confirming that:
+   - The connected `ep-...` endpoint belongs to the exact expected
+     `NEON_PRODUCTION_BRANCH_ID`;
+   - The branch name in Neon is `'production'`; and
+   - The branch is marked `default: true` or `primary: true` in Neon.
+   The GUC-only fallback (`neon-server-guc`) and local CLI fallback are
+   strictly forbidden on the production path.
+7. **Exact production migration role (`neondb_owner`)**: Requires both
+   `CURRENT_USER` and `SESSION_USER` (and the connection URI user) to be
+   exactly `neondb_owner`, rejecting `oracle_app`, `oracle_migrator`, and any
+   other administrative role before executing DDL or transmitting
+   `ORACLE_APP_PASSWORD`.
+8. **Password-safe role provisioning, transactional DDL, and §2.5 audit**:
+   Verifies safe server logging settings before transmitting
+   `ORACLE_APP_PASSWORD` as a `$1` bind parameter, applies
+   `0001_oracle_ledger_v1_10.sql` inside `BEGIN ... COMMIT`, runs
+   `runLedgerSecurityAudit()` (requiring 0 violations), and verifies a live TCP
+   login as `oracle_app` with `DATABASE_URL` unset.
+
