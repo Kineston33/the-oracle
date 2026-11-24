@@ -1920,7 +1920,8 @@ describe('protocol v1.3 PostgreSQL transaction contract and retry semantics', ()
     expect(sqlBlocks).toContain(
       'CREATE ROLE oracle_app NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOBYPASSRLS LOGIN;',
     );
-    expect(sqlBlocks).toContain('REVOKE oracle_migrator FROM oracle_app, PUBLIC;');
+    expect(sqlBlocks).toContain('REVOKE oracle_migrator FROM oracle_app;');
+    expect(sqlBlocks).not.toContain('REVOKE oracle_migrator FROM oracle_app, PUBLIC;');
     expect(sqlBlocks).toContain(
       'ALTER TABLE oracle_ledger.publication_idempotency_keys OWNER TO oracle_migrator;',
     );
@@ -2362,7 +2363,8 @@ describe('protocol v1.3 PostgreSQL transaction contract and retry semantics', ()
     expect(sqlBlocks).toContain(
       'CREATE ROLE oracle_migrator NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOLOGIN;',
     );
-    expect(sqlBlocks).toContain('REVOKE oracle_migrator FROM oracle_app, PUBLIC;');
+    expect(sqlBlocks).toContain('REVOKE oracle_migrator FROM oracle_app;');
+    expect(sqlBlocks).not.toContain('REVOKE oracle_migrator FROM oracle_app, PUBLIC;');
     expect(sqlBlocks).not.toMatch(/GRANT\s+oracle_migrator\s+TO/i);
 
     // --- Part B: In-memory TypeScript simulation (not real PostgreSQL execution) of the
@@ -2900,7 +2902,7 @@ describe('protocol v1.3 PostgreSQL transaction contract and retry semantics', ()
     expect(sqlBlocks).toContain('r_granted.rolcreaterole');
     expect(sqlBlocks).toContain('r_granted.rolbypassrls');
     expect(contractDoc).toMatch(
-      /Executing `REVOKE oracle_migrator FROM oracle_app, PUBLIC;` only removes direct membership[\s\S]*?does \*\*not\*\* by itself remove arbitrary\s+pre-existing role memberships/i,
+      /Executing `REVOKE oracle_migrator FROM oracle_app;` only removes direct membership[\s\S]*?does \*\*not\*\* by itself remove arbitrary\s+pre-existing role memberships/i,
     );
 
     // --- 3. Static checks for explicit digest format-validation vs. SHA-256 distinction ---
@@ -3436,7 +3438,7 @@ describe('protocol v1.3 PostgreSQL transaction contract and retry semantics', ()
     // --- Part A: Static SQL inspection of v1.9+ catalog audit requirements ---
     expect(contractDoc).toMatch(/# THE ORACLE — Publication API & Storage Contract \(v1\.(9|10)\)/);
     expect(contractDoc).toMatch(
-      /Real PostgreSQL execution remains unverified in this[\s>]+environment because no live PostgreSQL server is available/i,
+      /the Node\.js backend server is not yet deployed to a live production host, and Neon is not[\s>]+yet connected to a live backend runtime/i,
     );
 
     // 1. Complete role attribute checks for oracle_app and oracle_migrator (including rolinherit)
