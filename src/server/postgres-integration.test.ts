@@ -1536,6 +1536,16 @@ describe('Real PostgreSQL 16+ Integration Suite — Official Publication Protoco
       ),
     ).toThrow(/must enforce SSL/);
 
+    // 4b. executeSafeMigrationRun aborts before connecting if ORACLE_APP_PASSWORD is missing or empty
+    await expect(
+      executeSafeMigrationRun({
+        migrationDatabaseUrl: cluster.adminConnectionString,
+        oracleAppPassword: '',
+      }),
+    ).rejects.toThrow(
+      /ORACLE_APP_PASSWORD environment variable is required/,
+    );
+
     // 5. Anti-spoofing & production protection: verifyMigrationTargetIdentity blocks production
     //    even when the operator passes expectedBranchName='staging-test'
     const baseProbe = await probeDatabaseIdentity(adminPool);

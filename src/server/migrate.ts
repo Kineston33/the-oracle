@@ -166,9 +166,6 @@ async function applyMigrationStatementsOnClient(
   client: ClientBase,
   options?: MigrationOptions,
 ): Promise<void> {
-  const sql = loadMigrationSql();
-  await client.query(sql);
-
   if (options?.oracleAppPassword !== undefined) {
     if (
       options.oracleAppPassword.trim().length === 0 ||
@@ -179,8 +176,13 @@ async function applyMigrationStatementsOnClient(
       ]);
     }
     const escaped = options.oracleAppPassword.replace(/'/g, "''");
+    // Provision or update oracle_app with its password before running 0001_oracle_ledger_v1_10.sql
+    // so managed PostgreSQL providers (such as Neon) that enforce a password on CREATE ROLE ... LOGIN
+    // receive the password at role creation time.
     await client.query(`
       DO $pwd$
+      DECLARE
+        v_is_superuser BOOLEAN;
       BEGIN
         BEGIN
           PERFORM pg_catalog.set_config('log_statement', 'none', true);
@@ -188,11 +190,36 @@ async function applyMigrationStatementsOnClient(
           WHEN insufficient_privilege THEN
             NULL;
         END;
-        EXECUTE pg_catalog.format('ALTER ROLE oracle_app WITH LOGIN PASSWORD %L', '${escaped}');
+
+        SELECT rolsuper INTO v_is_superuser
+          FROM pg_catalog.pg_roles
+         WHERE rolname = CURRENT_USER;
+
+        IF NOT EXISTS (SELECT 1 FROM pg_catalog.pg_roles WHERE rolname = 'oracle_app') THEN
+          IF COALESCE(v_is_superuser, FALSE) THEN
+            EXECUTE pg_catalog.format(
+              'CREATE ROLE oracle_app NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOBYPASSRLS NOREPLICATION LOGIN PASSWORD %L',
+              '${escaped}'
+            );
+          ELSE
+            EXECUTE pg_catalog.format(
+              'CREATE ROLE oracle_app NOCREATEDB NOCREATEROLE NOINHERIT LOGIN PASSWORD %L',
+              '${escaped}'
+            );
+          END IF;
+        ELSE
+          EXECUTE pg_catalog.format(
+            'ALTER ROLE oracle_app WITH LOGIN PASSWORD %L',
+            '${escaped}'
+          );
+        END IF;
       END;
       $pwd$;
     `);
   }
+
+  const sql = loadMigrationSql();
+  await client.query(sql);
 }
 
 /**
@@ -1042,6 +1069,16 @@ export async function executeSafeMigrationRun(
     migrationUrl,
     runtimeUrl,
   );
+
+  if (
+    !oracleAppPassword ||
+    oracleAppPassword.trim().length === 0 ||
+    oracleAppPassword.includes('\0')
+  ) {
+    throw new MigrationTargetSecurityError([
+      'ORACLE_APP_PASSWORD environment variable is required to configure and verify the restricted oracle_app runtime role',
+    ]);
+  }
 
   const client = new pg.Client({
     connectionString: migrationUrl,
