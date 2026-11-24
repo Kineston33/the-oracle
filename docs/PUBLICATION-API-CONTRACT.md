@@ -1823,3 +1823,46 @@ Every call to `POST /v1/publications` returns one of the ten `PublicationOutcome
 | `wrong-stage` | `409 Conflict` | Candidate is not in `eligible-for-publication` (`reason: 'invalid-stage'`) or its `eligible-for-publication` stage was forged/modified without a verified lifecycle attestation (`reason: 'forged-stage'`). Nothing written to `official_predictions`. |
 | `identity-conflict` | `422 Unprocessable Entity` | At least one component of `PropositionIdentity` is `unresolved` (`match.outcome === 'uncertain'`). Consumes `idempotencyKey` for that `requestDigest`, but writes nothing to `official_predictions`; a corrected candidate must use a new `idempotencyKey`. |
 | `rejected` | `422 Unprocessable Entity` | `evaluateCandidate(candidate, { publishedAt })` returned `eligible: false` (including `publishedAt >= horizon.endsAt` or `evidence[i].publishedAt > publishedAt`); response includes all eleven `verdict.results` and `verdict.clarificationsRequired`. Consumes `idempotencyKey` for that `requestDigest`, but writes nothing to `official_predictions`; a corrected candidate must use a new `idempotencyKey`. |
+
+---
+
+## 4. Phase 2A PostgreSQL 16+ Implementation & Remaining Steps to Connect Neon
+
+### 4.1 Shipped PostgreSQL 16+ modules in `src/server/`
+
+- **`src/server/migrations/0001_oracle_ledger_v1_10.sql`**: Idempotent PostgreSQL 16+ DDL migration creating `oracle_migrator` (`NOLOGIN`) and `oracle_app` (`LOGIN`), schema `oracle_ledger`, tables `official_predictions`, `prediction_events`, and `publication_idempotency_keys`, all seven append-only / immutability / `TRUNCATE`-prevention / deferred constraint triggers, the three hardened `SECURITY DEFINER` write functions (`SET search_path = pg_catalog, pg_temp`), and least-privilege `REVOKE`/`GRANT` rules.
+  - *Contract note verified against live PostgreSQL 16.16*: Role-membership revocation uses `REVOKE oracle_migrator FROM oracle_app;` (plus a `pg_auth_members` cleanup loop), whereas object privilege revocation uses `REVOKE ALL ON ... FROM PUBLIC, oracle_app;`, because PostgreSQL's `REVOKE <role> FROM <role_spec>` grammar does not accept the `PUBLIC` pseudo-role keyword (`SQLSTATE 42704` in `acl.c:get_rolespec_oid`).
+- **`src/server/migrations/audit_v1_10.sql` & `src/server/migrate.ts`**: Migration runner (`runLedgerMigrations`) and live PostgreSQL 16+ catalog security audit runner (`runLedgerSecurityAudit`) executing Steps A, B, and C of §2.5.
+- **`src/server/postgres-registry.ts` (`PostgresPublicationRegistry`)**: Persistent PostgreSQL 16+ implementation of `PublicationRegistry` (`findByIdempotencyKey`, `findByIdentity`, `recordIdempotencyKey`, `commitPublication`, `claimIdentity`) plus `appendResolutionEvent`, `getPredictionById`, `listOfficialPredictions`, and `getPredictionEventsWithVerification`.
+- **`src/server/api.ts` & `src/server/index.ts`**: Minimal server-side HTTP read API (`GET /v1/predictions`, `GET /v1/predictions/:id`, `GET /v1/predictions/:id/events`) that reads `DATABASE_URL` from `process.env`, never exposes credentials to the browser, keeps illustrative `demo: true` records distinct from official `demo: false` predictions, and blocks unauthenticated public write requests (`403 Forbidden` / `405 Method Not Allowed`).
+- **`src/server/postgres-integration.test.ts` & `.github/workflows/postgres-ci.yml`**: Real PostgreSQL 16.16 integration test suite (`postgres (PostgreSQL) 16.16` via `initdb` and `pg_ctl` on an on-disk `PGDATA` cluster, plus GitHub Actions `postgres:16` service container support via `TEST_DATABASE_ADMIN_URL`).
+
+### 4.2 Exact remaining steps to connect the existing Neon project (`wispy-cell-45340306`)
+
+Because the Arena cloud sandbox blocks outbound connections to `*.neon.tech` and `console.neon.tech` and lacks an out-of-band secret injection store, **Neon cloud connectivity and production deployment are not claimed**. To connect the existing Neon project (`org-winter-poetry-50012479` / `wispy-cell-45340306`, branch `production`, region `sa-east-1`) from a workstation or CI/CD runner with outbound access to `*.neon.tech`:
+
+1. **Rotate any previously exposed API key** in the Neon Console (**Settings → API keys**) and store a fresh key in your environment secret manager as `NEON_API_KEY` (never in source code or Git).
+2. **Verify Neon CLI authentication and branch status**:
+   ```bash
+   neon profile list -o json
+   neon status
+   neon config plan
+   ```
+3. **Obtain the direct migration connection string and the pooled runtime connection string**:
+   - Use a **direct (non-`-pooler`)** connection string as the admin/migration role to apply `src/server/migrations/0001_oracle_ledger_v1_10.sql` and run `runLedgerSecurityAudit`:
+     ```bash
+     node --input-type=module -e '
+       import pg from "pg";
+       import { runLedgerMigrations, runLedgerSecurityAudit } from "./src/server/migrate.ts";
+       const pool = new pg.Pool({ connectionString: process.env.MIGRATION_DATABASE_URL });
+       await runLedgerMigrations(pool, { oracleAppPassword: process.env.ORACLE_APP_PASSWORD });
+       const audit = await runLedgerSecurityAudit(pool);
+       console.log(JSON.stringify(audit, null, 2));
+       await pool.end();
+       if (!audit.compliant) process.exit(1);
+     '
+     ```
+   - Configure the application runtime environment variable `DATABASE_URL` with the **`oracle_app`** connection string (pooled `-pooler` endpoint recommended for web/serverless traffic) in your hosting platform's secret store.
+4. **Start the read API server and verify end-to-end**:
+   - Start the server with `DATABASE_URL` injected from the secret store (`startOracleServer()`) and verify `GET /v1/predictions`, `GET /v1/predictions/:id`, and `GET /v1/predictions/:id/events`.
+

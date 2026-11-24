@@ -32,5 +32,11 @@
     }
   },
   "include": ["src"],
-  "exclude": ["src/audit.audit.tsx", "src/**/*.test.ts", "src/**/*.test.tsx", "src/test"]
+  "exclude": [
+    "src/audit.audit.tsx",
+    "src/**/*.test.ts",
+    "src/**/*.test.tsx",
+    "src/test",
+    "src/server"
+  ]
 }
