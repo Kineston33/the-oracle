@@ -3208,9 +3208,12 @@ describe('protocol v1.3 PostgreSQL transaction contract and retry semantics', ()
       "WHERE p.oid = pg_catalog.to_regprocedure(ef.fn_sig)\n       AND r.rolname = 'oracle_migrator'",
     );
 
-    // Effective function EXECUTE checks for oracle_app by exact signature/OID
+    // Effective function EXECUTE checks for oracle_app by exact signature/OID (via LEFT JOIN + p.oid, never ef.fn_sig)
     expect(sqlBlocks).toContain(
-      "OR NOT pg_catalog.has_function_privilege('oracle_app', ef.fn_sig, 'EXECUTE')",
+      "LEFT JOIN pg_catalog.pg_proc AS p\n    ON p.oid = pg_catalog.to_regprocedure(ef.fn_sig)\n  WHERE ef.is_approved_for_app\n    AND (\n      p.oid IS NULL\n      OR NOT pg_catalog.has_function_privilege('oracle_app', p.oid, 'EXECUTE')\n    )",
+    );
+    expect(sqlBlocks).not.toContain(
+      "pg_catalog.has_function_privilege('oracle_app', ef.fn_sig, 'EXECUTE')",
     );
     expect(sqlBlocks).toContain(
       "AND p.oid = pg_catalog.to_regprocedure(ef.fn_sig)\n    )\n    AND pg_catalog.has_function_privilege('oracle_app', p.oid, 'EXECUTE')",
@@ -3430,8 +3433,8 @@ describe('protocol v1.3 PostgreSQL transaction contract and retry semantics', ()
       (m) => m[1],
     ).join('\n');
 
-    // --- Part A: Static SQL inspection of v1.9 catalog audit requirements ---
-    expect(contractDoc).toContain('# THE ORACLE — Publication API & Storage Contract (v1.9)');
+    // --- Part A: Static SQL inspection of v1.9+ catalog audit requirements ---
+    expect(contractDoc).toMatch(/# THE ORACLE — Publication API & Storage Contract \(v1\.(9|10)\)/);
     expect(contractDoc).toMatch(
       /Real PostgreSQL execution remains unverified in this[\s>]+environment because no live PostgreSQL server is available/i,
     );
@@ -3923,6 +3926,208 @@ describe('protocol v1.3 PostgreSQL transaction contract and retry semantics', ()
     expect(runV19CatalogAudit(extraRelationCat)).toEqual([
       'oracle_app_forbidden_table_priv:oracle_ledger.auxiliary_staging_table:INSERT',
     ]);
+  });
+
+  it('enforces v1.10 missing-function audit safety by resolving approved functions once via to_regprocedure + LEFT JOIN and passing p.oid (never ef.fn_sig) to has_function_privilege (static SQL inspection + in-memory TypeScript simulation, not real PostgreSQL execution)', () => {
+    const contractDoc = readFileSync(
+      resolve(process.cwd(), 'docs/PUBLICATION-API-CONTRACT.md'),
+      'utf8',
+    );
+    const sqlBlocks = Array.from(
+      contractDoc.matchAll(/```sql\r?\n([\s\S]*?)```/g),
+      (m) => m[1],
+    ).join('\n');
+
+    // --- Part A: Static SQL contract inspection for v1.10 missing-function audit safety ---
+    expect(contractDoc).toContain('# THE ORACLE — Publication API & Storage Contract (v1.10)');
+
+    // 1. Check 8 resolves each approved function via LEFT JOIN pg_catalog.pg_proc ON p.oid = pg_catalog.to_regprocedure(ef.fn_sig)
+    //    and calls has_function_privilege('oracle_app', p.oid, 'EXECUTE') with the resolved OID, never ef.fn_sig
+    const check8Pattern =
+      /SELECT\s+'oracle_app_missing_approved_execute',\s+ef\.fn_sig,\s+'oracle_app is missing EXECUTE privilege on approved function ' \|\| ef\.fn_sig\s+FROM expected_ledger_functions AS ef\s+LEFT JOIN pg_catalog\.pg_proc AS p\s+ON p\.oid = pg_catalog\.to_regprocedure\(ef\.fn_sig\)\s+WHERE ef\.is_approved_for_app\s+AND \(\s+p\.oid IS NULL\s+OR NOT pg_catalog\.has_function_privilege\('oracle_app', p\.oid, 'EXECUTE'\)\s+\)/;
+    expect(sqlBlocks).toMatch(check8Pattern);
+
+    // Ensure the unsafe signature-string call has_function_privilege('oracle_app', ef.fn_sig, ...) is completely absent
+    expect(sqlBlocks).not.toMatch(/has_function_privilege\s*\(\s*'oracle_app'\s*,\s*ef\.fn_sig/i);
+
+    // Ensure check 8 invokes to_regprocedure(ef.fn_sig) only once (inside the LEFT JOIN ON clause)
+    const check8Section = sqlBlocks.slice(
+      sqlBlocks.indexOf("'oracle_app_missing_approved_execute'"),
+      sqlBlocks.indexOf("'oracle_app_unapproved_function_execute'"),
+    );
+    const toRegprocMatchesInCheck8 = check8Section.match(
+      /pg_catalog\.to_regprocedure\(ef\.fn_sig\)/g,
+    );
+    expect(toRegprocMatchesInCheck8).toHaveLength(1);
+
+    // 2. Preserve exact signature matching and the existing required-function-ownership check (7c)
+    expect(sqlBlocks).toContain(
+      "SELECT\n    'required_function_ownership',\n    ef.fn_sig,\n    'required function ' || ef.fn_sig || ' is missing or not owned by oracle_migrator'\n  FROM expected_ledger_functions AS ef\n  WHERE NOT EXISTS (\n    SELECT 1\n      FROM pg_catalog.pg_proc AS p\n      JOIN pg_catalog.pg_roles AS r ON r.oid = p.proowner\n     WHERE p.oid = pg_catalog.to_regprocedure(ef.fn_sig)\n       AND r.rolname = 'oracle_migrator'\n  )",
+    );
+
+    // --- Part B: Deterministic in-memory TypeScript simulation (not live PostgreSQL execution)
+    //             of LEFT JOIN OID resolution and missing-function safety ---
+    const ORACLE_APP_OID = 10;
+    const ORACLE_MIGRATOR_OID = 20;
+
+    interface ExpectedFnSpec {
+      fn_sig: string;
+      fn_name: string;
+      is_approved_for_app: boolean;
+    }
+
+    interface SimulatedPgProcRow {
+      oid: number;
+      fn_sig: string;
+      proowner: number;
+      executableByApp: boolean;
+    }
+
+    const EXPECTED_FUNCTIONS: ExpectedFnSpec[] = [
+      {
+        fn_sig:
+          'oracle_ledger.commit_official_publication(text,character,text,character,jsonb,character,timestamp with time zone,timestamp with time zone,jsonb,character)',
+        fn_name: 'commit_official_publication',
+        is_approved_for_app: true,
+      },
+      {
+        fn_sig:
+          'oracle_ledger.record_rejected_or_conflict_idempotency(text,character,jsonb,timestamp with time zone)',
+        fn_name: 'record_rejected_or_conflict_idempotency',
+        is_approved_for_app: true,
+      },
+      {
+        fn_sig:
+          'oracle_ledger.append_terminal_prediction_event(text,text,timestamp with time zone,timestamp with time zone,jsonb,character,character)',
+        fn_name: 'append_terminal_prediction_event',
+        is_approved_for_app: true,
+      },
+      {
+        fn_sig: 'oracle_ledger.enforce_append_only_ledger_row()',
+        fn_name: 'enforce_append_only_ledger_row',
+        is_approved_for_app: false,
+      },
+      {
+        fn_sig: 'oracle_ledger.enforce_publication_idempotency_immutability()',
+        fn_name: 'enforce_publication_idempotency_immutability',
+        is_approved_for_app: false,
+      },
+      {
+        fn_sig: 'oracle_ledger.enforce_publication_idempotency_no_truncate()',
+        fn_name: 'enforce_publication_idempotency_no_truncate',
+        is_approved_for_app: false,
+      },
+      {
+        fn_sig: 'oracle_ledger.enforce_publication_idempotency_outcome_complete()',
+        fn_name: 'enforce_publication_idempotency_outcome_complete',
+        is_approved_for_app: false,
+      },
+    ];
+
+    function simulateV110FunctionAudit(pgProcRows: SimulatedPgProcRow[]): {
+      violations: string[];
+      check8ToRegprocedureCallCountBySig: Record<string, number>;
+    } {
+      const procByOid = new Map(pgProcRows.map((row) => [row.oid, row]));
+      const procBySig = new Map(pgProcRows.map((row) => [row.fn_sig, row]));
+      const check8ToRegprocedureCallCountBySig: Record<string, number> = {};
+
+      // Simulates pg_catalog.to_regprocedure(text): returns OID or null if function is missing (never throws)
+      const toRegprocedure = (sig: string, trackCheck8: boolean): number | null => {
+        if (trackCheck8) {
+          check8ToRegprocedureCallCountBySig[sig] =
+            (check8ToRegprocedureCallCountBySig[sig] ?? 0) + 1;
+        }
+        return procBySig.get(sig)?.oid ?? null;
+      };
+
+      // Simulates pg_catalog.has_function_privilege(role, oid, 'EXECUTE'):
+      // Strict on NULL::oid; throws if a caller ever passes a string signature or unknown non-null OID
+      const hasFunctionPrivilegeByOid = (
+        roleOid: number,
+        fnOid: number | null,
+        priv: 'EXECUTE',
+      ): boolean | null => {
+        if (typeof fnOid !== 'number') {
+          return null; // PostgreSQL STRICT behavior on NULL::oid
+        }
+        const row = procByOid.get(fnOid);
+        if (!row) {
+          throw new Error(`42883: function with OID ${fnOid} does not exist`);
+        }
+        return roleOid === ORACLE_APP_OID && priv === 'EXECUTE' ? row.executableByApp : false;
+      };
+
+      const violations: string[] = [];
+
+      // Check 7c: required_function_ownership
+      for (const ef of EXPECTED_FUNCTIONS) {
+        const resolvedOid = toRegprocedure(ef.fn_sig, false);
+        const row = resolvedOid !== null ? procByOid.get(resolvedOid) : undefined;
+        if (!row || row.proowner !== ORACLE_MIGRATOR_OID) {
+          violations.push(`required_function_ownership:${ef.fn_sig}`);
+        }
+      }
+
+      // Check 8: LEFT JOIN pg_catalog.pg_proc AS p ON p.oid = pg_catalog.to_regprocedure(ef.fn_sig)
+      //          WHERE ef.is_approved_for_app AND (p.oid IS NULL OR NOT has_function_privilege('oracle_app', p.oid, 'EXECUTE'))
+      for (const ef of EXPECTED_FUNCTIONS.filter((f) => f.is_approved_for_app)) {
+        // Resolve each approved function exactly once through to_regprocedure(ef.fn_sig)
+        const resolvedOid = toRegprocedure(ef.fn_sig, true);
+        const joinedProc = resolvedOid !== null ? (procByOid.get(resolvedOid) ?? null) : null;
+        const pOid: number | null = joinedProc ? joinedProc.oid : null;
+
+        // Even if the SQL planner evaluates both sides of OR, has_function_privilege receives p.oid (number | null), never ef.fn_sig
+        const privResult = hasFunctionPrivilegeByOid(ORACLE_APP_OID, pOid, 'EXECUTE');
+        if (pOid === null || privResult !== true) {
+          violations.push(`oracle_app_missing_approved_execute:${ef.fn_sig}`);
+        }
+      }
+
+      return { violations, check8ToRegprocedureCallCountBySig };
+    }
+
+    const buildCompliantPgProcCatalog = (): SimulatedPgProcRow[] =>
+      EXPECTED_FUNCTIONS.map((ef, idx) => ({
+        oid: 1000 + idx,
+        fn_sig: ef.fn_sig,
+        proowner: ORACLE_MIGRATOR_OID,
+        executableByApp: ef.is_approved_for_app,
+      }));
+
+    // Scenario 1: An approved function missing entirely — emits oracle_app_missing_approved_execute
+    //             (plus required_function_ownership) without throwing a signature-resolution error,
+    //             and resolves each approved function exactly once in Check 8
+    const missingApprovedFnCatalog = buildCompliantPgProcCatalog().filter(
+      (row) => row.fn_sig !== EXPECTED_FUNCTIONS[1]!.fn_sig,
+    );
+    const missingResult = simulateV110FunctionAudit(missingApprovedFnCatalog);
+    expect(missingResult.violations).toEqual([
+      `required_function_ownership:${EXPECTED_FUNCTIONS[1]!.fn_sig}`,
+      `oracle_app_missing_approved_execute:${EXPECTED_FUNCTIONS[1]!.fn_sig}`,
+    ]);
+    expect(missingResult.check8ToRegprocedureCallCountBySig).toEqual({
+      [EXPECTED_FUNCTIONS[0]!.fn_sig]: 1,
+      [EXPECTED_FUNCTIONS[1]!.fn_sig]: 1,
+      [EXPECTED_FUNCTIONS[2]!.fn_sig]: 1,
+    });
+
+    // Scenario 2: An approved function present (and owned by oracle_migrator) but missing EXECUTE for oracle_app
+    const missingExecCatalog = buildCompliantPgProcCatalog();
+    missingExecCatalog[2]!.executableByApp = false;
+    const missingExecResult = simulateV110FunctionAudit(missingExecCatalog);
+    expect(missingExecResult.violations).toEqual([
+      `oracle_app_missing_approved_execute:${EXPECTED_FUNCTIONS[2]!.fn_sig}`,
+    ]);
+
+    // Scenario 3 & 4: All approved functions present with EXECUTE in a compliant catalog produce zero violations
+    const compliantResult = simulateV110FunctionAudit(buildCompliantPgProcCatalog());
+    expect(compliantResult.violations).toEqual([]);
+    expect(compliantResult.check8ToRegprocedureCallCountBySig).toEqual({
+      [EXPECTED_FUNCTIONS[0]!.fn_sig]: 1,
+      [EXPECTED_FUNCTIONS[1]!.fn_sig]: 1,
+      [EXPECTED_FUNCTIONS[2]!.fn_sig]: 1,
+    });
   });
 });
 

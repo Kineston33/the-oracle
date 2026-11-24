@@ -1,11 +1,12 @@
-# THE ORACLE — Publication API & Storage Contract (v1.9)
+# THE ORACLE — Publication API & Storage Contract (v1.10)
 
 This document specifies the storage invariants, transaction boundaries, `READ COMMITTED`
 isolation-level enforcement, `TRUNCATE` and privilege hardening, controlled `SECURITY DEFINER`
 database write boundary, PostgreSQL 16+ compatibility, catalog ACL (`PUBLIC` grantee OID `0`),
-role-attribute, object-ownership, and effective-privilege auditing, and read/write separation
-required to back **Official Publication Protocol v1.9** (`src/data/publication-types.ts` and
-`src/data/publication.ts`) with a persistent PostgreSQL 16+ database and HTTP service.
+role-attribute, object-ownership, missing-function-safe `EXECUTE` privilege auditing, and
+read/write separation required to back **Official Publication Protocol v1.10**
+(`src/data/publication-types.ts` and `src/data/publication.ts`) with a persistent
+PostgreSQL 16+ database and HTTP service.
 
 > **Minimum supported PostgreSQL version**: **PostgreSQL 16** (`server_version_num >= 160000`).
 > The deployment role-membership audit inspects `pg_catalog.pg_auth_members.inherit_option` and
@@ -1313,10 +1314,15 @@ serving traffic:
        **exact function signature** (`pg_catalog.to_regprocedure(fn_sig)`).
      - `oracle_app` owns **0** schemas (`pg_namespace`), relations (`pg_class`), or
        functions/procedures (`pg_proc`).
-   - **Function `EXECUTE` privileges (`has_function_privilege`)**:
+   - **Function `EXECUTE` privileges (`has_function_privilege` by resolved OID)**:
      - `oracle_app` has `EXECUTE` privilege on **all three** approved `SECURITY DEFINER`
-       functions (verified by exact signature) and **cannot** execute any internal trigger
-       function or other function in `oracle_ledger`.
+       functions — resolving each approved signature once through
+       `pg_catalog.to_regprocedure(ef.fn_sig)` via a `LEFT JOIN` to `pg_catalog.pg_proc` and
+       calling `pg_catalog.has_function_privilege('oracle_app', p.oid, 'EXECUTE')` with the
+       resolved OID `p.oid` (never the potentially nonexistent signature string `ef.fn_sig`)
+       so a missing function returns `oracle_app_missing_approved_execute` without raising an
+       error — and **cannot** execute any internal trigger function or other function in
+       `oracle_ledger`.
    - **`PUBLIC` catalog ACL inspection (`aclexplode` + `acldefault`, `grantee = 0::oid`)**:
      - `PUBLIC` (`grantee = 0::oid`) has **no** `SELECT`, `INSERT`, `UPDATE`, `DELETE`,
        `TRUNCATE`, `TRIGGER`, `REFERENCES`, or `USAGE` privileges on any ledger table or
@@ -1708,16 +1714,22 @@ effective_privilege_violations AS (
 
   UNION ALL
 
-  -- 8. Verify oracle_app has EXECUTE on all three approved SECURITY DEFINER functions by exact signature
+  -- 8. Verify oracle_app has EXECUTE on all three approved SECURITY DEFINER functions by exact signature.
+  --    Resolve each approved function once through pg_catalog.to_regprocedure(ef.fn_sig) via a LEFT JOIN
+  --    to pg_catalog.pg_proc and call pg_catalog.has_function_privilege('oracle_app', p.oid, 'EXECUTE')
+  --    with the resolved OID (never the potentially nonexistent signature string ef.fn_sig) so a missing
+  --    function emits oracle_app_missing_approved_execute instead of raising a signature-lookup error.
   SELECT
     'oracle_app_missing_approved_execute',
     ef.fn_sig,
     'oracle_app is missing EXECUTE privilege on approved function ' || ef.fn_sig
   FROM expected_ledger_functions AS ef
+  LEFT JOIN pg_catalog.pg_proc AS p
+    ON p.oid = pg_catalog.to_regprocedure(ef.fn_sig)
   WHERE ef.is_approved_for_app
     AND (
-      pg_catalog.to_regprocedure(ef.fn_sig) IS NULL
-      OR NOT pg_catalog.has_function_privilege('oracle_app', ef.fn_sig, 'EXECUTE')
+      p.oid IS NULL
+      OR NOT pg_catalog.has_function_privilege('oracle_app', p.oid, 'EXECUTE')
     )
 
   UNION ALL
