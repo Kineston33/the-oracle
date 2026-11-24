@@ -1,9 +1,9 @@
-# THE ORACLE — Publication API & Storage Contract (v1.3)
+# THE ORACLE — Publication API & Storage Contract (v1.5)
 
 This document specifies the storage invariants, transaction boundaries, isolation-level
-requirements, and read/write separation required to back **Official Publication Protocol v1.3**
-(`src/data/publication-types.ts` and `src/data/publication.ts`) with a persistent PostgreSQL
-database and HTTP service.
+requirements, `TRUNCATE` and privilege hardening, and read/write separation required to back
+**Official Publication Protocol v1.5** (`src/data/publication-types.ts` and
+`src/data/publication.ts`) with a persistent PostgreSQL database and HTTP service.
 
 > **Status in this repository**: No HTTP server and no PostgreSQL database are shipped or
 > running in this repository/sandbox. `InMemoryRegistry` (`src/data/publication.ts`)
@@ -12,11 +12,11 @@ database and HTTP service.
 > storage, and idempotency binding in one synchronous critical section with no `await`
 > points); it does **not** survive process restarts or coordinate across multiple OS
 > processes or nodes. Single-threaded `InMemoryRegistry` tests verify the domain state
-> machine and contract invariants, and the PostgreSQL DDL and transaction statements below
-> are verified by static SQL contract inspection and automated tests rather than executed
-> against a live PostgreSQL instance. A production backend must implement the relational
-> constraints, PL/pgSQL deferred constraint trigger, and `READ COMMITTED` ACID transaction
-> specified below.
+> machine and contract invariants, and the PostgreSQL DDL, trigger, privilege, and
+> transaction statements below are verified by static SQL contract inspection and in-memory
+> state-machine simulation tests rather than executed against a live PostgreSQL instance. A
+> production backend must implement the relational constraints, PL/pgSQL triggers, role
+> separation, and `READ COMMITTED` ACID transaction specified below.
 
 ---
 
@@ -58,18 +58,23 @@ their correctness depends on:
 2. A non-null transaction-local reservation sentinel (`'{"kind":"__pending__"}'::jsonb`)
    paired with:
    - an immediate `CHECK` constraint (`publication_idempotency_outcome_valid_shape`),
-   - an immediate `BEFORE UPDATE OR DELETE` trigger (`publication_idempotency_immutability_trg`)
+   - an immediate `BEFORE UPDATE OR DELETE` row trigger (`publication_idempotency_immutability_trg`)
      that forbids `DELETE`, forbids any `UPDATE` on already-finalized rows, protects
      `idempotency_key`, `request_digest`, and `recorded_at` from modification, and permits
-     only the transition `'__pending__' -> ('created' | 'existing' | 'identity-conflict' | 'rejected')`, and
+     only the transition `'__pending__' -> ('created' | 'existing' | 'identity-conflict' | 'rejected')`,
+   - an immediate `BEFORE TRUNCATE ... FOR EACH STATEMENT` trigger
+     (`publication_idempotency_no_truncate_trg`) that rejects `TRUNCATE` (including indirect
+     `TRUNCATE ... CASCADE`) with SQLSTATE `23514`, and
    - a `DEFERRABLE INITIALLY DEFERRED` `CONSTRAINT TRIGGER`
      (`publication_idempotency_outcome_complete_trg`) that validates the live row state at
      `COMMIT` and forces a rollback if the row disappeared (`NOT FOUND`) or remains
-     `'__pending__'`, and
+     `'__pending__'`,
 3. A single `READ COMMITTED` ACID transaction covering idempotency reservation, canonical
-   identity claiming, initial `e0` event insertion, and idempotency outcome finalization.
+   identity claiming, initial `e0` event insertion, and idempotency outcome finalization, and
+4. Strict database privilege separation between the migration/table-owner role and the
+   least-privilege application runtime role (§2.5).
 
-### 2.1 PostgreSQL schema, immutability trigger, and deferred constraint trigger
+### 2.1 PostgreSQL schema, immutability triggers, `TRUNCATE` protection, and deferred constraint trigger
 
 > **Why an ordinary `CHECK` constraint cannot be deferred in PostgreSQL**: PostgreSQL only
 > supports `DEFERRABLE` on `PRIMARY KEY`, `UNIQUE`, `EXCLUDE`, and `FOREIGN KEY` table
@@ -81,8 +86,9 @@ their correctness depends on:
 > Instead, `publication_idempotency_keys.outcome` is declared `JSONB NOT NULL` with an
 > immediate `CHECK` constraint allowing the transaction-local sentinel
 > `'{"kind":"__pending__"}'::jsonb` during the reservation `INSERT`, an immediate
-> `BEFORE UPDATE OR DELETE` trigger enforces one-way finalization and row immutability, and a
-> `DEFERRABLE INITIALLY DEFERRED` `CONSTRAINT TRIGGER` queries the live row state at
+> `BEFORE UPDATE OR DELETE` row trigger enforces one-way finalization and row immutability,
+> an immediate `BEFORE TRUNCATE ... FOR EACH STATEMENT` trigger blocks table truncation, and
+> a `DEFERRABLE INITIALLY DEFERRED` `CONSTRAINT TRIGGER` queries the live row state at
 > `COMMIT` time and aborts the transaction if the row disappeared (`NOT FOUND`) or if
 > `outcome ->> 'kind'` is still `'__pending__'`.
 
@@ -193,6 +199,33 @@ CREATE TRIGGER publication_idempotency_immutability_trg
   FOR EACH ROW
   EXECUTE FUNCTION enforce_publication_idempotency_immutability();
 
+CREATE OR REPLACE FUNCTION enforce_publication_idempotency_no_truncate()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+AS $$
+BEGIN
+  RAISE EXCEPTION
+    'TRUNCATE on % is forbidden',
+    TG_TABLE_NAME
+    USING ERRCODE = '23514';
+END;
+$$;
+
+CREATE TRIGGER publication_idempotency_no_truncate_trg
+  BEFORE TRUNCATE ON publication_idempotency_keys
+  FOR EACH STATEMENT
+  EXECUTE FUNCTION enforce_publication_idempotency_no_truncate();
+
+CREATE TRIGGER official_predictions_no_truncate_trg
+  BEFORE TRUNCATE ON official_predictions
+  FOR EACH STATEMENT
+  EXECUTE FUNCTION enforce_publication_idempotency_no_truncate();
+
+CREATE TRIGGER prediction_events_no_truncate_trg
+  BEFORE TRUNCATE ON prediction_events
+  FOR EACH STATEMENT
+  EXECUTE FUNCTION enforce_publication_idempotency_no_truncate();
+
 CREATE OR REPLACE FUNCTION enforce_publication_idempotency_outcome_complete()
 RETURNS TRIGGER
 LANGUAGE plpgsql
@@ -274,10 +307,24 @@ CREATE CONSTRAINT TRIGGER publication_idempotency_outcome_complete_trg
    - Once finalized (`'created'`, `'existing'`, `'identity-conflict'`, or `'rejected'`), any
      subsequent `UPDATE` (whether in the same transaction or a later transaction) is
      immediately rejected because `(OLD.outcome ->> 'kind') IS DISTINCT FROM '__pending__'`.
-3. **`DELETE` is forbidden and disappearing reservations force a rollback**:
-   - `publication_idempotency_immutability_trg` (`BEFORE DELETE`) unconditionally rejects
-     `DELETE` on `publication_idempotency_keys` (`ERRCODE = '23514'`), preventing deletion of
-     consumed keys or pending reservations.
+3. **`DELETE` and `TRUNCATE` (including `TRUNCATE ... CASCADE`) are forbidden, and disappearing reservations force a rollback**:
+   - `publication_idempotency_immutability_trg` (`BEFORE DELETE ... FOR EACH ROW`)
+     unconditionally rejects row-level `DELETE` on `publication_idempotency_keys`
+     (`ERRCODE = '23514'`), preventing deletion of consumed keys or pending reservations.
+   - Because PostgreSQL `TRUNCATE` bypasses `FOR EACH ROW` `BEFORE DELETE` triggers,
+     `publication_idempotency_no_truncate_trg` (`BEFORE TRUNCATE ON publication_idempotency_keys FOR EACH STATEMENT`)
+     invokes `enforce_publication_idempotency_no_truncate()` and unconditionally raises
+     SQLSTATE `23514` (`check_violation`) before any truncation can occur.
+   - **Protection against indirect `TRUNCATE ... CASCADE`**:
+     1. `publication_idempotency_keys` defines **no** `FOREIGN KEY` (`REFERENCES`) to
+        `official_predictions`, `prediction_events`, or any other table — and must never add
+        a foreign key referencing another table — so `TRUNCATE <other_table> CASCADE` can
+        never propagate to `publication_idempotency_keys`.
+     2. In PostgreSQL, when `TRUNCATE ... CASCADE` expands to dependent tables, PostgreSQL
+        fires `BEFORE TRUNCATE ... FOR EACH STATEMENT` triggers on every affected table in
+        the cascade; furthermore, `official_predictions_no_truncate_trg` and
+        `prediction_events_no_truncate_trg` forbid `TRUNCATE` on the prediction and event
+        tables as well.
    - As defense-in-depth, if a pending reservation row ever disappeared before `COMMIT`,
      `enforce_publication_idempotency_outcome_complete()` detects `IF NOT FOUND` at `COMMIT`
      and raises `ERRCODE = '23514'`, aborting the transaction and rolling back any writes to
@@ -491,6 +538,73 @@ BEGIN ISOLATION LEVEL READ COMMITTED;
      - **A corrected/retried candidate submission must therefore supply a new
        `idempotencyKey`**, which will pass all nine steps and claim the official identity
        with `{ kind: 'created', ... }`.
+
+### 2.5 Production database role separation and least-privilege model
+
+Database triggers (`publication_idempotency_immutability_trg`,
+`publication_idempotency_no_truncate_trg`, `publication_idempotency_outcome_complete_trg`)
+cannot protect against a PostgreSQL superuser or the owner of the table, because a table
+owner or superuser can execute `ALTER TABLE ... DISABLE TRIGGER`, `DROP TRIGGER`,
+`DROP TABLE`, or `SET session_replication_role = 'replica'`. A production deployment must
+therefore separate the migration/schema-owner role from the application runtime role.
+
+The role names below (`oracle_migrator` and `oracle_app`) are **illustrative** and must be
+configured with concrete role names and secrets during deployment:
+
+1. **Migration role (`oracle_migrator` — table and function owner)**:
+   - Created with `NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT`.
+   - Used exclusively by controlled migration jobs to create/alter tables, functions, and
+     triggers (`official_predictions`, `prediction_events`, `publication_idempotency_keys`).
+   - Never used by the HTTP/application service at runtime.
+2. **Application runtime role (`oracle_app` — least-privilege DML role)**:
+   - Created with `NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOBYPASSRLS`.
+   - Does **not** own any schema, table, function, or trigger, and therefore cannot execute
+     `ALTER TABLE`, `DROP TABLE`, `DROP TRIGGER`, `ALTER TABLE ... DISABLE TRIGGER`,
+     `CREATE OR REPLACE FUNCTION`, or `SET session_replication_role = 'replica'`.
+   - Receives **no** `TRUNCATE`, **no** `DELETE`, **no** `TRIGGER`, and **no** `REFERENCES`
+     privileges on any ledger table.
+   - Receives only `SELECT`, `INSERT`, and column-restricted `UPDATE (outcome)` on
+     `publication_idempotency_keys` (so even at the PostgreSQL privilege layer, `oracle_app`
+     cannot update `idempotency_key`, `request_digest`, or `recorded_at`), and only `SELECT`
+     and `INSERT` on `official_predictions` and `prediction_events`:
+
+```sql
+-- Illustrative role names; configure concrete role names and credentials during deployment.
+CREATE ROLE oracle_migrator NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT LOGIN;
+CREATE ROLE oracle_app NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOBYPASSRLS LOGIN;
+
+ALTER TABLE official_predictions OWNER TO oracle_migrator;
+ALTER TABLE prediction_events OWNER TO oracle_migrator;
+ALTER TABLE publication_idempotency_keys OWNER TO oracle_migrator;
+
+REVOKE ALL ON TABLE
+  official_predictions,
+  prediction_events,
+  publication_idempotency_keys
+FROM PUBLIC, oracle_app;
+
+-- Application runtime role may only read, insert reservations/outcomes, and
+-- update the outcome column during __pending__ -> final finalization;
+-- it has NO DELETE and NO TRUNCATE privilege.
+GRANT SELECT, INSERT, UPDATE (outcome)
+  ON TABLE publication_idempotency_keys
+  TO oracle_app;
+
+-- Official predictions and events are strictly append-only (SELECT, INSERT only).
+GRANT SELECT, INSERT
+  ON TABLE official_predictions, prediction_events
+  TO oracle_app;
+```
+
+> **Honest boundary of database triggers and role separation**: Combining
+> `publication_idempotency_immutability_trg`, `publication_idempotency_no_truncate_trg`,
+> `publication_idempotency_outcome_complete_trg`, and the non-owner `oracle_app` privilege
+> model prevents the application service from deleting, truncating, or mutating finalized
+> idempotency rows through both privilege checks and trigger enforcement. It does **not**
+> protect against a compromised database superuser or migration owner (`oracle_migrator`) who
+> holds DDL authority to disable triggers or rewrite storage directly; detecting privileged
+> storage rewrites requires external cryptographic anchoring / transparency logs (not
+> implemented in v0.1).
 
 ---
 

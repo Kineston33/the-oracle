@@ -1885,13 +1885,61 @@ describe('protocol v1.3 PostgreSQL transaction contract and retry semantics', ()
       'CREATE TRIGGER publication_idempotency_immutability_trg\n  BEFORE UPDATE OR DELETE ON publication_idempotency_keys\n  FOR EACH ROW\n  EXECUTE FUNCTION enforce_publication_idempotency_immutability();',
     );
 
-    // 5. Retains READ COMMITTED and ON CONFLICT unique-index arbitration
+    // 5. Enforces BEFORE TRUNCATE statement-level trigger on publication_idempotency_keys
+    expect(sqlBlocks).toContain(
+      'CREATE OR REPLACE FUNCTION enforce_publication_idempotency_no_truncate()',
+    );
+    expect(sqlBlocks).toContain(
+      "RAISE EXCEPTION\n    'TRUNCATE on % is forbidden',\n    TG_TABLE_NAME\n    USING ERRCODE = '23514';",
+    );
+    expect(sqlBlocks).toContain(
+      'CREATE TRIGGER publication_idempotency_no_truncate_trg\n  BEFORE TRUNCATE ON publication_idempotency_keys\n  FOR EACH STATEMENT\n  EXECUTE FUNCTION enforce_publication_idempotency_no_truncate();',
+    );
+    expect(sqlBlocks).toContain(
+      'CREATE TRIGGER official_predictions_no_truncate_trg\n  BEFORE TRUNCATE ON official_predictions\n  FOR EACH STATEMENT\n  EXECUTE FUNCTION enforce_publication_idempotency_no_truncate();',
+    );
+    expect(sqlBlocks).toContain(
+      'CREATE TRIGGER prediction_events_no_truncate_trg\n  BEFORE TRUNCATE ON prediction_events\n  FOR EACH STATEMENT\n  EXECUTE FUNCTION enforce_publication_idempotency_no_truncate();',
+    );
+    expect(contractDoc).toContain('TRUNCATE ... CASCADE');
+
+    // 6. Documents migration owner vs. application runtime role separation without DELETE/TRUNCATE privileges
+    expect(sqlBlocks).toContain(
+      'CREATE ROLE oracle_migrator NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT LOGIN;',
+    );
+    expect(sqlBlocks).toContain(
+      'CREATE ROLE oracle_app NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOBYPASSRLS LOGIN;',
+    );
+    expect(sqlBlocks).toContain(
+      'ALTER TABLE publication_idempotency_keys OWNER TO oracle_migrator;',
+    );
+    expect(sqlBlocks).toContain(
+      'REVOKE ALL ON TABLE\n  official_predictions,\n  prediction_events,\n  publication_idempotency_keys\nFROM PUBLIC, oracle_app;',
+    );
+    expect(sqlBlocks).toContain(
+      'GRANT SELECT, INSERT, UPDATE (outcome)\n  ON TABLE publication_idempotency_keys\n  TO oracle_app;',
+    );
+    expect(sqlBlocks).toContain(
+      'GRANT SELECT, INSERT\n  ON TABLE official_predictions, prediction_events\n  TO oracle_app;',
+    );
+    // Ensure no GRANT statement ever grants DELETE, TRUNCATE, TRIGGER, or ALTER to oracle_app
+    const grantStatements = Array.from(
+      sqlBlocks.matchAll(/GRANT\s+[\s\S]*?TO\s+oracle_app\s*;/gi),
+      (m) => m[0],
+    );
+    expect(grantStatements.length).toBe(2);
+    for (const grantSql of grantStatements) {
+      expect(grantSql).not.toMatch(/\b(DELETE|TRUNCATE|TRIGGER|REFERENCES|ALL)\b/i);
+    }
+    expect(contractDoc).toMatch(/cannot protect against a PostgreSQL superuser or the owner/i);
+
+    // 7. Retains READ COMMITTED and ON CONFLICT unique-index arbitration
     expect(sqlBlocks).toContain('BEGIN ISOLATION LEVEL READ COMMITTED;');
     expect(sqlBlocks).toContain('ON CONFLICT (idempotency_key) DO NOTHING');
     expect(sqlBlocks).toContain('ON CONFLICT (identity_digest) DO NOTHING');
   });
 
-  it('enforces the SQL trigger state-machine rules for pending reservation, immutability, column protection, DELETE prohibition, and commit rollback', () => {
+  it('simulates (in-memory TypeScript simulation, not real PostgreSQL execution) the SQL trigger state-machine rules for pending reservation, immutability, column protection, DELETE/TRUNCATE prohibition, and commit rollback', () => {
     interface IdempotencyRow {
       idempotency_key: string;
       request_digest: string;
@@ -1902,8 +1950,12 @@ describe('protocol v1.3 PostgreSQL transaction contract and retry semantics', ()
     const FINAL_KINDS = new Set(['created', 'existing', 'identity-conflict', 'rejected']);
     const VALID_SHAPE_KINDS = new Set(['__pending__', ...FINAL_KINDS]);
 
-    // Models the immediate CHECK constraint + BEFORE UPDATE OR DELETE trigger
-    // + DEFERRABLE INITIALLY DEFERRED AFTER INSERT OR UPDATE constraint trigger
+    // In-memory TypeScript simulation (not a live PostgreSQL instance) modeling:
+    // - immediate CHECK constraint (publication_idempotency_outcome_valid_shape)
+    // - BEFORE UPDATE OR DELETE row trigger (publication_idempotency_immutability_trg)
+    // - BEFORE TRUNCATE statement trigger (publication_idempotency_no_truncate_trg)
+    // - DEFERRABLE INITIALLY DEFERRED AFTER INSERT OR UPDATE constraint trigger
+    //   (publication_idempotency_outcome_complete_trg)
     class SimulatedPgIdempotencyTable {
       private committed = new Map<string, IdempotencyRow>();
       private working = new Map<string, IdempotencyRow>();
@@ -1988,6 +2040,17 @@ describe('protocol v1.3 PostgreSQL transaction contract and retry semantics', ()
         );
       }
 
+      truncate(): void {
+        // BEFORE TRUNCATE FOR EACH STATEMENT trigger:
+        // enforce_publication_idempotency_no_truncate()
+        throw new Error('23514: TRUNCATE on publication_idempotency_keys is forbidden');
+      }
+
+      truncateCascade(): void {
+        // Indirect TRUNCATE ... CASCADE is also blocked by BEFORE TRUNCATE FOR EACH STATEMENT
+        this.truncate();
+      }
+
       // Simulates a hypothetical bypass that removes a pending row before COMMIT
       // to verify that the deferred trigger's IF NOT FOUND branch aborts COMMIT.
       forceRemoveWorkingRowForTest(key: string): void {
@@ -2034,6 +2097,10 @@ describe('protocol v1.3 PostgreSQL transaction contract and retry semantics', ()
 
       getCommitted(key: string): IdempotencyRow | undefined {
         return this.committed.get(key);
+      }
+
+      get committedSize(): number {
+        return this.committed.size;
       }
     }
 
@@ -2140,6 +2207,23 @@ describe('protocol v1.3 PostgreSQL transaction contract and retry semantics', ()
     expect(table.getCommitted('k-valid')?.outcome).toEqual({
       kind: 'created',
       predictionId: 'pred-0001',
+    });
+
+    // Case 8: Direct TRUNCATE and TRUNCATE ... CASCADE are rejected with SQLSTATE 23514
+    // and leave finalized idempotency keys intact
+    table.begin();
+    expect(() => table.truncate()).toThrow(
+      /23514: TRUNCATE on publication_idempotency_keys is forbidden/,
+    );
+    expect(() => table.truncateCascade()).toThrow(
+      /23514: TRUNCATE on publication_idempotency_keys is forbidden/,
+    );
+    expect(table.committedSize).toBe(1);
+    expect(table.getCommitted('k-valid')).toEqual({
+      idempotency_key: 'k-valid',
+      request_digest: baseDigest,
+      outcome: { kind: 'created', predictionId: 'pred-0001' },
+      recorded_at: recordedAt,
     });
   });
 });
