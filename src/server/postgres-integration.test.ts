@@ -9,7 +9,8 @@
 
 import { spawn } from 'node:child_process';
 import { EventEmitter } from 'node:events';
-import { dirname, resolve } from 'node:path';
+import { readFileSync } from 'node:fs';
+import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import pg from 'pg';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
@@ -1743,6 +1744,244 @@ describe('Real PostgreSQL 16+ Integration Suite — Official Publication Protoco
       expect(res.status).toBe(200);
     } finally {
       await runningOnBranch.close();
+    }
+  });
+
+  it('15. never interpolates ORACLE_APP_PASSWORD into SQL statement text, enforces preflight logging safety before sending $1, and aborts fail-closed when logging or role permissions are unsafe', async () => {
+    // Spin up a dedicated fresh PostgreSQL 16 cluster so we test both:
+    // (a) initial creation of oracle_app from scratch as non-superuser neondb_owner, and
+    // (b) idempotent re-execution (password rotation) on existing oracle_app.
+    const isolatedCluster = await startEmbeddedPostgres16();
+    try {
+      const superClient = new pg.Client({
+        connectionString: isolatedCluster.adminConnectionString,
+      });
+      await superClient.connect();
+      try {
+        // Enable server-level DDL logging to prove the password never lands in postgres.log
+        await superClient.query("ALTER SYSTEM SET log_statement = 'ddl'");
+        await superClient.query('SELECT pg_reload_conf()');
+
+        await superClient.query(
+          'CREATE ROLE neon_superuser NOLOGIN CREATEDB CREATEROLE BYPASSRLS',
+        );
+        await superClient.query(
+          "CREATE ROLE neondb_owner LOGIN PASSWORD 'neondb_owner_iso_pw' CREATEDB CREATEROLE IN ROLE neon_superuser",
+        );
+        await superClient.query(
+          "CREATE ROLE unprivileged_migrator LOGIN PASSWORD 'unpriv_pw' NOSUPERUSER NOCREATEDB NOCREATEROLE",
+        );
+        await superClient.query(
+          "CREATE ROLE peer_createrole LOGIN PASSWORD 'peer_pw' NOSUPERUSER NOCREATEDB CREATEROLE",
+        );
+        await superClient.query(
+          'CREATE DATABASE neondb OWNER neondb_owner',
+        );
+      } finally {
+        await superClient.end();
+      }
+
+      const neondbOwnerUrl = new URL(isolatedCluster.adminConnectionString);
+      neondbOwnerUrl.username = 'neondb_owner';
+      neondbOwnerUrl.password = 'neondb_owner_iso_pw';
+      neondbOwnerUrl.pathname = '/neondb';
+
+      const initialCanaryPw = 'InitCanary_NoSqlLiteral_2026!#A';
+      const rotatedCanaryPw = 'RotateCanary_NoSqlLiteral_2026!#B';
+      const blockedCanaryPw = 'BlockedCanary_NeverSent_2026!#C';
+
+      // Intercept every SQL text and parameter array sent through pg.Client.prototype.query
+      const capturedQueries: Array<{ sql: string; values: unknown[] }> = [];
+      const originalQuery = pg.Client.prototype.query;
+      pg.Client.prototype.query = function patchedQuery(
+        this: pg.Client,
+        ...args: unknown[]
+      ) {
+        const first = args[0];
+        const second = args[1];
+        const sqlText =
+          typeof first === 'string'
+            ? first
+            : first &&
+                typeof first === 'object' &&
+                'text' in first &&
+                typeof (first as { text?: unknown }).text === 'string'
+              ? ((first as { text: string }).text ?? '')
+              : '';
+        const values = Array.isArray(second)
+          ? second
+          : first &&
+              typeof first === 'object' &&
+              'values' in first &&
+              Array.isArray((first as { values?: unknown }).values)
+            ? (first as { values: unknown[] }).values
+            : [];
+        capturedQueries.push({ sql: sqlText, values });
+        return (originalQuery as (...a: unknown[]) => unknown).apply(
+          this,
+          args,
+        );
+      } as typeof pg.Client.prototype.query;
+
+      try {
+        // 1. Initial creation of oracle_app (role does not exist yet on isolatedCluster)
+        const firstReport = await executeSafeMigrationRun({
+          migrationDatabaseUrl: neondbOwnerUrl.toString(),
+          oracleAppPassword: initialCanaryPw,
+        });
+        expect(firstReport.audit.compliant).toBe(true);
+        expect(firstReport.oracleApp.liveLoginVerified).toBe(true);
+
+        // Verify NO SQL statement text ever contained initialCanaryPw
+        for (const q of capturedQueries) {
+          expect(q.sql).not.toContain(initialCanaryPw);
+        }
+        // Verify initialCanaryPw was passed ONLY as a $1 bind parameter to pg_temp.oracle_provision_app_role
+        const paramQueries1 = capturedQueries.filter((q) =>
+          q.values.includes(initialCanaryPw),
+        );
+        expect(paramQueries1).toHaveLength(1);
+        expect(paramQueries1[0]!.sql).toBe(
+          'SELECT pg_temp.oracle_provision_app_role($1::text)',
+        );
+
+        // Verify the logging guard ran BEFORE the $1 parameter query was sent
+        const setConfigIdx = capturedQueries.findIndex((q) =>
+          q.sql.includes("set_config('log_parameter_max_length_on_error', '0', true)"),
+        );
+        const paramSendIdx = capturedQueries.findIndex((q) =>
+          q.values.includes(initialCanaryPw),
+        );
+        expect(setConfigIdx).toBeGreaterThanOrEqual(0);
+        expect(setConfigIdx).toBeLessThan(paramSendIdx);
+
+        // 2. Idempotent re-execution with rotated password
+        capturedQueries.length = 0;
+        const secondReport = await executeSafeMigrationRun({
+          migrationDatabaseUrl: neondbOwnerUrl.toString(),
+          oracleAppPassword: rotatedCanaryPw,
+        });
+        expect(secondReport.audit.compliant).toBe(true);
+        expect(secondReport.oracleApp.liveLoginVerified).toBe(true);
+
+        for (const q of capturedQueries) {
+          expect(q.sql).not.toContain(rotatedCanaryPw);
+        }
+        const paramQueries2 = capturedQueries.filter((q) =>
+          q.values.includes(rotatedCanaryPw),
+        );
+        expect(paramQueries2).toHaveLength(1);
+        expect(paramQueries2[0]!.sql).toBe(
+          'SELECT pg_temp.oracle_provision_app_role($1::text)',
+        );
+
+        // 3. Fail-closed BEFORE sending password when role lacks CREATEROLE
+        capturedQueries.length = 0;
+        const unprivUrl = new URL(neondbOwnerUrl.toString());
+        unprivUrl.username = 'unprivileged_migrator';
+        unprivUrl.password = 'unpriv_pw';
+        await expect(
+          executeSafeMigrationRun({
+            migrationDatabaseUrl: unprivUrl.toString(),
+            oracleAppPassword: blockedCanaryPw,
+          }),
+        ).rejects.toThrow(
+          /lacks SUPERUSER and CREATEROLE privileges required to provision oracle_app; aborting before sending password/,
+        );
+        expect(
+          capturedQueries.some(
+            (q) =>
+              q.sql.includes(blockedCanaryPw) ||
+              q.values.includes(blockedCanaryPw),
+          ),
+        ).toBe(false);
+
+        // 4. Fail-closed BEFORE sending password when role has CREATEROLE but lacks ADMIN OPTION on existing oracle_app
+        capturedQueries.length = 0;
+        const peerUrl = new URL(neondbOwnerUrl.toString());
+        peerUrl.username = 'peer_createrole';
+        peerUrl.password = 'peer_pw';
+        await expect(
+          executeSafeMigrationRun({
+            migrationDatabaseUrl: peerUrl.toString(),
+            oracleAppPassword: blockedCanaryPw,
+          }),
+        ).rejects.toThrow(
+          /lacks ADMIN OPTION on existing role 'oracle_app'; aborting before sending password/,
+        );
+        expect(
+          capturedQueries.some(
+            (q) =>
+              q.sql.includes(blockedCanaryPw) ||
+              q.values.includes(blockedCanaryPw),
+          ),
+        ).toBe(false);
+
+        // 5. Fail-closed BEFORE sending password when server has log_statement = 'all'
+        //    and connected role is a non-superuser (cannot disable log_statement)
+        const superToggle = new pg.Client({
+          connectionString: isolatedCluster.adminConnectionString,
+        });
+        await superToggle.connect();
+        try {
+          await superToggle.query("ALTER SYSTEM SET log_statement = 'all'");
+          await superToggle.query('SELECT pg_reload_conf()');
+        } finally {
+          await superToggle.end();
+        }
+
+        capturedQueries.length = 0;
+        await expect(
+          executeSafeMigrationRun({
+            migrationDatabaseUrl: neondbOwnerUrl.toString(),
+            oracleAppPassword: blockedCanaryPw,
+          }),
+        ).rejects.toThrow(
+          /Cannot guarantee password-safe logging for non-superuser role 'neondb_owner'/,
+        );
+        // Verify blockedCanaryPw was NEVER sent over the wire (neither in SQL nor in bind values)
+        expect(
+          capturedQueries.some(
+            (q) =>
+              q.sql.includes(blockedCanaryPw) ||
+              q.values.includes(blockedCanaryPw),
+          ),
+        ).toBe(false);
+
+        // 6. When connected as superuser even with server log_statement = 'all',
+        //    provisionOracleAppPasswordSafely disables log_statement in a standalone query
+        //    BEFORE sending $1, so the password never appears in SQL text or postgres.log
+        capturedQueries.length = 0;
+        const superMigrateUrl = new URL(isolatedCluster.adminConnectionString);
+        superMigrateUrl.pathname = '/neondb';
+        const superCanaryPw = 'SuperCanary_SafeEvenWithAll_2026!#D';
+        const superReport = await executeSafeMigrationRun({
+          migrationDatabaseUrl: superMigrateUrl.toString(),
+          oracleAppPassword: superCanaryPw,
+        });
+        expect(superReport.audit.compliant).toBe(true);
+        expect(superReport.oracleApp.liveLoginVerified).toBe(true);
+        for (const q of capturedQueries) {
+          expect(q.sql).not.toContain(superCanaryPw);
+        }
+
+        // 7. Inspect the real PostgreSQL 16 server log file on disk and verify ZERO canary passwords leaked
+        const pgServerLog = readFileSync(
+          join(dirname(isolatedCluster.dataDir), 'postgres.log'),
+          'utf8',
+        );
+        expect(pgServerLog).toContain(
+          'CREATE OR REPLACE FUNCTION pg_temp.oracle_provision_app_role',
+        );
+        expect(pgServerLog).not.toContain(initialCanaryPw);
+        expect(pgServerLog).not.toContain(rotatedCanaryPw);
+        expect(pgServerLog).not.toContain(blockedCanaryPw);
+        expect(pgServerLog).not.toContain(superCanaryPw);
+      } finally {
+        pg.Client.prototype.query = originalQuery;
+      }
+    } finally {
+      await isolatedCluster.stop();
     }
   });
 });

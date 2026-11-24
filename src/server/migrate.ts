@@ -162,60 +162,248 @@ function isPool(db: Pool | ClientBase): db is Pool {
   );
 }
 
-async function applyMigrationStatementsOnClient(
+interface LoggingAndRoleSafetyProbeRow {
+  current_user: string;
+  is_superuser: boolean;
+  can_createrole: boolean;
+  oracle_app_exists: boolean;
+  has_admin_on_oracle_app: boolean;
+  log_statement: string;
+  log_min_duration_statement: number;
+  log_parameter_max_length: number;
+  log_parameter_max_length_on_error: number;
+}
+
+interface EffectiveLoggingPostureRow {
+  log_statement: string;
+  log_min_duration_statement: number;
+  log_parameter_max_length: number;
+  log_parameter_max_length_on_error: number;
+}
+
+/**
+ * Provision or update `oracle_app` with `oracleAppPassword` without ever
+ * interpolating the password literal into any SQL statement string.
+ *
+ * Security invariants enforced before any bind parameter carrying the password
+ * is transmitted to PostgreSQL:
+ *   1. Validates `oracleAppPassword` locally (non-empty, no NUL bytes).
+ *   2. Verifies in `pg_catalog` that `CURRENT_USER` holds `SUPERUSER` or `CREATEROLE`
+ *      (and `ADMIN OPTION` on `oracle_app` if `oracle_app` already exists).
+ *   3. Sets `log_parameter_max_length_on_error = '0'` (and, when `rolsuper` is true,
+ *      `log_statement = 'none'`, `log_min_duration_statement = '-1'`,
+ *      `log_min_error_statement = 'panic'`, `log_parameter_max_length = '0'`)
+ *      in standalone statements before the password is sent, without swallowing errors.
+ *   4. Verifies the effective session logging configuration and aborts fail-closed
+ *      if statement/parameter logging cannot be guaranteed safe.
+ *   5. Passes the password exclusively as a `$1` bind parameter to a `SELECT` call
+ *      (`SELECT pg_temp.oracle_provision_app_role($1::text)`), never in SQL text.
+ */
+async function provisionOracleAppPasswordSafely(
   client: ClientBase,
-  options?: MigrationOptions,
+  oracleAppPassword: string,
 ): Promise<void> {
-  if (options?.oracleAppPassword !== undefined) {
-    if (
-      options.oracleAppPassword.trim().length === 0 ||
-      options.oracleAppPassword.includes('\0')
-    ) {
-      throw new MigrationTargetSecurityError([
-        'ORACLE_APP_PASSWORD must be a non-empty string without NUL characters',
-      ]);
-    }
-    const escaped = options.oracleAppPassword.replace(/'/g, "''");
-    // Provision or update oracle_app with its password before running 0001_oracle_ledger_v1_10.sql
-    // so managed PostgreSQL providers (such as Neon) that enforce a password on CREATE ROLE ... LOGIN
-    // receive the password at role creation time.
+  if (
+    oracleAppPassword.trim().length === 0 ||
+    oracleAppPassword.includes('\0')
+  ) {
+    throw new MigrationTargetSecurityError([
+      'ORACLE_APP_PASSWORD must be a non-empty string without NUL characters',
+    ]);
+  }
+
+  const preflightRes = await client.query<LoggingAndRoleSafetyProbeRow>(`
+    SELECT
+      CURRENT_USER::text AS current_user,
+      COALESCE(r.rolsuper, FALSE) AS is_superuser,
+      COALESCE(r.rolcreaterole, FALSE) AS can_createrole,
+      EXISTS (
+        SELECT 1 FROM pg_catalog.pg_roles WHERE rolname = 'oracle_app'
+      ) AS oracle_app_exists,
+      EXISTS (
+        SELECT 1
+          FROM pg_catalog.pg_auth_members AS m
+          JOIN pg_catalog.pg_roles AS target_r ON target_r.oid = m.roleid
+          JOIN pg_catalog.pg_roles AS admin_r ON admin_r.oid = m.member
+         WHERE target_r.rolname = 'oracle_app'
+           AND m.admin_option = TRUE
+           AND pg_catalog.pg_has_role(CURRENT_USER, admin_r.oid, 'USAGE')
+      ) AS has_admin_on_oracle_app,
+      pg_catalog.current_setting('log_statement') AS log_statement,
+      pg_catalog.current_setting('log_min_duration_statement')::integer AS log_min_duration_statement,
+      pg_catalog.current_setting('log_parameter_max_length')::integer AS log_parameter_max_length,
+      pg_catalog.current_setting('log_parameter_max_length_on_error')::integer AS log_parameter_max_length_on_error
+    FROM pg_catalog.pg_roles AS r
+    WHERE r.rolname = CURRENT_USER
+  `);
+
+  const preflight = preflightRes.rows[0];
+  if (!preflight) {
+    throw new MigrationTargetSecurityError([
+      'Unable to inspect current role and logging configuration before provisioning oracle_app password',
+    ]);
+  }
+
+  if (!preflight.is_superuser && !preflight.can_createrole) {
+    throw new MigrationTargetSecurityError([
+      `Migration role '${preflight.current_user}' lacks SUPERUSER and CREATEROLE privileges required to provision oracle_app; aborting before sending password`,
+    ]);
+  }
+
+  if (
+    preflight.oracle_app_exists &&
+    !preflight.is_superuser &&
+    !preflight.has_admin_on_oracle_app
+  ) {
+    throw new MigrationTargetSecurityError([
+      `Migration role '${preflight.current_user}' lacks ADMIN OPTION on existing role 'oracle_app'; aborting before sending password`,
+    ]);
+  }
+
+  // Always enforce user-context bind parameter error redaction before sending $1.
+  // Never ignore errors.
+  await client.query(
+    "SELECT pg_catalog.set_config('log_parameter_max_length_on_error', '0', true)",
+  );
+
+  if (preflight.is_superuser) {
     await client.query(`
-      DO $pwd$
-      DECLARE
-        v_is_superuser BOOLEAN;
+      SELECT
+        pg_catalog.set_config('log_statement', 'none', true),
+        pg_catalog.set_config('log_min_duration_statement', '-1', true),
+        pg_catalog.set_config('log_min_error_statement', 'panic', true),
+        pg_catalog.set_config('log_parameter_max_length', '0', true)
+    `);
+  } else {
+    const initialLogStmt = preflight.log_statement.trim().toLowerCase();
+    const durationLogsParams =
+      Number(preflight.log_min_duration_statement) >= 0 &&
+      Number(preflight.log_parameter_max_length) !== 0;
+
+    if (initialLogStmt === 'all' || durationLogsParams) {
+      // Do not silently ignore permission errors: attempt to disable and fail closed if denied.
+      try {
+        await client.query(`
+          SELECT
+            pg_catalog.set_config('log_statement', 'none', true),
+            pg_catalog.set_config('log_min_duration_statement', '-1', true),
+            pg_catalog.set_config('log_parameter_max_length', '0', true)
+        `);
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        throw new MigrationTargetSecurityError([
+          `Cannot guarantee password-safe logging for non-superuser role '${preflight.current_user}' (log_statement='${preflight.log_statement}', log_min_duration_statement=${preflight.log_min_duration_statement}, log_parameter_max_length=${preflight.log_parameter_max_length}): ${msg}`,
+        ]);
+      }
+    }
+  }
+
+  const verifyLoggingRes = await client.query<EffectiveLoggingPostureRow>(`
+    SELECT
+      pg_catalog.current_setting('log_statement') AS log_statement,
+      pg_catalog.current_setting('log_min_duration_statement')::integer AS log_min_duration_statement,
+      pg_catalog.current_setting('log_parameter_max_length')::integer AS log_parameter_max_length,
+      pg_catalog.current_setting('log_parameter_max_length_on_error')::integer AS log_parameter_max_length_on_error
+  `);
+
+  const effectiveLogging = verifyLoggingRes.rows[0];
+  if (!effectiveLogging) {
+    throw new MigrationTargetSecurityError([
+      'Failed to verify effective PostgreSQL logging settings before sending oracle_app password',
+    ]);
+  }
+
+  const effectiveLogStatement = effectiveLogging.log_statement
+    .trim()
+    .toLowerCase();
+  const effectiveDuration = Number(effectiveLogging.log_min_duration_statement);
+  const effectiveParamMaxLen = Number(effectiveLogging.log_parameter_max_length);
+  const effectiveParamOnError = Number(
+    effectiveLogging.log_parameter_max_length_on_error,
+  );
+
+  if (effectiveParamOnError !== 0) {
+    throw new MigrationTargetSecurityError([
+      `Cannot guarantee password-safe logging: log_parameter_max_length_on_error is ${effectiveParamOnError} (expected 0); aborting before sending password`,
+    ]);
+  }
+
+  if (effectiveLogStatement === 'all') {
+    throw new MigrationTargetSecurityError([
+      "Cannot guarantee password-safe logging: server log_statement is 'all'; aborting before sending password",
+    ]);
+  }
+
+  if (effectiveDuration >= 0 && effectiveParamMaxLen !== 0) {
+    throw new MigrationTargetSecurityError([
+      `Cannot guarantee password-safe logging: log_min_duration_statement=${effectiveDuration} with log_parameter_max_length=${effectiveParamMaxLen}; aborting before sending password`,
+    ]);
+  }
+
+  await client.query(`
+    CREATE OR REPLACE FUNCTION pg_temp.oracle_provision_app_role(p_password TEXT)
+    RETURNS VOID
+    LANGUAGE plpgsql
+    AS $fn$
+    DECLARE
+      v_is_superuser BOOLEAN;
+      v_sqlstate TEXT;
+      v_message TEXT;
+    BEGIN
+      SELECT rolsuper INTO v_is_superuser
+        FROM pg_catalog.pg_roles
+       WHERE rolname = CURRENT_USER;
+
       BEGIN
-        BEGIN
-          PERFORM pg_catalog.set_config('log_statement', 'none', true);
-        EXCEPTION
-          WHEN insufficient_privilege THEN
-            NULL;
-        END;
-
-        SELECT rolsuper INTO v_is_superuser
-          FROM pg_catalog.pg_roles
-         WHERE rolname = CURRENT_USER;
-
         IF NOT EXISTS (SELECT 1 FROM pg_catalog.pg_roles WHERE rolname = 'oracle_app') THEN
           IF COALESCE(v_is_superuser, FALSE) THEN
             EXECUTE pg_catalog.format(
               'CREATE ROLE oracle_app NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOBYPASSRLS NOREPLICATION LOGIN PASSWORD %L',
-              '${escaped}'
+              p_password
             );
           ELSE
             EXECUTE pg_catalog.format(
               'CREATE ROLE oracle_app NOCREATEDB NOCREATEROLE NOINHERIT LOGIN PASSWORD %L',
-              '${escaped}'
+              p_password
             );
           END IF;
         ELSE
           EXECUTE pg_catalog.format(
             'ALTER ROLE oracle_app WITH LOGIN PASSWORD %L',
-            '${escaped}'
+            p_password
           );
         END IF;
+      EXCEPTION
+        WHEN OTHERS THEN
+          GET STACKED DIAGNOSTICS
+            v_sqlstate = RETURNED_SQLSTATE,
+            v_message = MESSAGE_TEXT;
+          IF p_password IS NOT NULL AND pg_catalog.length(p_password) > 0 THEN
+            v_message := pg_catalog.replace(v_message, p_password, '[REDACTED]');
+          END IF;
+          RAISE EXCEPTION 'Failed to provision oracle_app role password: %', v_message
+            USING ERRCODE = v_sqlstate;
       END;
-      $pwd$;
-    `);
+    END;
+    $fn$;
+  `);
+
+  await client.query(
+    'SELECT pg_temp.oracle_provision_app_role($1::text)',
+    [oracleAppPassword],
+  );
+
+  await client.query(
+    'DROP FUNCTION pg_temp.oracle_provision_app_role(TEXT)',
+  );
+}
+
+async function applyMigrationStatementsOnClient(
+  client: ClientBase,
+  options?: MigrationOptions,
+): Promise<void> {
+  if (options?.oracleAppPassword !== undefined) {
+    await provisionOracleAppPasswordSafely(client, options.oracleAppPassword);
   }
 
   const sql = loadMigrationSql();
