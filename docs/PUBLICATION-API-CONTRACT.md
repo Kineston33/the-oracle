@@ -1,9 +1,10 @@
-# THE ORACLE — Publication API & Storage Contract (v1.5)
+# THE ORACLE — Publication API & Storage Contract (v1.6)
 
 This document specifies the storage invariants, transaction boundaries, isolation-level
-requirements, `TRUNCATE` and privilege hardening, and read/write separation required to back
-**Official Publication Protocol v1.5** (`src/data/publication-types.ts` and
-`src/data/publication.ts`) with a persistent PostgreSQL database and HTTP service.
+requirements, `TRUNCATE` and privilege hardening, controlled `SECURITY DEFINER` database write
+boundary, and read/write separation required to back **Official Publication Protocol v1.6**
+(`src/data/publication-types.ts` and `src/data/publication.ts`) with a persistent PostgreSQL
+database and HTTP service.
 
 > **Status in this repository**: No HTTP server and no PostgreSQL database are shipped or
 > running in this repository/sandbox. `InMemoryRegistry` (`src/data/publication.ts`)
@@ -12,11 +13,12 @@ requirements, `TRUNCATE` and privilege hardening, and read/write separation requ
 > storage, and idempotency binding in one synchronous critical section with no `await`
 > points); it does **not** survive process restarts or coordinate across multiple OS
 > processes or nodes. Single-threaded `InMemoryRegistry` tests verify the domain state
-> machine and contract invariants, and the PostgreSQL DDL, trigger, privilege, and
-> transaction statements below are verified by static SQL contract inspection and in-memory
-> state-machine simulation tests rather than executed against a live PostgreSQL instance. A
-> production backend must implement the relational constraints, PL/pgSQL triggers, role
-> separation, and `READ COMMITTED` ACID transaction specified below.
+> machine and contract invariants, and the PostgreSQL DDL, trigger, `SECURITY DEFINER`
+> function, privilege, and transaction statements below are verified by static SQL contract
+> inspection and in-memory state-machine / privilege simulation tests rather than executed
+> against a live PostgreSQL instance. A production backend must implement the relational
+> constraints, PL/pgSQL triggers, `SECURITY DEFINER` write functions, role separation, and
+> `READ COMMITTED` ACID transaction specified below.
 
 ---
 
@@ -25,8 +27,8 @@ requirements, `TRUNCATE` and privilege hardening, and read/write separation requ
 Exploration, identity comparison, candidate evaluation, and archive/event retrieval are
 **read or non-publishing** operations. Official publication and terminal resolution are
 **write** commands against the official ledger. No read, exploration, or evaluation
-endpoint may ever call `commitPublication`, `claimIdentity`, or insert a row into
-`official_predictions`.
+endpoint may ever call `commitPublication`, `claimIdentity`, or invoke any database write
+function on `oracle_ledger`.
 
 ### 1.1 Read, exploration, and analysis operations (never mutate the official archive)
 
@@ -35,7 +37,7 @@ endpoint may ever call `commitPublication`, `claimIdentity`, or insert a row int
 | **Submit exploratory query** | `POST /v1/queries:explore` | `readQuestion` (`src/lib/question.ts`); stage remains `exploratory-query` | **No** — returns lexical reading and matching archive records; never creates a prediction |
 | **Match canonical proposition** | `POST /v1/identities:match` | `compareIdentities`, `identityDigest` (`src/data/canonical-identity.ts`), `registry.findByIdentity` | **No** — returns `IdentityMatch` (`equivalent` \| `distinct` \| `uncertain`) and any existing `predictionId` |
 | **Evaluate candidate** | `POST /v1/candidates:evaluate` | `evaluateCandidate(candidate, { publishedAt })`, `verdictIsComplete` (`src/data/publication.ts`) | **No** — returns `EvaluationVerdict` (all 11 `RequirementResult` items and `clarificationsRequired`) evaluated against the supplied or candidate timestamp |
-| **Retrieve official prediction** | `GET /v1/predictions/:id` (and `GET /v1/predictions`) | `PredictionRecord` (`src/data/types.ts`), `registry.findByIdentity` | **No** — read-only lookup by `predictionId` or `identityDigest` |
+| **Retrieve official prediction** | `GET /v1/predictions/:id` (and `GET /v1/predictions`) | `PredictionRecord` (`src/data/types.ts`), `registry.findByIdentity` | **No** — read-only `SELECT` lookup by `predictionId` or `identityDigest` |
 | **Retrieve public event history** | `GET /v1/predictions/:id/events` | `RecordEvent[]`, `eventChainProblems`, `publishedLinkProblems` (`src/data/validate.ts`) | **No** — returns the ordered append-only chain (`e0`, `e1`, …) with schema-2 envelopes and digests |
 
 ### 1.2 Candidate staging and official publication/event commands
@@ -43,36 +45,46 @@ endpoint may ever call `commitPublication`, `claimIdentity`, or insert a row int
 | Conceptual operation | Target endpoint | Domain contract / module | Mutates official archive? |
 | --- | --- | --- | --- |
 | **Create / advance candidate** | `POST /v1/candidates` (and `POST /v1/candidates/:id/advance`) | `CandidateProposition`, `advanceCandidate`, `qualifyCandidate` (`exploratory-query` → `candidate-proposition` → `identity-matching` → `evaluation` → `eligible-for-publication`) | **No** — writes only to draft candidate storage; `candidateId` never becomes a `PredictionId` |
-| **Publish official prediction** | `POST /v1/publications` | `publishCandidate(candidate, request, deps)` (`src/data/publication.ts`) | **Yes** — sole entry point permitted to call `registry.commitPublication` and seal `e0` (`published`) with `demo: false` |
-| **Append resolution event** | `POST /v1/predictions/:id/events` | `appendEvent(record, event)` (`src/data/events.ts`, `resolved` \| `annulled`) | **Appends event only** — inserts `e1` into `prediction_events`; never modifies `sealed_payload` or `probability` |
+| **Publish official prediction** | `POST /v1/publications` | `publishCandidate(candidate, request, deps)` (`src/data/publication.ts`) | **Yes** — sole entry point permitted to invoke `oracle_ledger.commit_official_publication` (or `oracle_ledger.record_rejected_or_conflict_idempotency` on steps 6–7 rejection) |
+| **Append resolution event** | `POST /v1/predictions/:id/events` | `appendEvent(record, event)` (`src/data/events.ts`, `resolved` \| `annulled`) | **Appends event only** — invokes `oracle_ledger.append_terminal_prediction_event` to insert `e1` into `oracle_ledger.prediction_events`; never modifies `sealed_payload` or `probability` |
 
 ---
 
-## 2. Mapping `PublicationRegistry` to PostgreSQL constraints and transactions
+## 2. Mapping `PublicationRegistry` to PostgreSQL constraints, triggers, and controlled `SECURITY DEFINER` write functions
 
 `PublicationRegistry` (`src/data/publication-types.ts`) defines five methods. In PostgreSQL,
-their correctness depends on:
+their correctness and write-boundary integrity depend on:
 
 1. `PRIMARY KEY` and `UNIQUE` constraints (`PRIMARY KEY (idempotency_key)` on
-   `publication_idempotency_keys` and `UNIQUE (identity_digest)` on `official_predictions`),
+   `oracle_ledger.publication_idempotency_keys` and `UNIQUE (identity_digest)` on
+   `oracle_ledger.official_predictions`),
 2. A non-null transaction-local reservation sentinel (`'{"kind":"__pending__"}'::jsonb`)
    paired with:
    - an immediate `CHECK` constraint (`publication_idempotency_outcome_valid_shape`),
-   - an immediate `BEFORE UPDATE OR DELETE` row trigger (`publication_idempotency_immutability_trg`)
-     that forbids `DELETE`, forbids any `UPDATE` on already-finalized rows, protects
-     `idempotency_key`, `request_digest`, and `recorded_at` from modification, and permits
-     only the transition `'__pending__' -> ('created' | 'existing' | 'identity-conflict' | 'rejected')`,
-   - an immediate `BEFORE TRUNCATE ... FOR EACH STATEMENT` trigger
-     (`publication_idempotency_no_truncate_trg`) that rejects `TRUNCATE` (including indirect
+   - an immediate `BEFORE INSERT OR UPDATE OR DELETE` row trigger
+     (`publication_idempotency_immutability_trg`) that forbids `DELETE`, forbids direct
+     `INSERT` of already-finalized `'created'` or `'existing'` rows (requiring them to pass
+     through the `'__pending__'` reservation transition and verify the existence of the
+     corresponding row in `oracle_ledger.official_predictions`), forbids any `UPDATE` on
+     already-finalized rows, protects `idempotency_key`, `request_digest`, and `recorded_at`
+     from modification, and permits only the transition
+     `'__pending__' -> ('created' | 'existing' | 'identity-conflict' | 'rejected')`,
+   - immediate `BEFORE UPDATE OR DELETE` row triggers (`official_predictions_append_only_trg`
+     and `prediction_events_append_only_trg`) that forbid any `UPDATE` or `DELETE` on
+     `oracle_ledger.official_predictions` and `oracle_ledger.prediction_events`,
+   - immediate `BEFORE TRUNCATE ... FOR EACH STATEMENT` triggers
+     (`publication_idempotency_no_truncate_trg`, `official_predictions_no_truncate_trg`, and
+     `prediction_events_no_truncate_trg`) that reject `TRUNCATE` (including indirect
      `TRUNCATE ... CASCADE`) with SQLSTATE `23514`, and
    - a `DEFERRABLE INITIALLY DEFERRED` `CONSTRAINT TRIGGER`
      (`publication_idempotency_outcome_complete_trg`) that validates the live row state at
      `COMMIT` and forces a rollback if the row disappeared (`NOT FOUND`) or remains
      `'__pending__'`,
-3. A single `READ COMMITTED` ACID transaction covering idempotency reservation, canonical
-   identity claiming, initial `e0` event insertion, and idempotency outcome finalization, and
-4. Strict database privilege separation between the migration/table-owner role and the
-   least-privilege application runtime role (§2.5).
+3. A single `READ COMMITTED` ACID transaction executed through narrowly scoped,
+   schema-qualified `SECURITY DEFINER` functions owned by `oracle_migrator`, and
+4. Complete removal of direct runtime table DML privileges (`INSERT`, `UPDATE`, `DELETE`,
+   `TRUNCATE`) from `oracle_app`, leaving `oracle_app` with only `SELECT` on ledger tables and
+   `EXECUTE` on the three approved `SECURITY DEFINER` write functions (§2.5).
 
 ### 2.1 PostgreSQL schema, immutability triggers, `TRUNCATE` protection, and deferred constraint trigger
 
@@ -81,19 +93,21 @@ their correctness depends on:
 > constraints, and on `CREATE CONSTRAINT TRIGGER`. A table `CHECK (...) DEFERRABLE INITIALLY DEFERRED`
 > clause is a syntax error in PostgreSQL, and an immediate `CHECK (outcome IS NOT NULL)`
 > would reject a `NULL` reservation `INSERT` before the transaction could arbitrate
-> `official_predictions`.
+> `oracle_ledger.official_predictions`.
 >
-> Instead, `publication_idempotency_keys.outcome` is declared `JSONB NOT NULL` with an
-> immediate `CHECK` constraint allowing the transaction-local sentinel
+> Instead, `oracle_ledger.publication_idempotency_keys.outcome` is declared `JSONB NOT NULL`
+> with an immediate `CHECK` constraint allowing the transaction-local sentinel
 > `'{"kind":"__pending__"}'::jsonb` during the reservation `INSERT`, an immediate
-> `BEFORE UPDATE OR DELETE` row trigger enforces one-way finalization and row immutability,
-> an immediate `BEFORE TRUNCATE ... FOR EACH STATEMENT` trigger blocks table truncation, and
-> a `DEFERRABLE INITIALLY DEFERRED` `CONSTRAINT TRIGGER` queries the live row state at
-> `COMMIT` time and aborts the transaction if the row disappeared (`NOT FOUND`) or if
+> `BEFORE INSERT OR UPDATE OR DELETE` row trigger enforces one-way finalization and row
+> immutability, an immediate `BEFORE TRUNCATE ... FOR EACH STATEMENT` trigger blocks table
+> truncation, and a `DEFERRABLE INITIALLY DEFERRED` `CONSTRAINT TRIGGER` queries the live row
+> state at `COMMIT` time and aborts the transaction if the row disappeared (`NOT FOUND`) or if
 > `outcome ->> 'kind'` is still `'__pending__'`.
 
 ```sql
-CREATE TABLE official_predictions (
+CREATE SCHEMA oracle_ledger AUTHORIZATION oracle_migrator;
+
+CREATE TABLE oracle_ledger.official_predictions (
   prediction_id   TEXT PRIMARY KEY,
   identity_digest CHAR(64) NOT NULL UNIQUE,
   sealed_payload  JSONB NOT NULL,
@@ -104,9 +118,9 @@ CREATE TABLE official_predictions (
     CHECK (recorded_at > published_at)
 );
 
-CREATE TABLE prediction_events (
-  prediction_id   TEXT NOT NULL REFERENCES official_predictions(prediction_id),
-  seq             TEXT NOT NULL,
+CREATE TABLE oracle_ledger.prediction_events (
+  prediction_id   TEXT NOT NULL REFERENCES oracle_ledger.official_predictions(prediction_id),
+  seq             TEXT NOT NULL CHECK (seq IN ('e0', 'e1')),
   kind            TEXT NOT NULL CHECK (kind IN ('published', 'resolved', 'annulled')),
   occurred_at     TIMESTAMPTZ NOT NULL,
   recorded_at     TIMESTAMPTZ NOT NULL,
@@ -115,16 +129,21 @@ CREATE TABLE prediction_events (
   prev_digest     CHAR(64),
   PRIMARY KEY (prediction_id, seq),
   CONSTRAINT prediction_events_recording_order
-    CHECK (recorded_at > occurred_at)
+    CHECK (recorded_at > occurred_at),
+  CONSTRAINT prediction_events_seq_kind_consistency
+    CHECK (
+      (seq = 'e0' AND kind = 'published' AND prev_digest IS NULL)
+      OR (seq = 'e1' AND kind IN ('resolved', 'annulled') AND prev_digest IS NOT NULL)
+    )
 );
 
-CREATE TABLE publication_idempotency_keys (
+CREATE TABLE oracle_ledger.publication_idempotency_keys (
   idempotency_key  TEXT PRIMARY KEY,
   request_digest   CHAR(64) NOT NULL,
   outcome          JSONB NOT NULL,
   recorded_at      TIMESTAMPTZ NOT NULL,
   CONSTRAINT publication_idempotency_outcome_valid_shape CHECK (
-    jsonb_typeof(outcome) = 'object'
+    pg_catalog.jsonb_typeof(outcome) = 'object'
     AND (outcome ->> 'kind') IN (
       '__pending__',
       'created',
@@ -135,16 +154,64 @@ CREATE TABLE publication_idempotency_keys (
   )
 );
 
-CREATE OR REPLACE FUNCTION enforce_publication_idempotency_immutability()
+CREATE OR REPLACE FUNCTION oracle_ledger.enforce_append_only_ledger_row()
 RETURNS TRIGGER
 LANGUAGE plpgsql
+SET search_path = pg_catalog, pg_temp
 AS $$
+BEGIN
+  RAISE EXCEPTION
+    '% on %.% is forbidden; official ledger rows are strictly append-only',
+    TG_OP,
+    TG_TABLE_SCHEMA,
+    TG_TABLE_NAME
+    USING ERRCODE = '23514';
+END;
+$$;
+
+CREATE TRIGGER official_predictions_append_only_trg
+  BEFORE UPDATE OR DELETE ON oracle_ledger.official_predictions
+  FOR EACH ROW
+  EXECUTE FUNCTION oracle_ledger.enforce_append_only_ledger_row();
+
+CREATE TRIGGER prediction_events_append_only_trg
+  BEFORE UPDATE OR DELETE ON oracle_ledger.prediction_events
+  FOR EACH ROW
+  EXECUTE FUNCTION oracle_ledger.enforce_append_only_ledger_row();
+
+CREATE OR REPLACE FUNCTION oracle_ledger.enforce_publication_idempotency_immutability()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+SET search_path = pg_catalog, pg_temp
+AS $$
+DECLARE
+  v_prediction_exists BOOLEAN;
 BEGIN
   IF TG_OP = 'DELETE' THEN
     RAISE EXCEPTION
       'DELETE on publication_idempotency_keys is forbidden (idempotency_key = %)',
       OLD.idempotency_key
       USING ERRCODE = '23514';
+  END IF;
+
+  IF TG_OP = 'INSERT' THEN
+    -- Direct insertion of 'created' or 'existing' outcomes is forbidden even for
+    -- table-owner code paths: a 'created' or 'existing' outcome may only be reached
+    -- by inserting '{"kind":"__pending__"}' first, arbitrating official_predictions,
+    -- and updating the pending reservation in the same transaction.
+    IF NEW.outcome IS NULL
+       OR pg_catalog.jsonb_typeof(NEW.outcome) <> 'object'
+       OR (NEW.outcome ->> 'kind') IS NULL
+       OR (NEW.outcome ->> 'kind') NOT IN ('__pending__', 'identity-conflict', 'rejected')
+    THEN
+      RAISE EXCEPTION
+        'publication_idempotency_keys row % cannot be inserted directly with outcome kind %; only __pending__, identity-conflict, or rejected may be inserted',
+        NEW.idempotency_key,
+        NEW.outcome ->> 'kind'
+        USING ERRCODE = '23514';
+    END IF;
+
+    RETURN NEW;
   END IF;
 
   IF TG_OP = 'UPDATE' THEN
@@ -171,7 +238,7 @@ BEGIN
 
     -- The only permitted UPDATE transition is '__pending__' -> valid final outcome.
     IF NEW.outcome IS NULL
-       OR jsonb_typeof(NEW.outcome) <> 'object'
+       OR pg_catalog.jsonb_typeof(NEW.outcome) <> 'object'
        OR (NEW.outcome ->> 'kind') IS NULL
        OR (NEW.outcome ->> 'kind') NOT IN (
          'created',
@@ -187,6 +254,26 @@ BEGIN
         USING ERRCODE = '23514';
     END IF;
 
+    -- When finalizing to 'created' or 'existing', verify that the referenced official
+    -- prediction actually exists in oracle_ledger.official_predictions.
+    IF (NEW.outcome ->> 'kind') IN ('created', 'existing') THEN
+      SELECT EXISTS (
+        SELECT 1
+          FROM oracle_ledger.official_predictions AS op
+         WHERE op.prediction_id = (NEW.outcome ->> 'predictionId')
+           AND op.identity_digest = (NEW.outcome ->> 'identityDigest')
+      )
+      INTO v_prediction_exists;
+
+      IF NOT COALESCE(v_prediction_exists, FALSE) THEN
+        RAISE EXCEPTION
+          'publication_idempotency_keys row % cannot finalize as % without a matching row in oracle_ledger.official_predictions',
+          OLD.idempotency_key,
+          NEW.outcome ->> 'kind'
+          USING ERRCODE = '23514';
+      END IF;
+    END IF;
+
     RETURN NEW;
   END IF;
 
@@ -195,13 +282,14 @@ END;
 $$;
 
 CREATE TRIGGER publication_idempotency_immutability_trg
-  BEFORE UPDATE OR DELETE ON publication_idempotency_keys
+  BEFORE INSERT OR UPDATE OR DELETE ON oracle_ledger.publication_idempotency_keys
   FOR EACH ROW
-  EXECUTE FUNCTION enforce_publication_idempotency_immutability();
+  EXECUTE FUNCTION oracle_ledger.enforce_publication_idempotency_immutability();
 
-CREATE OR REPLACE FUNCTION enforce_publication_idempotency_no_truncate()
+CREATE OR REPLACE FUNCTION oracle_ledger.enforce_publication_idempotency_no_truncate()
 RETURNS TRIGGER
 LANGUAGE plpgsql
+SET search_path = pg_catalog, pg_temp
 AS $$
 BEGIN
   RAISE EXCEPTION
@@ -212,23 +300,24 @@ END;
 $$;
 
 CREATE TRIGGER publication_idempotency_no_truncate_trg
-  BEFORE TRUNCATE ON publication_idempotency_keys
+  BEFORE TRUNCATE ON oracle_ledger.publication_idempotency_keys
   FOR EACH STATEMENT
-  EXECUTE FUNCTION enforce_publication_idempotency_no_truncate();
+  EXECUTE FUNCTION oracle_ledger.enforce_publication_idempotency_no_truncate();
 
 CREATE TRIGGER official_predictions_no_truncate_trg
-  BEFORE TRUNCATE ON official_predictions
+  BEFORE TRUNCATE ON oracle_ledger.official_predictions
   FOR EACH STATEMENT
-  EXECUTE FUNCTION enforce_publication_idempotency_no_truncate();
+  EXECUTE FUNCTION oracle_ledger.enforce_publication_idempotency_no_truncate();
 
 CREATE TRIGGER prediction_events_no_truncate_trg
-  BEFORE TRUNCATE ON prediction_events
+  BEFORE TRUNCATE ON oracle_ledger.prediction_events
   FOR EACH STATEMENT
-  EXECUTE FUNCTION enforce_publication_idempotency_no_truncate();
+  EXECUTE FUNCTION oracle_ledger.enforce_publication_idempotency_no_truncate();
 
-CREATE OR REPLACE FUNCTION enforce_publication_idempotency_outcome_complete()
+CREATE OR REPLACE FUNCTION oracle_ledger.enforce_publication_idempotency_outcome_complete()
 RETURNS TRIGGER
 LANGUAGE plpgsql
+SET search_path = pg_catalog, pg_temp
 AS $$
 DECLARE
   current_outcome JSONB;
@@ -239,7 +328,7 @@ BEGIN
   -- even when a subsequent UPDATE in the same transaction has finalized the row.
   SELECT outcome
     INTO current_outcome
-    FROM publication_idempotency_keys
+    FROM oracle_ledger.publication_idempotency_keys
    WHERE idempotency_key = NEW.idempotency_key;
 
   -- If the reservation row disappeared before COMMIT, abort the transaction.
@@ -251,7 +340,7 @@ BEGIN
   END IF;
 
   IF current_outcome IS NULL
-     OR jsonb_typeof(current_outcome) <> 'object'
+     OR pg_catalog.jsonb_typeof(current_outcome) <> 'object'
      OR (current_outcome ->> 'kind') IS NULL
      OR (current_outcome ->> 'kind') = '__pending__'
      OR (current_outcome ->> 'kind') NOT IN (
@@ -273,29 +362,34 @@ END;
 $$;
 
 CREATE CONSTRAINT TRIGGER publication_idempotency_outcome_complete_trg
-  AFTER INSERT OR UPDATE ON publication_idempotency_keys
+  AFTER INSERT OR UPDATE ON oracle_ledger.publication_idempotency_keys
   DEFERRABLE INITIALLY DEFERRED
   FOR EACH ROW
-  EXECUTE FUNCTION enforce_publication_idempotency_outcome_complete();
+  EXECUTE FUNCTION oracle_ledger.enforce_publication_idempotency_outcome_complete();
 ```
 
-#### How the two triggers enforce intra-transaction finalization and permanent immutability
+#### How the triggers enforce intra-transaction finalization, append-only ledger integrity, and permanent immutability
 
 1. **Compatible with `INSERT` followed by `UPDATE` in the same transaction**:
-   When a transaction executes `INSERT INTO publication_idempotency_keys ... VALUES ($1, $2, '{"kind":"__pending__"}'::jsonb, $3)`
-   and later in the same transaction executes `UPDATE publication_idempotency_keys SET outcome = $2 WHERE idempotency_key = $1`,
+   When `oracle_ledger.commit_official_publication` executes `INSERT INTO oracle_ledger.publication_idempotency_keys ... VALUES (..., '{"kind":"__pending__"}'::jsonb, ...)`
+   and later in the same transaction executes `UPDATE oracle_ledger.publication_idempotency_keys SET outcome = v_outcome WHERE idempotency_key = p_idempotency_key`,
    PostgreSQL queues two deferred trigger invocations for `COMMIT`: one for the `INSERT`
    (whose `NEW` record holds the `INSERT`-time snapshot with `NEW.outcome = '{"kind":"__pending__"}'`)
    and one for the `UPDATE` (whose `NEW` record holds the updated snapshot). Because
-   `enforce_publication_idempotency_outcome_complete()` executes
-   `SELECT outcome INTO current_outcome FROM publication_idempotency_keys WHERE idempotency_key = NEW.idempotency_key;`
+   `oracle_ledger.enforce_publication_idempotency_outcome_complete()` executes
+   `SELECT outcome INTO current_outcome FROM oracle_ledger.publication_idempotency_keys WHERE idempotency_key = NEW.idempotency_key;`
    at `COMMIT`, both queued invocations inspect the **live, post-`UPDATE` tuple** at the end
    of the transaction and succeed once `current_outcome ->> 'kind'` has been finalized to
    `'created'`, `'existing'`, `'identity-conflict'`, or `'rejected'`.
-2. **Exclusively `pending -> final` within the same transaction, and strictly immutable thereafter**:
-   - `publication_idempotency_immutability_trg` (`BEFORE UPDATE OR DELETE`) rejects any
-     `UPDATE` unless `(OLD.outcome ->> 'kind') = '__pending__'` and
-     `(NEW.outcome ->> 'kind') IN ('created', 'existing', 'identity-conflict', 'rejected')`.
+2. **Direct insertion of `'created'` or `'existing'` is forbidden; transition is exclusively `'__pending__' -> final` within the same transaction, and strictly immutable thereafter**:
+   - `publication_idempotency_immutability_trg` (`BEFORE INSERT OR UPDATE OR DELETE`) rejects
+     any `INSERT` whose `NEW.outcome ->> 'kind'` is `'created'` or `'existing'`; only
+     `'__pending__'`, `'identity-conflict'`, or `'rejected'` may be inserted.
+   - On `UPDATE`, `publication_idempotency_immutability_trg` rejects any row unless
+     `(OLD.outcome ->> 'kind') = '__pending__'` and
+     `(NEW.outcome ->> 'kind') IN ('created', 'existing', 'identity-conflict', 'rejected')`,
+     and when finalizing to `'created'` or `'existing'` it verifies that the referenced
+     `(predictionId, identityDigest)` exists in `oracle_ledger.official_predictions`.
    - During that single allowed transition (`'__pending__' -> final`), `NEW.idempotency_key`,
      `NEW.request_digest`, and `NEW.recorded_at` must remain identical to `OLD`
      (`IS NOT DISTINCT FROM`), so neither the key, the bound request digest, nor the
@@ -309,26 +403,29 @@ CREATE CONSTRAINT TRIGGER publication_idempotency_outcome_complete_trg
      immediately rejected because `(OLD.outcome ->> 'kind') IS DISTINCT FROM '__pending__'`.
 3. **`DELETE` and `TRUNCATE` (including `TRUNCATE ... CASCADE`) are forbidden, and disappearing reservations force a rollback**:
    - `publication_idempotency_immutability_trg` (`BEFORE DELETE ... FOR EACH ROW`)
-     unconditionally rejects row-level `DELETE` on `publication_idempotency_keys`
-     (`ERRCODE = '23514'`), preventing deletion of consumed keys or pending reservations.
+     unconditionally rejects row-level `DELETE` on `oracle_ledger.publication_idempotency_keys`
+     (`ERRCODE = '23514'`), and `official_predictions_append_only_trg` /
+     `prediction_events_append_only_trg` unconditionally reject any `UPDATE` or `DELETE` on
+     `oracle_ledger.official_predictions` and `oracle_ledger.prediction_events`.
    - Because PostgreSQL `TRUNCATE` bypasses `FOR EACH ROW` `BEFORE DELETE` triggers,
-     `publication_idempotency_no_truncate_trg` (`BEFORE TRUNCATE ON publication_idempotency_keys FOR EACH STATEMENT`)
-     invokes `enforce_publication_idempotency_no_truncate()` and unconditionally raises
-     SQLSTATE `23514` (`check_violation`) before any truncation can occur.
+     `publication_idempotency_no_truncate_trg` (`BEFORE TRUNCATE ON oracle_ledger.publication_idempotency_keys FOR EACH STATEMENT`)
+     invokes `oracle_ledger.enforce_publication_idempotency_no_truncate()` and unconditionally
+     raises SQLSTATE `23514` (`check_violation`) before any truncation can occur.
    - **Protection against indirect `TRUNCATE ... CASCADE`**:
-     1. `publication_idempotency_keys` defines **no** `FOREIGN KEY` (`REFERENCES`) to
-        `official_predictions`, `prediction_events`, or any other table — and must never add
-        a foreign key referencing another table — so `TRUNCATE <other_table> CASCADE` can
-        never propagate to `publication_idempotency_keys`.
+     1. `oracle_ledger.publication_idempotency_keys` defines **no** `FOREIGN KEY`
+        (`REFERENCES`) to `oracle_ledger.official_predictions`,
+        `oracle_ledger.prediction_events`, or any other table — and must never add a foreign
+        key referencing another table — so `TRUNCATE <other_table> CASCADE` can never
+        propagate to `oracle_ledger.publication_idempotency_keys`.
      2. In PostgreSQL, when `TRUNCATE ... CASCADE` expands to dependent tables, PostgreSQL
         fires `BEFORE TRUNCATE ... FOR EACH STATEMENT` triggers on every affected table in
         the cascade; furthermore, `official_predictions_no_truncate_trg` and
         `prediction_events_no_truncate_trg` forbid `TRUNCATE` on the prediction and event
         tables as well.
    - As defense-in-depth, if a pending reservation row ever disappeared before `COMMIT`,
-     `enforce_publication_idempotency_outcome_complete()` detects `IF NOT FOUND` at `COMMIT`
-     and raises `ERRCODE = '23514'`, aborting the transaction and rolling back any writes to
-     `official_predictions` or `prediction_events`.
+     `oracle_ledger.enforce_publication_idempotency_outcome_complete()` detects `IF NOT FOUND`
+     at `COMMIT` and raises `ERRCODE = '23514'`, aborting the transaction and rolling back
+     any writes to `oracle_ledger.official_predictions` or `oracle_ledger.prediction_events`.
 4. **Why the `'{"kind":"__pending__"}'` sentinel can never be committed or mistaken for a replayable outcome**:
    - **Never committed**: If a transaction inserts `'{"kind":"__pending__"}'` and reaches
      `COMMIT` without updating `outcome` to one of the four final kinds,
@@ -344,17 +441,476 @@ CREATE CONSTRAINT TRIGGER publication_idempotency_outcome_complete_trg
      post-conflict `SELECT`) explicitly requires
      `(outcome ->> 'kind') IN ('created', 'existing', 'identity-conflict', 'rejected')`.
 
-### 2.2 Registry method mapping
+---
+
+### 2.2 Controlled `SECURITY DEFINER` database write operations
+
+Because the application runtime role (`oracle_app`) has **no** direct `INSERT`, `UPDATE`,
+`DELETE`, or `TRUNCATE` privileges on any table in `oracle_ledger`, all ledger writes must
+pass through three narrowly scoped `SECURITY DEFINER` PL/pgSQL functions owned by
+`oracle_migrator`:
+
+| Approved function in `oracle_ledger` | Purpose | Tables written | Executable by `oracle_app`? |
+| --- | --- | --- | --- |
+| `oracle_ledger.commit_official_publication(...)` | Atomic publication under `READ COMMITTED`: reserves `idempotency_key` with `'{"kind":"__pending__"}'::jsonb`, arbitrates `identity_digest` in `official_predictions`, inserts initial `e0` (`published`) event into `prediction_events` when `created`, and finalizes `publication_idempotency_keys.outcome` to `'created'` or `'existing'`. | `publication_idempotency_keys`, `official_predictions`, `prediction_events` | **Yes** (`GRANT EXECUTE`) |
+| `oracle_ledger.record_rejected_or_conflict_idempotency(...)` | Records a domain validation rejection (`kind = 'rejected'`) or unresolved identity conflict (`kind = 'identity-conflict'`) in `publication_idempotency_keys` (steps 6–7 of `publishCandidate`) without touching `official_predictions` or `prediction_events`. Rejects `'created'`, `'existing'`, or `'__pending__'` outcomes. | `publication_idempotency_keys` only | **Yes** (`GRANT EXECUTE`) |
+| `oracle_ledger.append_terminal_prediction_event(...)` | Appends the single permitted terminal resolution or annulment event (`seq = 'e1'`, `kind IN ('resolved', 'annulled')`) to `prediction_events` after verifying `e0` digest linkage (`prev_digest = e0.digest`), timestamp monotonicity, and absence of any prior `e1` event. Never modifies `official_predictions`. | `prediction_events` only | **Yes** (`GRANT EXECUTE`) |
+
+#### Security properties enforced on every `SECURITY DEFINER` function
+
+1. **Explicit, fixed `search_path` excluding user/attacker schemas**:
+   Every function specifies `SET search_path = pg_catalog, pg_temp` in its DDL header, so
+   unqualified built-in types and operators resolve strictly against `pg_catalog` and no
+   session `search_path` manipulation can shadow functions, operators, or tables.
+2. **Fully qualified object references**:
+   Every table (`oracle_ledger.official_predictions`, `oracle_ledger.prediction_events`,
+   `oracle_ledger.publication_idempotency_keys`) and built-in function (`pg_catalog.jsonb_typeof`,
+   `pg_catalog.jsonb_build_object`, `pg_catalog.length`, `pg_catalog.btrim`) is explicitly
+   schema-qualified.
+3. **Non-superuser, non-application owner (`oracle_migrator`)**:
+   Every function is owned by `oracle_migrator` (`NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOLOGIN`).
+   Because `oracle_migrator` is **not** a superuser, all table `CHECK` constraints, `UNIQUE`
+   constraints, `FOREIGN KEY` constraints, `BEFORE` row/statement triggers, and `DEFERRABLE`
+   constraint triggers still fire normally when the `SECURITY DEFINER` functions execute.
+4. **Zero dynamic SQL (`EXECUTE`)**:
+   None of the functions uses dynamic SQL (`EXECUTE <string>`); every statement is static,
+   compile-time bound PL/pgSQL using typed parameters.
+5. **Up-front argument validation**:
+   Each function validates its parameters (non-null, non-empty strings, 64-character lowercase
+   hex SHA-256 digests, valid JSONB object shapes, timestamp ordering, and allowed `kind` /
+   `seq` values) before touching any table, raising SQLSTATE `22023` (`invalid_parameter_value`)
+   or `23514` (`check_violation`) on invalid input.
+
+```sql
+-- 1. Atomic publication entry point (Step 9 of publishCandidate)
+CREATE OR REPLACE FUNCTION oracle_ledger.commit_official_publication(
+  p_idempotency_key TEXT,
+  p_request_digest  CHAR(64),
+  p_prediction_id   TEXT,
+  p_identity_digest CHAR(64),
+  p_sealed_payload  JSONB,
+  p_payload_digest  CHAR(64),
+  p_published_at    TIMESTAMPTZ,
+  p_recorded_at     TIMESTAMPTZ,
+  p_e0_envelope     JSONB,
+  p_e0_digest       CHAR(64)
+)
+RETURNS JSONB
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, pg_temp
+AS $$
+DECLARE
+  v_reserved_key            TEXT;
+  v_existing_request_digest CHAR(64);
+  v_existing_outcome        JSONB;
+  v_claimed_prediction_id   TEXT;
+  v_winner_id               TEXT;
+  v_winner_payload          JSONB;
+  v_outcome                 JSONB;
+  v_status                  TEXT;
+BEGIN
+  IF p_idempotency_key IS NULL OR pg_catalog.length(pg_catalog.btrim(p_idempotency_key)) = 0 THEN
+    RAISE EXCEPTION 'p_idempotency_key must be non-empty'
+      USING ERRCODE = '22023';
+  END IF;
+
+  IF p_prediction_id IS NULL OR pg_catalog.length(pg_catalog.btrim(p_prediction_id)) = 0 THEN
+    RAISE EXCEPTION 'p_prediction_id must be non-empty'
+      USING ERRCODE = '22023';
+  END IF;
+
+  IF p_request_digest IS NULL OR p_request_digest !~ '^[0-9a-f]{64}$'
+     OR p_identity_digest IS NULL OR p_identity_digest !~ '^[0-9a-f]{64}$'
+     OR p_payload_digest IS NULL OR p_payload_digest !~ '^[0-9a-f]{64}$'
+     OR p_e0_digest IS NULL OR p_e0_digest !~ '^[0-9a-f]{64}$'
+  THEN
+    RAISE EXCEPTION 'all digest arguments must be 64-character lowercase hex SHA-256 strings'
+      USING ERRCODE = '22023';
+  END IF;
+
+  IF p_published_at IS NULL OR p_recorded_at IS NULL OR p_recorded_at <= p_published_at THEN
+    RAISE EXCEPTION 'p_recorded_at (%) must be strictly greater than p_published_at (%)',
+      p_recorded_at, p_published_at
+      USING ERRCODE = '23514';
+  END IF;
+
+  IF p_sealed_payload IS NULL
+     OR pg_catalog.jsonb_typeof(p_sealed_payload) <> 'object'
+     OR (p_sealed_payload ->> 'id') IS DISTINCT FROM p_prediction_id
+     OR COALESCE((p_sealed_payload ->> 'demo')::boolean, TRUE) IS NOT FALSE
+  THEN
+    RAISE EXCEPTION 'p_sealed_payload must be a non-demo official PredictionRecord object matching p_prediction_id'
+      USING ERRCODE = '23514';
+  END IF;
+
+  IF p_e0_envelope IS NULL OR pg_catalog.jsonb_typeof(p_e0_envelope) <> 'object' THEN
+    RAISE EXCEPTION 'p_e0_envelope must be a JSON object'
+      USING ERRCODE = '22023';
+  END IF;
+
+  -- Step 1: Reserve the idempotency key with the transaction-local '__pending__' sentinel
+  INSERT INTO oracle_ledger.publication_idempotency_keys (
+    idempotency_key,
+    request_digest,
+    outcome,
+    recorded_at
+  )
+  VALUES (
+    p_idempotency_key,
+    p_request_digest,
+    '{"kind":"__pending__"}'::jsonb,
+    p_recorded_at
+  )
+  ON CONFLICT (idempotency_key) DO NOTHING
+  RETURNING idempotency_key INTO v_reserved_key;
+
+  IF NOT FOUND THEN
+    -- Key was already committed by an earlier or concurrent transaction;
+    -- read the committed row in a fresh READ COMMITTED statement snapshot.
+    SELECT pik.request_digest, pik.outcome
+      INTO v_existing_request_digest, v_existing_outcome
+      FROM oracle_ledger.publication_idempotency_keys AS pik
+     WHERE pik.idempotency_key = p_idempotency_key
+       AND (pik.outcome ->> 'kind') IN ('created', 'existing', 'identity-conflict', 'rejected');
+
+    IF NOT FOUND THEN
+      RAISE EXCEPTION 'publication_idempotency_keys row % not found after conflict',
+        p_idempotency_key
+        USING ERRCODE = '23514';
+    END IF;
+
+    IF v_existing_request_digest = p_request_digest THEN
+      RETURN pg_catalog.jsonb_build_object(
+        'status', 'replayed',
+        'original', v_existing_outcome
+      );
+    ELSE
+      RETURN pg_catalog.jsonb_build_object(
+        'status', 'idempotency-conflict',
+        'existingRequestDigest', v_existing_request_digest,
+        'incomingRequestDigest', p_request_digest
+      );
+    END IF;
+  END IF;
+
+  -- Step 2: Claim canonical identity or observe the committed winner
+  INSERT INTO oracle_ledger.official_predictions (
+    prediction_id,
+    identity_digest,
+    sealed_payload,
+    payload_digest,
+    published_at,
+    recorded_at
+  )
+  VALUES (
+    p_prediction_id,
+    p_identity_digest,
+    p_sealed_payload,
+    p_payload_digest,
+    p_published_at,
+    p_recorded_at
+  )
+  ON CONFLICT (identity_digest) DO NOTHING
+  RETURNING prediction_id INTO v_claimed_prediction_id;
+
+  IF FOUND THEN
+    INSERT INTO oracle_ledger.prediction_events (
+      prediction_id,
+      seq,
+      kind,
+      occurred_at,
+      recorded_at,
+      envelope,
+      digest,
+      prev_digest
+    )
+    VALUES (
+      p_prediction_id,
+      'e0',
+      'published',
+      p_published_at,
+      p_recorded_at,
+      p_e0_envelope,
+      p_e0_digest,
+      NULL
+    );
+
+    v_status := 'created';
+    v_outcome := pg_catalog.jsonb_build_object(
+      'kind', 'created',
+      'predictionId', p_prediction_id,
+      'identityDigest', p_identity_digest,
+      'requestDigest', p_request_digest,
+      'record', p_sealed_payload
+    );
+  ELSE
+    SELECT op.prediction_id, op.sealed_payload
+      INTO v_winner_id, v_winner_payload
+      FROM oracle_ledger.official_predictions AS op
+     WHERE op.identity_digest = p_identity_digest;
+
+    IF NOT FOUND THEN
+      RAISE EXCEPTION 'official_predictions winner for identity_digest % not found after conflict',
+        p_identity_digest
+        USING ERRCODE = '23514';
+    END IF;
+
+    v_status := 'existing';
+    v_outcome := pg_catalog.jsonb_build_object(
+      'kind', 'existing',
+      'predictionId', v_winner_id,
+      'identityDigest', p_identity_digest,
+      'requestDigest', p_request_digest,
+      'record', v_winner_payload
+    );
+  END IF;
+
+  -- Step 3: Finalize the reserved idempotency row in the same transaction
+  UPDATE oracle_ledger.publication_idempotency_keys
+     SET outcome = v_outcome
+   WHERE idempotency_key = p_idempotency_key;
+
+  RETURN pg_catalog.jsonb_build_object(
+    'status', v_status,
+    'outcome', v_outcome
+  );
+END;
+$$;
+
+-- 2. Controlled idempotency recording for rejected or identity-conflict outcomes (Steps 6-7)
+CREATE OR REPLACE FUNCTION oracle_ledger.record_rejected_or_conflict_idempotency(
+  p_idempotency_key TEXT,
+  p_request_digest  CHAR(64),
+  p_outcome         JSONB,
+  p_recorded_at     TIMESTAMPTZ
+)
+RETURNS JSONB
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, pg_temp
+AS $$
+DECLARE
+  v_inserted_key            TEXT;
+  v_existing_request_digest CHAR(64);
+  v_existing_outcome        JSONB;
+BEGIN
+  IF p_idempotency_key IS NULL OR pg_catalog.length(pg_catalog.btrim(p_idempotency_key)) = 0 THEN
+    RAISE EXCEPTION 'p_idempotency_key must be non-empty'
+      USING ERRCODE = '22023';
+  END IF;
+
+  IF p_request_digest IS NULL OR p_request_digest !~ '^[0-9a-f]{64}$' THEN
+    RAISE EXCEPTION 'p_request_digest must be a 64-character lowercase hex SHA-256 string'
+      USING ERRCODE = '22023';
+  END IF;
+
+  IF p_recorded_at IS NULL THEN
+    RAISE EXCEPTION 'p_recorded_at must not be null'
+      USING ERRCODE = '22023';
+  END IF;
+
+  -- Strictly restrict this entry point to 'identity-conflict' and 'rejected' outcomes;
+  -- it can never be used to forge 'created', 'existing', or '__pending__' rows.
+  IF p_outcome IS NULL
+     OR pg_catalog.jsonb_typeof(p_outcome) <> 'object'
+     OR (p_outcome ->> 'kind') IS NULL
+     OR (p_outcome ->> 'kind') NOT IN ('identity-conflict', 'rejected')
+  THEN
+    RAISE EXCEPTION
+      'record_rejected_or_conflict_idempotency only accepts identity-conflict or rejected outcomes, got: %',
+      p_outcome ->> 'kind'
+      USING ERRCODE = '23514';
+  END IF;
+
+  INSERT INTO oracle_ledger.publication_idempotency_keys (
+    idempotency_key,
+    request_digest,
+    outcome,
+    recorded_at
+  )
+  VALUES (
+    p_idempotency_key,
+    p_request_digest,
+    p_outcome,
+    p_recorded_at
+  )
+  ON CONFLICT (idempotency_key) DO NOTHING
+  RETURNING idempotency_key INTO v_inserted_key;
+
+  IF FOUND THEN
+    RETURN pg_catalog.jsonb_build_object(
+      'status', 'recorded',
+      'outcome', p_outcome
+    );
+  END IF;
+
+  SELECT pik.request_digest, pik.outcome
+    INTO v_existing_request_digest, v_existing_outcome
+    FROM oracle_ledger.publication_idempotency_keys AS pik
+   WHERE pik.idempotency_key = p_idempotency_key
+     AND (pik.outcome ->> 'kind') IN ('created', 'existing', 'identity-conflict', 'rejected');
+
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'publication_idempotency_keys row % not found after conflict',
+      p_idempotency_key
+      USING ERRCODE = '23514';
+  END IF;
+
+  IF v_existing_request_digest = p_request_digest THEN
+    RETURN pg_catalog.jsonb_build_object(
+      'status', 'replayed',
+      'original', v_existing_outcome
+    );
+  ELSE
+    RETURN pg_catalog.jsonb_build_object(
+      'status', 'idempotency-conflict',
+      'existingRequestDigest', v_existing_request_digest,
+      'incomingRequestDigest', p_request_digest
+    );
+  END IF;
+END;
+$$;
+
+-- 3. Controlled append-only entry point for terminal resolution or annulment events (e1)
+CREATE OR REPLACE FUNCTION oracle_ledger.append_terminal_prediction_event(
+  p_prediction_id TEXT,
+  p_kind          TEXT,
+  p_occurred_at   TIMESTAMPTZ,
+  p_recorded_at   TIMESTAMPTZ,
+  p_envelope      JSONB,
+  p_digest        CHAR(64),
+  p_prev_digest   CHAR(64)
+)
+RETURNS VOID
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, pg_temp
+AS $$
+DECLARE
+  v_locked_prediction_id TEXT;
+  v_e0_digest            CHAR(64);
+  v_e0_occurred_at       TIMESTAMPTZ;
+  v_has_terminal_event   BOOLEAN;
+BEGIN
+  IF p_prediction_id IS NULL OR pg_catalog.length(pg_catalog.btrim(p_prediction_id)) = 0 THEN
+    RAISE EXCEPTION 'p_prediction_id must be non-empty'
+      USING ERRCODE = '22023';
+  END IF;
+
+  IF p_kind IS NULL OR p_kind NOT IN ('resolved', 'annulled') THEN
+    RAISE EXCEPTION 'append_terminal_prediction_event only permits resolved or annulled events, got: %',
+      p_kind
+      USING ERRCODE = '23514';
+  END IF;
+
+  IF p_occurred_at IS NULL OR p_recorded_at IS NULL OR p_recorded_at <= p_occurred_at THEN
+    RAISE EXCEPTION 'p_recorded_at (%) must be strictly greater than p_occurred_at (%)',
+      p_recorded_at, p_occurred_at
+      USING ERRCODE = '23514';
+  END IF;
+
+  IF p_envelope IS NULL OR pg_catalog.jsonb_typeof(p_envelope) <> 'object' THEN
+    RAISE EXCEPTION 'p_envelope must be a JSON object'
+      USING ERRCODE = '22023';
+  END IF;
+
+  IF p_digest IS NULL OR p_digest !~ '^[0-9a-f]{64}$'
+     OR p_prev_digest IS NULL OR p_prev_digest !~ '^[0-9a-f]{64}$'
+  THEN
+    RAISE EXCEPTION 'p_digest and p_prev_digest must be 64-character lowercase hex SHA-256 strings'
+      USING ERRCODE = '22023';
+  END IF;
+
+  -- Serialize terminal event appends per prediction without firing UPDATE triggers
+  SELECT op.prediction_id
+    INTO v_locked_prediction_id
+    FROM oracle_ledger.official_predictions AS op
+   WHERE op.prediction_id = p_prediction_id
+     FOR KEY SHARE;
+
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'official_predictions row % does not exist',
+      p_prediction_id
+      USING ERRCODE = '23503';
+  END IF;
+
+  -- Verify initial e0 ('published') event exists and matches p_prev_digest
+  SELECT pe.digest, pe.occurred_at
+    INTO v_e0_digest, v_e0_occurred_at
+    FROM oracle_ledger.prediction_events AS pe
+   WHERE pe.prediction_id = p_prediction_id
+     AND pe.seq = 'e0'
+     AND pe.kind = 'published';
+
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'initial e0 published event missing for prediction_id %',
+      p_prediction_id
+      USING ERRCODE = '23514';
+  END IF;
+
+  IF p_prev_digest IS DISTINCT FROM v_e0_digest THEN
+    RAISE EXCEPTION 'p_prev_digest (%) does not match e0 digest (%) for prediction_id %',
+      p_prev_digest, v_e0_digest, p_prediction_id
+      USING ERRCODE = '23514';
+  END IF;
+
+  IF p_occurred_at <= v_e0_occurred_at THEN
+    RAISE EXCEPTION 'terminal event occurred_at (%) must be strictly after e0 occurred_at (%)',
+      p_occurred_at, v_e0_occurred_at
+      USING ERRCODE = '23514';
+  END IF;
+
+  -- Reject if a terminal event (e1) already exists for this prediction
+  SELECT EXISTS (
+    SELECT 1
+      FROM oracle_ledger.prediction_events AS pe
+     WHERE pe.prediction_id = p_prediction_id
+       AND (pe.seq = 'e1' OR pe.kind IN ('resolved', 'annulled'))
+  )
+  INTO v_has_terminal_event;
+
+  IF COALESCE(v_has_terminal_event, FALSE) THEN
+    RAISE EXCEPTION 'prediction_id % already has a terminal event (e1)',
+      p_prediction_id
+      USING ERRCODE = '23505';
+  END IF;
+
+  INSERT INTO oracle_ledger.prediction_events (
+    prediction_id,
+    seq,
+    kind,
+    occurred_at,
+    recorded_at,
+    envelope,
+    digest,
+    prev_digest
+  )
+  VALUES (
+    p_prediction_id,
+    'e1',
+    p_kind,
+    p_occurred_at,
+    p_recorded_at,
+    p_envelope,
+    p_digest,
+    p_prev_digest
+  );
+END;
+$$;
+```
+
+### 2.3 Registry method mapping
 
 | `PublicationRegistry` method | Read / Write | Database constraint & SQL contract |
 | --- | --- | --- |
-| `findByIdempotencyKey(key, requestDigest)` | **Read** | `SELECT request_digest, outcome FROM publication_idempotency_keys WHERE idempotency_key = $1 AND (outcome ->> 'kind') IN ('created', 'existing', 'identity-conflict', 'rejected');`. Returns `{ status: 'miss' }` if absent, `{ status: 'match', requestDigest, outcome }` if `request_digest = $2`, or `{ status: 'conflict', existingRequestDigest: request_digest, incomingRequestDigest: $2 }` if `request_digest <> $2`. |
-| `findByIdentity(identityDigest)` | **Read** | `SELECT prediction_id, sealed_payload FROM official_predictions WHERE identity_digest = $1;`. Read-only lookup by canonical identity digest. |
-| `recordIdempotencyKey(key, requestDigest, outcome)` | **Write (atomic)** | Used in steps 6 (`identity-conflict`) and 7 (`rejected`) where the complete non-sentinel `outcome` is already known. Runs `INSERT INTO publication_idempotency_keys (idempotency_key, request_digest, outcome, recorded_at) VALUES ($1, $2, $3, $4) ON CONFLICT (idempotency_key) DO NOTHING RETURNING request_digest;` inside a `READ COMMITTED` transaction with `$3` having `kind IN ('identity-conflict', 'rejected')`. Immediately locked against any future `UPDATE` or `DELETE` by `publication_idempotency_immutability_trg`. If 0 rows are returned, selects the committed `(request_digest, outcome)` in the next statement under `READ COMMITTED` and returns `replayed` (when `request_digest = $2`) or `idempotency-conflict` (when `request_digest <> $2`). |
-| `claimIdentity(identityDigest, predictionId, record)` | **Write (atomic)** | Enforced by `UNIQUE (identity_digest)` on `official_predictions`. Low-level single-table claim used by direct contract tests. |
-| `commitPublication(commit)` | **Write (single ACID transaction)** | Enforced jointly by `PRIMARY KEY (idempotency_key)`, `publication_idempotency_immutability_trg`, `publication_idempotency_outcome_complete_trg`, and `UNIQUE (identity_digest)`. Executes the four-step `READ COMMITTED` ACID transaction in §2.3 so the winning prediction, its initial `e0` event, and its finalized, permanently immutable idempotency outcome are committed together. |
+| `findByIdempotencyKey(key, requestDigest)` | **Read (`SELECT`)** | `SELECT request_digest, outcome FROM oracle_ledger.publication_idempotency_keys WHERE idempotency_key = $1 AND (outcome ->> 'kind') IN ('created', 'existing', 'identity-conflict', 'rejected');`. Returns `{ status: 'miss' }` if absent, `{ status: 'match', requestDigest, outcome }` if `request_digest = $2`, or `{ status: 'conflict', existingRequestDigest: request_digest, incomingRequestDigest: $2 }` if `request_digest <> $2`. |
+| `findByIdentity(identityDigest)` | **Read (`SELECT`)** | `SELECT prediction_id, sealed_payload FROM oracle_ledger.official_predictions WHERE identity_digest = $1;`. Read-only lookup by canonical identity digest. |
+| `recordIdempotencyKey(key, requestDigest, outcome)` | **Write (`EXECUTE` `SECURITY DEFINER`)** | Used in steps 6 (`identity-conflict`) and 7 (`rejected`). Calls `SELECT oracle_ledger.record_rejected_or_conflict_idempotency($1, $2, $3, $4);` inside a `READ COMMITTED` transaction. The function enforces `(p_outcome ->> 'kind') IN ('identity-conflict', 'rejected')`, inserts with `ON CONFLICT (idempotency_key) DO NOTHING`, and returns `recorded`, `replayed`, or `idempotency-conflict` without ever touching `official_predictions`. |
+| `claimIdentity(identityDigest, predictionId, record)` | **Internal / unit-test primitive** | Enforced in PostgreSQL inside `oracle_ledger.commit_official_publication` via `UNIQUE (identity_digest)` on `oracle_ledger.official_predictions`; `oracle_app` has no direct `INSERT` privilege on `official_predictions`. |
+| `commitPublication(commit)` | **Write (`EXECUTE` `SECURITY DEFINER` in single ACID transaction)** | Calls `SELECT oracle_ledger.commit_official_publication($1, $2, $3, $4, $5, $6, $7, $8, $9, $10);` inside a `READ COMMITTED` transaction (§2.4), executing the `'__pending__'` reservation, `UNIQUE (identity_digest)` arbitration, `e0` event insertion, and `'__pending__' -> ('created' \| 'existing')` finalization atomically. |
 
-### 2.3 Single `READ COMMITTED` ACID transaction for `commitPublication`
+### 2.4 Single `READ COMMITTED` ACID transaction for `commitPublication`
 
 > **Why `READ COMMITTED` with `INSERT ... ON CONFLICT` is required**:
 > - Under `READ COMMITTED`, `SELECT ... FOR UPDATE` on a non-existent `idempotency_key`
@@ -366,133 +922,82 @@ CREATE CONSTRAINT TRIGGER publication_idempotency_outcome_complete_trg
 >   transaction snapshot was frozen at the first statement.
 > - Under `READ COMMITTED`, `INSERT ... ON CONFLICT (idempotency_key) DO NOTHING` blocks a
 >   second writer on the unique-index lock until the first writer commits or rolls back, and
->   each subsequent `SELECT` statement in the same transaction takes a fresh statement
->   snapshot that sees all rows committed before that statement began.
+>   each subsequent `SELECT` statement inside `oracle_ledger.commit_official_publication`
+>   takes a fresh statement snapshot that sees all rows committed before that statement began.
 
-When steps 1–8 of `publishCandidate` succeed, step 9 calls `commitPublication`, which a
-PostgreSQL backend executes inside one `READ COMMITTED` transaction:
+When steps 1–8 of `publishCandidate` succeed, step 9 invokes
+`oracle_ledger.commit_official_publication` inside one `READ COMMITTED` transaction:
 
 ```sql
 BEGIN ISOLATION LEVEL READ COMMITTED;
+
+SELECT oracle_ledger.commit_official_publication(
+  $1,  -- p_idempotency_key
+  $2,  -- p_request_digest
+  $3,  -- p_prediction_id
+  $4,  -- p_identity_digest
+  $5,  -- p_sealed_payload
+  $6,  -- p_payload_digest
+  $7,  -- p_published_at
+  $8,  -- p_recorded_at
+  $9,  -- p_e0_envelope
+  $10  -- p_e0_digest
+);
+
+COMMIT;
 ```
 
+Inside `oracle_ledger.commit_official_publication`, PostgreSQL executes the three steps
+defined in §2.2:
+
 1. **Step 1 — Reserve the idempotency key with the transaction-local sentinel**:
-   ```sql
-   INSERT INTO publication_idempotency_keys (
-     idempotency_key,
-     request_digest,
-     outcome,
-     recorded_at
-   )
-   VALUES (
-     $1,
-     $2,
-     '{"kind":"__pending__"}'::jsonb,
-     $3
-   )
-   ON CONFLICT (idempotency_key) DO NOTHING
-   RETURNING idempotency_key;
-   ```
-   - **If 1 row is returned**: This transaction holds the uncommitted reservation for `$1`
-     and proceeds to Step 2.
-   - **If 0 rows are returned**: Another transaction already committed `$1` (or was already
-     committed before this transaction started). Because this `INSERT` modified 0 rows,
-     `publication_idempotency_outcome_complete_trg` is not queued for this transaction.
-     Execute a fresh-snapshot `SELECT` in the same `READ COMMITTED` transaction:
-     ```sql
-     SELECT request_digest, outcome
-     FROM publication_idempotency_keys
-     WHERE idempotency_key = $1
-       AND (outcome ->> 'kind') IN ('created', 'existing', 'identity-conflict', 'rejected');
-     ```
-     - If `request_digest = $2`, execute `ROLLBACK;` (no writes were performed by this
-       transaction) and return `{ status: 'replayed', original: outcome }`.
-     - If `request_digest <> $2`, execute `ROLLBACK;` (nothing was written to
-       `official_predictions` or `prediction_events`) and return
-       `{ status: 'idempotency-conflict', existingRequestDigest: request_digest, incomingRequestDigest: $2 }`.
-
+   Inserts `(p_idempotency_key, p_request_digest, '{"kind":"__pending__"}'::jsonb, p_recorded_at)`
+   into `oracle_ledger.publication_idempotency_keys` with `ON CONFLICT (idempotency_key) DO NOTHING`.
+   - **If 1 row is returned**: This transaction holds the uncommitted reservation and proceeds
+     to Step 2.
+   - **If 0 rows are returned**: Another transaction already committed `p_idempotency_key`.
+     Because this `INSERT` modified 0 rows, `publication_idempotency_outcome_complete_trg` is
+     not queued for this transaction. The function executes a fresh-snapshot `SELECT` in the
+     same `READ COMMITTED` transaction and returns `{ status: 'replayed', original }` (when
+     `request_digest` matches) or `{ status: 'idempotency-conflict', ... }` (when
+     `request_digest` differs), without touching `official_predictions` or `prediction_events`.
 2. **Step 2 — Claim canonical identity or observe the committed winner (reached only when Step 1 returned 1 row)**:
-   ```sql
-   INSERT INTO official_predictions (
-     prediction_id,
-     identity_digest,
-     sealed_payload,
-     payload_digest,
-     published_at,
-     recorded_at
-   )
-   VALUES ($1, $2, $3, $4, $5, $6)
-   ON CONFLICT (identity_digest) DO NOTHING
-   RETURNING prediction_id;
-   ```
-   - **If 1 row is returned (`status: 'created'`)**: Insert the initial `e0` (`published`)
-     event into `prediction_events` in the same transaction:
-     ```sql
-     INSERT INTO prediction_events (
-       prediction_id,
-       seq,
-       kind,
-       occurred_at,
-       recorded_at,
-       envelope,
-       digest,
-       prev_digest
-     )
-     VALUES ($1, 'e0', 'published', $2, $3, $4, $5, NULL);
-     ```
-     and construct the completed JSON outcome:
-     `outcome = { kind: 'created', predictionId, identityDigest, requestDigest, record }`.
-   - **If 0 rows are returned (`status: 'existing'`)**: Another transaction with a different
-     `idempotency_key` already committed the same `identity_digest`. Read the committed
-     winner using a fresh statement snapshot in the same `READ COMMITTED` transaction:
-     ```sql
-     SELECT prediction_id, sealed_payload
-     FROM official_predictions
-     WHERE identity_digest = $2;
-     ```
-     and construct the completed JSON outcome:
-     `outcome = { kind: 'existing', predictionId: winnerId, identityDigest, requestDigest, record: winnerRecord }`.
-
+   Inserts into `oracle_ledger.official_predictions` with `ON CONFLICT (identity_digest) DO NOTHING`.
+   - **If 1 row is returned (`status: 'created'`)**: Inserts the initial `e0` (`published`)
+     event into `oracle_ledger.prediction_events` in the same transaction and constructs the
+     completed `'created'` outcome JSON.
+   - **If 0 rows are returned (`status: 'existing'`)**: Selects the committed winner
+     `(prediction_id, sealed_payload)` from `oracle_ledger.official_predictions` in a fresh
+     `READ COMMITTED` statement snapshot and constructs the completed `'existing'` outcome JSON.
 3. **Step 3 — Finalize the reserved idempotency row in the same transaction**:
-   Replace the transaction-local `'{"kind":"__pending__"}'::jsonb` sentinel with the
-   completed `outcome` JSON object constructed in Step 2:
-   ```sql
-   UPDATE publication_idempotency_keys
-   SET outcome = $2
-   WHERE idempotency_key = $1;
-   ```
-   When this `UPDATE` executes, `publication_idempotency_immutability_trg` (`BEFORE UPDATE`)
-   verifies that `OLD.outcome ->> 'kind' = '__pending__'`, that `idempotency_key`,
-   `request_digest`, and `recorded_at` are unchanged, and that `NEW.outcome ->> 'kind'` is a
-   valid final outcome (`'created'`, `'existing'`, `'identity-conflict'`, or `'rejected'`).
-   Once this `UPDATE` completes, the row is in a final state and any subsequent `UPDATE` or
-   `DELETE` is permanently rejected by `publication_idempotency_immutability_trg`.
-
+   Executes `UPDATE oracle_ledger.publication_idempotency_keys SET outcome = v_outcome WHERE idempotency_key = p_idempotency_key;`.
+   `publication_idempotency_immutability_trg` (`BEFORE UPDATE`) verifies that
+   `OLD.outcome ->> 'kind' = '__pending__'`, that `idempotency_key`, `request_digest`, and
+   `recorded_at` are unchanged, that `NEW.outcome ->> 'kind'` is a valid final outcome, and
+   that the referenced `(predictionId, identityDigest)` exists in
+   `oracle_ledger.official_predictions`.
 4. **Step 4 — Commit and run the deferred constraint trigger**:
-   ```sql
-   COMMIT;
-   ```
    During `COMMIT`, PostgreSQL fires `publication_idempotency_outcome_complete_trg`, which
-   selects the live `outcome` for `idempotency_key = $1` and verifies that the row still
-   exists (`IF NOT FOUND THEN RAISE EXCEPTION`) and that `outcome ->> 'kind'` is in
+   selects the live `outcome` for `idempotency_key = p_idempotency_key` and verifies that the
+   row still exists (`IF NOT FOUND THEN RAISE EXCEPTION`) and that `outcome ->> 'kind'` is in
    `('created', 'existing', 'identity-conflict', 'rejected')` and is not `'__pending__'`.
-   Only after the trigger succeeds does the transaction become visible to other sessions.
 
-### 2.4 Exact concurrency, crash/rollback, and idempotency-key consumption guarantees
+#### Exact concurrency, crash/rollback, and idempotency-key consumption guarantees
 
 1. **Same `idempotency_key`, concurrent requests (identical or different `request_digest`)**:
-   - Transaction A and Transaction B both execute Step 1 with the same `idempotency_key`.
-   - PostgreSQL grants the unique-index lock on `publication_idempotency_keys(idempotency_key)`
-     to A and blocks B at Step 1 before B can touch `official_predictions`.
+   - Transaction A and Transaction B both call `oracle_ledger.commit_official_publication`
+     with the same `p_idempotency_key`.
+   - PostgreSQL grants the unique-index lock on
+     `oracle_ledger.publication_idempotency_keys(idempotency_key)` to A and blocks B at Step 1
+     before B can touch `oracle_ledger.official_predictions`.
    - When A commits (having finalized `outcome` in Step 3), B unblocks, receives 0 rows from
      `ON CONFLICT (idempotency_key) DO NOTHING`, reads A's committed `(request_digest, outcome)`
-     in a fresh `READ COMMITTED` statement snapshot, rolls back its empty transaction, and
-     returns `replayed` (if `request_digest` matches) or `idempotency-conflict` (if
-     `request_digest` differs). Neither replay nor conflict ever inserts a duplicate
-     prediction or event.
+     in a fresh `READ COMMITTED` statement snapshot, and returns `replayed` (if
+     `request_digest` matches) or `idempotency-conflict` (if `request_digest` differs).
+     Neither replay nor conflict ever inserts a duplicate prediction or event.
 2. **Different `idempotency_key` values, same `identity_digest` (competing for the same canonical proposition)**:
    - Transaction A (`key-1`) and Transaction B (`key-2`) both win Step 1 for their distinct
-     keys and reach Step 2 (`INSERT INTO official_predictions ... ON CONFLICT (identity_digest) DO NOTHING`).
+     keys and reach Step 2 (`INSERT INTO oracle_ledger.official_predictions ... ON CONFLICT (identity_digest) DO NOTHING`).
    - PostgreSQL serializes Step 2 on `UNIQUE (identity_digest)`. If A commits first, A
      inserts the prediction and `e0` event and commits `outcome.kind = 'created'` for
      `key-1`. B then unblocks at Step 2, receives 0 rows from `ON CONFLICT (identity_digest) DO NOTHING`,
@@ -506,30 +1011,32 @@ BEGIN ISOLATION LEVEL READ COMMITTED;
      uncommitted `'{"kind":"__pending__"}'` tuple (and any uncommitted Step 2 writes), and
      releases the unique-index lock so any waiting concurrent transaction immediately wins
      Step 1.
-   - If a buggy caller executes Step 1 and attempts `COMMIT` without executing Step 3
-     (`UPDATE`), or if the reservation row disappeared before `COMMIT` (`NOT FOUND`),
-     `publication_idempotency_outcome_complete_trg` raises SQLSTATE `23514` at `COMMIT` and
-     forces a full transaction rollback.
-   - If any caller attempts to `DELETE` a row from `publication_idempotency_keys`, modify
-     `idempotency_key`, `request_digest`, or `recorded_at`, or `UPDATE` an already-finalized
-     row, `publication_idempotency_immutability_trg` (`BEFORE UPDATE OR DELETE`) immediately
-     raises SQLSTATE `23514` and aborts the operation.
+   - If a buggy function or migration owner executes Step 1 and attempts `COMMIT` without
+     executing Step 3 (`UPDATE`), or if the reservation row disappeared before `COMMIT`
+     (`NOT FOUND`), `publication_idempotency_outcome_complete_trg` raises SQLSTATE `23514` at
+     `COMMIT` and forces a full transaction rollback.
+   - If any caller attempts to `DELETE` a row from `oracle_ledger.publication_idempotency_keys`,
+     insert a finalized `'created'` or `'existing'` row directly without `'__pending__'`,
+     modify `idempotency_key`, `request_digest`, or `recorded_at`, or `UPDATE` an
+     already-finalized row, `publication_idempotency_immutability_trg`
+     (`BEFORE INSERT OR UPDATE OR DELETE`) immediately raises SQLSTATE `23514` and aborts the
+     operation.
 4. **Why rejected publication attempts never claim an official identity — and when an `idempotency_key` is consumed**:
    - **Pre-idempotency rejections (steps 1–4 and step 8)**: `candidate-mismatch` (step 1),
      `candidate-digest-mismatch` (step 2), `wrong-stage` with `reason: 'invalid-stage'`
      (step 3), `invalid-clock` (step 4), and `wrong-stage` with `reason: 'forged-stage'`
-     (step 8) return without writing to either `publication_idempotency_keys` or
-     `official_predictions`.
+     (step 8) return without calling any database write function.
    - **Domain validation rejections (step 6 `identity-conflict` and step 7 `rejected`)**:
      When a request reaches step 6 (unresolved identity component) or step 7 (failed
      evaluation, including `publishedAt >= horizon.endsAt` or
-     `evidence[i].publishedAt > publishedAt`), `publishCandidate` calls
-     `recordIdempotencyKey` to persist the complete `identity-conflict` or `rejected`
-     outcome in `publication_idempotency_keys`, and returns **without ever touching
-     `official_predictions`**.
+     `evidence[i].publishedAt > publishedAt`), `publishCandidate` invokes
+     `oracle_ledger.record_rejected_or_conflict_idempotency` to persist the complete
+     `identity-conflict` or `rejected` outcome in `oracle_ledger.publication_idempotency_keys`,
+     and returns **without ever touching `oracle_ledger.official_predictions`**.
    - **Consequence for retries**: Neither `identity-conflict` nor `rejected` ever claims an
-     `identity_digest` in `official_predictions`. However, because `recordIdempotencyKey`
-     binds the caller's `idempotencyKey` to the rejected request's `requestDigest`:
+     `identity_digest` in `oracle_ledger.official_predictions`. However, because
+     `record_rejected_or_conflict_idempotency` binds the caller's `idempotencyKey` to the
+     rejected request's `requestDigest`:
      - Retrying the **identical** rejected request with the same `idempotencyKey` returns
        `{ kind: 'replayed', original }` (replaying the rejection).
      - Modifying the candidate to fix the issue (which changes `candidateContentDigest` and
@@ -539,72 +1046,147 @@ BEGIN ISOLATION LEVEL READ COMMITTED;
        `idempotencyKey`**, which will pass all nine steps and claim the official identity
        with `{ kind: 'created', ... }`.
 
-### 2.5 Production database role separation and least-privilege model
+---
+
+### 2.5 Production database role separation and controlled write-boundary privilege model
 
 Database triggers (`publication_idempotency_immutability_trg`,
-`publication_idempotency_no_truncate_trg`, `publication_idempotency_outcome_complete_trg`)
-cannot protect against a PostgreSQL superuser or the owner of the table, because a table
-owner or superuser can execute `ALTER TABLE ... DISABLE TRIGGER`, `DROP TRIGGER`,
-`DROP TABLE`, or `SET session_replication_role = 'replica'`. A production deployment must
-therefore separate the migration/schema-owner role from the application runtime role.
+`publication_idempotency_no_truncate_trg`, `publication_idempotency_outcome_complete_trg`,
+`official_predictions_append_only_trg`, `prediction_events_append_only_trg`) cannot protect
+against a PostgreSQL superuser or the table owner (`oracle_migrator`), because a table owner
+or superuser can execute `ALTER TABLE ... DISABLE TRIGGER`, `DROP TRIGGER`, `DROP TABLE`, or
+(for a superuser) `SET session_replication_role = 'replica'`. In addition, granting the
+application runtime role direct `INSERT` or `UPDATE` privileges on the ledger tables would
+allow a compromised or buggy application query to insert rows directly into
+`official_predictions`, `prediction_events`, or `publication_idempotency_keys` outside the
+controlled publication workflow.
+
+A production deployment must therefore enforce both **role separation** and a **controlled
+`SECURITY DEFINER` write boundary** where the application runtime role has **zero direct write
+privileges (`INSERT`, `UPDATE`, `DELETE`, `TRUNCATE`) on any ledger table**.
 
 The role names below (`oracle_migrator` and `oracle_app`) are **illustrative** and must be
 configured with concrete role names and secrets during deployment:
 
-1. **Migration role (`oracle_migrator` — table and function owner)**:
-   - Created with `NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT`.
-   - Used exclusively by controlled migration jobs to create/alter tables, functions, and
-     triggers (`official_predictions`, `prediction_events`, `publication_idempotency_keys`).
-   - Never used by the HTTP/application service at runtime.
-2. **Application runtime role (`oracle_app` — least-privilege DML role)**:
-   - Created with `NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOBYPASSRLS`.
+1. **Migration and object-owner role (`oracle_migrator` — schema, table, trigger, and function owner)**:
+   - Created with `NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOLOGIN` in steady-state
+     production (enabled for login only during controlled offline schema migrations, or
+     assumed by a dedicated migration runner; **never** used by the HTTP/application service
+     at runtime).
+   - Owns schema `oracle_ledger`, all three ledger tables, all trigger functions, and the
+     three `SECURITY DEFINER` write functions.
+   - Because `oracle_migrator` is `NOSUPERUSER`, all table constraints and triggers fire
+     normally inside its `SECURITY DEFINER` functions, and `oracle_migrator` cannot execute
+     `SET session_replication_role = 'replica'`.
+2. **Application runtime role (`oracle_app` — read-only table access + `EXECUTE` on approved functions only)**:
+   - Created with `NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOBYPASSRLS LOGIN`.
+   - Is **never** granted membership in `oracle_migrator` or any other privileged role
+     (`REVOKE oracle_migrator FROM oracle_app, PUBLIC;`).
    - Does **not** own any schema, table, function, or trigger, and therefore cannot execute
      `ALTER TABLE`, `DROP TABLE`, `DROP TRIGGER`, `ALTER TABLE ... DISABLE TRIGGER`,
-     `CREATE OR REPLACE FUNCTION`, or `SET session_replication_role = 'replica'`.
-   - Receives **no** `TRUNCATE`, **no** `DELETE`, **no** `TRIGGER`, and **no** `REFERENCES`
-     privileges on any ledger table.
-   - Receives only `SELECT`, `INSERT`, and column-restricted `UPDATE (outcome)` on
-     `publication_idempotency_keys` (so even at the PostgreSQL privilege layer, `oracle_app`
-     cannot update `idempotency_key`, `request_digest`, or `recorded_at`), and only `SELECT`
-     and `INSERT` on `official_predictions` and `prediction_events`:
+     `CREATE OR REPLACE FUNCTION`, `GRANT`, or `REVOKE`.
+   - Receives **zero** direct write or DDL privileges on any ledger table: **no `INSERT`, no
+     `UPDATE`, no `DELETE`, no `TRUNCATE`, no `TRIGGER`, and no `REFERENCES`**.
+   - Receives only:
+     - `USAGE` on schema `oracle_ledger` (no `CREATE` privilege),
+     - `SELECT` on `oracle_ledger.official_predictions`, `oracle_ledger.prediction_events`,
+       and `oracle_ledger.publication_idempotency_keys` (for read-only archive queries and
+       idempotency/identity lookups), and
+     - `EXECUTE` on the three approved `SECURITY DEFINER` write functions
+       (`oracle_ledger.commit_official_publication`,
+       `oracle_ledger.record_rejected_or_conflict_idempotency`, and
+       `oracle_ledger.append_terminal_prediction_event`), with default `PUBLIC` execution
+       revoked on all functions in `oracle_ledger`:
 
 ```sql
 -- Illustrative role names; configure concrete role names and credentials during deployment.
-CREATE ROLE oracle_migrator NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT LOGIN;
+-- oracle_migrator is NOLOGIN at runtime and is NEVER used by the application service.
+CREATE ROLE oracle_migrator NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOLOGIN;
 CREATE ROLE oracle_app NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOBYPASSRLS LOGIN;
 
-ALTER TABLE official_predictions OWNER TO oracle_migrator;
-ALTER TABLE prediction_events OWNER TO oracle_migrator;
-ALTER TABLE publication_idempotency_keys OWNER TO oracle_migrator;
+-- Ensure oracle_app is never a member of oracle_migrator
+REVOKE oracle_migrator FROM oracle_app, PUBLIC;
 
+-- Lock down schema-level privileges
+ALTER SCHEMA oracle_ledger OWNER TO oracle_migrator;
+REVOKE ALL ON SCHEMA public FROM PUBLIC, oracle_app;
+REVOKE ALL ON SCHEMA oracle_ledger FROM PUBLIC, oracle_app;
+GRANT USAGE ON SCHEMA oracle_ledger TO oracle_app;
+
+-- Assign ownership of all ledger tables to oracle_migrator
+ALTER TABLE oracle_ledger.official_predictions OWNER TO oracle_migrator;
+ALTER TABLE oracle_ledger.prediction_events OWNER TO oracle_migrator;
+ALTER TABLE oracle_ledger.publication_idempotency_keys OWNER TO oracle_migrator;
+
+-- Assign ownership of all trigger and write functions to oracle_migrator
+ALTER FUNCTION oracle_ledger.enforce_append_only_ledger_row() OWNER TO oracle_migrator;
+ALTER FUNCTION oracle_ledger.enforce_publication_idempotency_immutability() OWNER TO oracle_migrator;
+ALTER FUNCTION oracle_ledger.enforce_publication_idempotency_no_truncate() OWNER TO oracle_migrator;
+ALTER FUNCTION oracle_ledger.enforce_publication_idempotency_outcome_complete() OWNER TO oracle_migrator;
+ALTER FUNCTION oracle_ledger.commit_official_publication(TEXT, CHAR(64), TEXT, CHAR(64), JSONB, CHAR(64), TIMESTAMPTZ, TIMESTAMPTZ, JSONB, CHAR(64)) OWNER TO oracle_migrator;
+ALTER FUNCTION oracle_ledger.record_rejected_or_conflict_idempotency(TEXT, CHAR(64), JSONB, TIMESTAMPTZ) OWNER TO oracle_migrator;
+ALTER FUNCTION oracle_ledger.append_terminal_prediction_event(TEXT, TEXT, TIMESTAMPTZ, TIMESTAMPTZ, JSONB, CHAR(64), CHAR(64)) OWNER TO oracle_migrator;
+
+-- Revoke all table privileges from PUBLIC and oracle_app;
+-- grant ONLY read-only SELECT on the three ledger tables to oracle_app.
+-- oracle_app has NO INSERT, NO UPDATE, NO DELETE, NO TRUNCATE, NO TRIGGER, and NO REFERENCES.
 REVOKE ALL ON TABLE
-  official_predictions,
-  prediction_events,
-  publication_idempotency_keys
+  oracle_ledger.official_predictions,
+  oracle_ledger.prediction_events,
+  oracle_ledger.publication_idempotency_keys
 FROM PUBLIC, oracle_app;
 
--- Application runtime role may only read, insert reservations/outcomes, and
--- update the outcome column during __pending__ -> final finalization;
--- it has NO DELETE and NO TRUNCATE privilege.
-GRANT SELECT, INSERT, UPDATE (outcome)
-  ON TABLE publication_idempotency_keys
+GRANT SELECT
+  ON TABLE
+    oracle_ledger.official_predictions,
+    oracle_ledger.prediction_events,
+    oracle_ledger.publication_idempotency_keys
   TO oracle_app;
 
--- Official predictions and events are strictly append-only (SELECT, INSERT only).
-GRANT SELECT, INSERT
-  ON TABLE official_predictions, prediction_events
-  TO oracle_app;
+-- Revoke default PUBLIC execution privileges on all existing and future functions in oracle_ledger
+ALTER DEFAULT PRIVILEGES FOR ROLE oracle_migrator IN SCHEMA oracle_ledger
+  REVOKE EXECUTE ON FUNCTIONS FROM PUBLIC;
+
+REVOKE ALL ON ALL FUNCTIONS IN SCHEMA oracle_ledger FROM PUBLIC, oracle_app;
+
+REVOKE ALL ON FUNCTION
+  oracle_ledger.enforce_append_only_ledger_row(),
+  oracle_ledger.enforce_publication_idempotency_immutability(),
+  oracle_ledger.enforce_publication_idempotency_no_truncate(),
+  oracle_ledger.enforce_publication_idempotency_outcome_complete(),
+  oracle_ledger.commit_official_publication(TEXT, CHAR(64), TEXT, CHAR(64), JSONB, CHAR(64), TIMESTAMPTZ, TIMESTAMPTZ, JSONB, CHAR(64)),
+  oracle_ledger.record_rejected_or_conflict_idempotency(TEXT, CHAR(64), JSONB, TIMESTAMPTZ),
+  oracle_ledger.append_terminal_prediction_event(TEXT, TEXT, TIMESTAMPTZ, TIMESTAMPTZ, JSONB, CHAR(64), CHAR(64))
+FROM PUBLIC, oracle_app;
+
+-- Grant EXECUTE to oracle_app ONLY on the three approved controlled write functions
+GRANT EXECUTE ON FUNCTION
+  oracle_ledger.commit_official_publication(TEXT, CHAR(64), TEXT, CHAR(64), JSONB, CHAR(64), TIMESTAMPTZ, TIMESTAMPTZ, JSONB, CHAR(64)),
+  oracle_ledger.record_rejected_or_conflict_idempotency(TEXT, CHAR(64), JSONB, TIMESTAMPTZ),
+  oracle_ledger.append_terminal_prediction_event(TEXT, TEXT, TIMESTAMPTZ, TIMESTAMPTZ, JSONB, CHAR(64), CHAR(64))
+TO oracle_app;
 ```
 
-> **Honest boundary of database triggers and role separation**: Combining
-> `publication_idempotency_immutability_trg`, `publication_idempotency_no_truncate_trg`,
-> `publication_idempotency_outcome_complete_trg`, and the non-owner `oracle_app` privilege
-> model prevents the application service from deleting, truncating, or mutating finalized
-> idempotency rows through both privilege checks and trigger enforcement. It does **not**
-> protect against a compromised database superuser or migration owner (`oracle_migrator`) who
-> holds DDL authority to disable triggers or rewrite storage directly; detecting privileged
-> storage rewrites requires external cryptographic anchoring / transparency logs (not
-> implemented in v0.1).
+> **Honest boundary of database triggers, `SECURITY DEFINER` write functions, and role separation**:
+>
+> 1. **What this boundary prevents**: Because `oracle_app` has no direct `INSERT`, `UPDATE`,
+>    `DELETE`, or `TRUNCATE` privileges on any ledger table, the application runtime cannot
+>    insert finalized idempotency rows directly, cannot insert predictions without a
+>    matching `e0` event and finalized idempotency row, cannot insert `e0` events outside
+>    publication or duplicate/unlinked `e1` events, and cannot mutate, delete, or truncate
+>    existing ledger rows.
+> 2. **What this boundary does not prevent**:
+>    - It does **not** protect against a compromised PostgreSQL superuser or a caller who
+>      obtains DDL control over the migration owner (`oracle_migrator`) and disables triggers,
+>      alters functions, or rewrites tables directly.
+>    - Because the HTTP application service constructs and signs/hashes candidate payloads
+>      before calling `oracle_ledger.commit_official_publication`, a compromised application
+>      runtime with `EXECUTE` on the three approved functions can still submit well-formed
+>      new publications or resolve existing open predictions using structurally valid inputs
+>      (though it cannot rewrite, delete, or truncate previously committed predictions,
+>      events, or idempotency keys, nor forge a `'created'` idempotency row without a
+>      committed prediction). Detecting privileged storage rewrites or equivocation requires
+>      external cryptographic anchoring / transparency logs (not implemented in v0.1).
 
 ---
 

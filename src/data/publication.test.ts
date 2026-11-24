@@ -1854,10 +1854,10 @@ describe('protocol v1.3 PostgreSQL transaction contract and retry semantics', ()
 
     // 3. Uses valid PostgreSQL CREATE CONSTRAINT TRIGGER ... DEFERRABLE INITIALLY DEFERRED
     expect(sqlBlocks).toContain(
-      'CREATE OR REPLACE FUNCTION enforce_publication_idempotency_outcome_complete()',
+      'CREATE OR REPLACE FUNCTION oracle_ledger.enforce_publication_idempotency_outcome_complete()',
     );
     expect(sqlBlocks).toContain(
-      'SELECT outcome\n    INTO current_outcome\n    FROM publication_idempotency_keys\n   WHERE idempotency_key = NEW.idempotency_key;',
+      'SELECT outcome\n    INTO current_outcome\n    FROM oracle_ledger.publication_idempotency_keys\n   WHERE idempotency_key = NEW.idempotency_key;',
     );
     // A disappearing reservation before COMMIT must raise an exception, never RETURN NULL
     expect(sqlBlocks).not.toMatch(/IF\s+NOT\s+FOUND\s+THEN\s+RETURN\s+NULL/i);
@@ -1865,15 +1865,19 @@ describe('protocol v1.3 PostgreSQL transaction contract and retry semantics', ()
       "IF NOT FOUND THEN\n    RAISE EXCEPTION\n      'publication_idempotency_keys row % disappeared before commit'",
     );
     expect(sqlBlocks).toContain(
-      'CREATE CONSTRAINT TRIGGER publication_idempotency_outcome_complete_trg\n  AFTER INSERT OR UPDATE ON publication_idempotency_keys\n  DEFERRABLE INITIALLY DEFERRED\n  FOR EACH ROW\n  EXECUTE FUNCTION enforce_publication_idempotency_outcome_complete();',
+      'CREATE CONSTRAINT TRIGGER publication_idempotency_outcome_complete_trg\n  AFTER INSERT OR UPDATE ON oracle_ledger.publication_idempotency_keys\n  DEFERRABLE INITIALLY DEFERRED\n  FOR EACH ROW\n  EXECUTE FUNCTION oracle_ledger.enforce_publication_idempotency_outcome_complete();',
     );
 
-    // 4. Enforces BEFORE UPDATE OR DELETE immutability trigger on publication_idempotency_keys
+    // 4. Enforces BEFORE INSERT OR UPDATE OR DELETE immutability trigger on publication_idempotency_keys
+    // and append-only triggers on official_predictions and prediction_events
     expect(sqlBlocks).toContain(
-      'CREATE OR REPLACE FUNCTION enforce_publication_idempotency_immutability()',
+      'CREATE OR REPLACE FUNCTION oracle_ledger.enforce_publication_idempotency_immutability()',
     );
     expect(sqlBlocks).toContain(
       "IF TG_OP = 'DELETE' THEN\n    RAISE EXCEPTION\n      'DELETE on publication_idempotency_keys is forbidden (idempotency_key = %)'",
+    );
+    expect(sqlBlocks).toContain(
+      "OR (NEW.outcome ->> 'kind') NOT IN ('__pending__', 'identity-conflict', 'rejected')\n    THEN\n      RAISE EXCEPTION\n        'publication_idempotency_keys row % cannot be inserted directly with outcome kind %; only __pending__, identity-conflict, or rejected may be inserted'",
     );
     expect(sqlBlocks).toContain(
       "IF (OLD.outcome ->> 'kind') IS DISTINCT FROM '__pending__' THEN\n      RAISE EXCEPTION\n        'publication_idempotency_keys row % is already finalized (%) and cannot be updated'",
@@ -1882,56 +1886,60 @@ describe('protocol v1.3 PostgreSQL transaction contract and retry semantics', ()
       'IF NEW.idempotency_key IS DISTINCT FROM OLD.idempotency_key\n       OR NEW.request_digest IS DISTINCT FROM OLD.request_digest\n       OR NEW.recorded_at IS DISTINCT FROM OLD.recorded_at',
     );
     expect(sqlBlocks).toContain(
-      'CREATE TRIGGER publication_idempotency_immutability_trg\n  BEFORE UPDATE OR DELETE ON publication_idempotency_keys\n  FOR EACH ROW\n  EXECUTE FUNCTION enforce_publication_idempotency_immutability();',
+      'CREATE TRIGGER publication_idempotency_immutability_trg\n  BEFORE INSERT OR UPDATE OR DELETE ON oracle_ledger.publication_idempotency_keys\n  FOR EACH ROW\n  EXECUTE FUNCTION oracle_ledger.enforce_publication_idempotency_immutability();',
+    );
+    expect(sqlBlocks).toContain(
+      'CREATE TRIGGER official_predictions_append_only_trg\n  BEFORE UPDATE OR DELETE ON oracle_ledger.official_predictions\n  FOR EACH ROW\n  EXECUTE FUNCTION oracle_ledger.enforce_append_only_ledger_row();',
+    );
+    expect(sqlBlocks).toContain(
+      'CREATE TRIGGER prediction_events_append_only_trg\n  BEFORE UPDATE OR DELETE ON oracle_ledger.prediction_events\n  FOR EACH ROW\n  EXECUTE FUNCTION oracle_ledger.enforce_append_only_ledger_row();',
     );
 
-    // 5. Enforces BEFORE TRUNCATE statement-level trigger on publication_idempotency_keys
+    // 5. Enforces BEFORE TRUNCATE statement-level trigger on publication_idempotency_keys, official_predictions, and prediction_events
     expect(sqlBlocks).toContain(
-      'CREATE OR REPLACE FUNCTION enforce_publication_idempotency_no_truncate()',
+      'CREATE OR REPLACE FUNCTION oracle_ledger.enforce_publication_idempotency_no_truncate()',
     );
     expect(sqlBlocks).toContain(
       "RAISE EXCEPTION\n    'TRUNCATE on % is forbidden',\n    TG_TABLE_NAME\n    USING ERRCODE = '23514';",
     );
     expect(sqlBlocks).toContain(
-      'CREATE TRIGGER publication_idempotency_no_truncate_trg\n  BEFORE TRUNCATE ON publication_idempotency_keys\n  FOR EACH STATEMENT\n  EXECUTE FUNCTION enforce_publication_idempotency_no_truncate();',
+      'CREATE TRIGGER publication_idempotency_no_truncate_trg\n  BEFORE TRUNCATE ON oracle_ledger.publication_idempotency_keys\n  FOR EACH STATEMENT\n  EXECUTE FUNCTION oracle_ledger.enforce_publication_idempotency_no_truncate();',
     );
     expect(sqlBlocks).toContain(
-      'CREATE TRIGGER official_predictions_no_truncate_trg\n  BEFORE TRUNCATE ON official_predictions\n  FOR EACH STATEMENT\n  EXECUTE FUNCTION enforce_publication_idempotency_no_truncate();',
+      'CREATE TRIGGER official_predictions_no_truncate_trg\n  BEFORE TRUNCATE ON oracle_ledger.official_predictions\n  FOR EACH STATEMENT\n  EXECUTE FUNCTION oracle_ledger.enforce_publication_idempotency_no_truncate();',
     );
     expect(sqlBlocks).toContain(
-      'CREATE TRIGGER prediction_events_no_truncate_trg\n  BEFORE TRUNCATE ON prediction_events\n  FOR EACH STATEMENT\n  EXECUTE FUNCTION enforce_publication_idempotency_no_truncate();',
+      'CREATE TRIGGER prediction_events_no_truncate_trg\n  BEFORE TRUNCATE ON oracle_ledger.prediction_events\n  FOR EACH STATEMENT\n  EXECUTE FUNCTION oracle_ledger.enforce_publication_idempotency_no_truncate();',
     );
     expect(contractDoc).toContain('TRUNCATE ... CASCADE');
 
-    // 6. Documents migration owner vs. application runtime role separation without DELETE/TRUNCATE privileges
+    // 6. Enforces SECURITY DEFINER controlled write boundary and zero direct table DML for oracle_app
     expect(sqlBlocks).toContain(
-      'CREATE ROLE oracle_migrator NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT LOGIN;',
+      'CREATE ROLE oracle_migrator NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOLOGIN;',
     );
     expect(sqlBlocks).toContain(
       'CREATE ROLE oracle_app NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOBYPASSRLS LOGIN;',
     );
+    expect(sqlBlocks).toContain('REVOKE oracle_migrator FROM oracle_app, PUBLIC;');
     expect(sqlBlocks).toContain(
-      'ALTER TABLE publication_idempotency_keys OWNER TO oracle_migrator;',
+      'ALTER TABLE oracle_ledger.publication_idempotency_keys OWNER TO oracle_migrator;',
     );
     expect(sqlBlocks).toContain(
-      'REVOKE ALL ON TABLE\n  official_predictions,\n  prediction_events,\n  publication_idempotency_keys\nFROM PUBLIC, oracle_app;',
+      'REVOKE ALL ON TABLE\n  oracle_ledger.official_predictions,\n  oracle_ledger.prediction_events,\n  oracle_ledger.publication_idempotency_keys\nFROM PUBLIC, oracle_app;',
     );
     expect(sqlBlocks).toContain(
-      'GRANT SELECT, INSERT, UPDATE (outcome)\n  ON TABLE publication_idempotency_keys\n  TO oracle_app;',
+      'GRANT SELECT\n  ON TABLE\n    oracle_ledger.official_predictions,\n    oracle_ledger.prediction_events,\n    oracle_ledger.publication_idempotency_keys\n  TO oracle_app;',
     );
-    expect(sqlBlocks).toContain(
-      'GRANT SELECT, INSERT\n  ON TABLE official_predictions, prediction_events\n  TO oracle_app;',
-    );
-    // Ensure no GRANT statement ever grants DELETE, TRUNCATE, TRIGGER, or ALTER to oracle_app
+    // Ensure no GRANT statement ever grants INSERT, UPDATE, DELETE, TRUNCATE, TRIGGER, REFERENCES, or ALL on tables to oracle_app
     const grantStatements = Array.from(
-      sqlBlocks.matchAll(/GRANT\s+[\s\S]*?TO\s+oracle_app\s*;/gi),
+      sqlBlocks.matchAll(/^GRANT\s+[^;]*?TO\s+oracle_app\s*;/gm),
       (m) => m[0],
     );
-    expect(grantStatements.length).toBe(2);
+    expect(grantStatements.length).toBe(3); // USAGE ON SCHEMA, SELECT ON TABLE, EXECUTE ON FUNCTION
     for (const grantSql of grantStatements) {
-      expect(grantSql).not.toMatch(/\b(DELETE|TRUNCATE|TRIGGER|REFERENCES|ALL)\b/i);
+      expect(grantSql).not.toMatch(/\b(INSERT|UPDATE|DELETE|TRUNCATE|TRIGGER|REFERENCES|CREATE|ALL)\b/i);
     }
-    expect(contractDoc).toMatch(/cannot protect against a PostgreSQL superuser or the owner/i);
+    expect(contractDoc).toMatch(/cannot protect\s+against a PostgreSQL superuser or the table owner/i);
 
     // 7. Retains READ COMMITTED and ON CONFLICT unique-index arbitration
     expect(sqlBlocks).toContain('BEGIN ISOLATION LEVEL READ COMMITTED;');
@@ -1982,6 +1990,19 @@ describe('protocol v1.3 PostgreSQL transaction contract and retry semantics', ()
 
       insert(row: IdempotencyRow): boolean {
         this.checkValidShape(row);
+        // BEFORE INSERT trigger: enforce_publication_idempotency_immutability()
+        // Direct insertion of 'created' or 'existing' is forbidden; only '__pending__',
+        // 'identity-conflict', or 'rejected' may be inserted.
+        if (
+          row.outcome === null ||
+          typeof row.outcome !== 'object' ||
+          typeof row.outcome.kind !== 'string' ||
+          !['__pending__', 'identity-conflict', 'rejected'].includes(row.outcome.kind)
+        ) {
+          throw new Error(
+            `23514: publication_idempotency_keys row ${row.idempotency_key} cannot be inserted directly with outcome kind ${String(row.outcome?.kind)}; only __pending__, identity-conflict, or rejected may be inserted`,
+          );
+        }
         if (this.working.has(row.idempotency_key)) {
           // ON CONFLICT (idempotency_key) DO NOTHING
           return false;
@@ -2225,6 +2246,601 @@ describe('protocol v1.3 PostgreSQL transaction contract and retry semantics', ()
       outcome: { kind: 'created', predictionId: 'pred-0001' },
       recorded_at: recordedAt,
     });
+
+    // Case 9: Direct INSERT of a finalized 'created' or 'existing' outcome is rejected
+    // by the BEFORE INSERT trigger with SQLSTATE 23514
+    table.begin();
+    expect(() =>
+      table.insert({
+        idempotency_key: 'k-forged-created',
+        request_digest: baseDigest,
+        outcome: { kind: 'created', predictionId: 'pred-forged' },
+        recorded_at: recordedAt,
+      }),
+    ).toThrow(
+      /23514: publication_idempotency_keys row k-forged-created cannot be inserted directly with outcome kind created/,
+    );
+    expect(() =>
+      table.insert({
+        idempotency_key: 'k-forged-existing',
+        request_digest: baseDigest,
+        outcome: { kind: 'existing', predictionId: 'pred-forged' },
+        recorded_at: recordedAt,
+      }),
+    ).toThrow(
+      /23514: publication_idempotency_keys row k-forged-existing cannot be inserted directly with outcome kind existing/,
+    );
+  });
+
+  it('enforces the v1.6 controlled SECURITY DEFINER write boundary and least-privilege contract (static SQL inspection + in-memory TypeScript simulation, not real PostgreSQL execution)', () => {
+    const contractDoc = readFileSync(
+      resolve(process.cwd(), 'docs/PUBLICATION-API-CONTRACT.md'),
+      'utf8',
+    );
+    const sqlBlocks = Array.from(
+      contractDoc.matchAll(/```sql\r?\n([\s\S]*?)```/g),
+      (m) => m[1],
+    ).join('\n');
+
+    // --- Part A: Static SQL inspection of SECURITY DEFINER functions and privilege grants ---
+
+    // 1. All three controlled write functions are defined in schema oracle_ledger as SECURITY DEFINER
+    //    with an explicit fixed search_path = pg_catalog, pg_temp and zero dynamic SQL (EXECUTE)
+    const approvedFunctions = [
+      'oracle_ledger.commit_official_publication',
+      'oracle_ledger.record_rejected_or_conflict_idempotency',
+      'oracle_ledger.append_terminal_prediction_event',
+    ];
+    for (const fnName of approvedFunctions) {
+      expect(sqlBlocks).toContain(`CREATE OR REPLACE FUNCTION ${fnName}(`);
+    }
+
+    // Extract every CREATE OR REPLACE FUNCTION ... $$ block and verify security properties
+    const functionBlocks = Array.from(
+      sqlBlocks.matchAll(
+        /CREATE\s+OR\s+REPLACE\s+FUNCTION\s+(oracle_ledger\.[a-z0-9_]+)\s*\([\s\S]*?\$\$\s*;/gi,
+      ),
+      (m) => ({ name: m[1], body: m[0] }),
+    );
+    expect(functionBlocks.length).toBe(7); // 4 trigger functions + 3 SECURITY DEFINER write functions
+
+    for (const fn of functionBlocks) {
+      // Every function in oracle_ledger sets fixed search_path = pg_catalog, pg_temp
+      expect(fn.body).toContain('SET search_path = pg_catalog, pg_temp');
+      // No function uses dynamic SQL (`EXECUTE '...'` or `EXECUTE format(...)`)
+      expect(fn.body).not.toMatch(/\bEXECUTE\s+['"a-z0-9_(]/i);
+      // Every function is explicitly assigned to non-superuser owner oracle_migrator
+      expect(sqlBlocks).toContain(`ALTER FUNCTION ${fn.name}(`);
+      expect(sqlBlocks).toContain(`OWNER TO oracle_migrator;`);
+    }
+
+    // 2. Only the 3 approved write functions are SECURITY DEFINER; trigger functions remain SECURITY INVOKER
+    for (const fn of functionBlocks) {
+      if (approvedFunctions.includes(fn.name)) {
+        expect(fn.body).toContain('SECURITY DEFINER');
+      } else {
+        expect(fn.body).not.toContain('SECURITY DEFINER');
+      }
+    }
+
+    // 3. oracle_app has NO direct ledger-table write grants (no INSERT, UPDATE, DELETE, TRUNCATE)
+    expect(sqlBlocks).not.toMatch(
+      /GRANT\s+[^;]*\b(INSERT|UPDATE|DELETE|TRUNCATE)\b[^;]*ON\s+TABLE[^;]*TO\s+oracle_app/i,
+    );
+    expect(sqlBlocks).toContain(
+      'GRANT SELECT\n  ON TABLE\n    oracle_ledger.official_predictions,\n    oracle_ledger.prediction_events,\n    oracle_ledger.publication_idempotency_keys\n  TO oracle_app;',
+    );
+
+    // 4. Default PUBLIC execution privileges are revoked, and only the 3 approved functions are granted to oracle_app
+    expect(sqlBlocks).toContain(
+      'ALTER DEFAULT PRIVILEGES FOR ROLE oracle_migrator IN SCHEMA oracle_ledger\n  REVOKE EXECUTE ON FUNCTIONS FROM PUBLIC;',
+    );
+    expect(sqlBlocks).toContain(
+      'REVOKE ALL ON ALL FUNCTIONS IN SCHEMA oracle_ledger FROM PUBLIC, oracle_app;',
+    );
+    const executeGrants = Array.from(
+      sqlBlocks.matchAll(/GRANT\s+EXECUTE\s+ON\s+FUNCTION\s+([\s\S]*?)TO\s+([a-z0-9_,\s]+);/gi),
+      (m) => ({ targets: m[1], grantee: m[2].trim() }),
+    );
+    expect(executeGrants.length).toBe(1);
+    expect(executeGrants[0]?.grantee).toBe('oracle_app');
+    for (const fnName of approvedFunctions) {
+      expect(executeGrants[0]?.targets).toContain(fnName);
+    }
+    const unapprovedFunctions = [
+      'oracle_ledger.enforce_append_only_ledger_row',
+      'oracle_ledger.enforce_publication_idempotency_immutability',
+      'oracle_ledger.enforce_publication_idempotency_no_truncate',
+      'oracle_ledger.enforce_publication_idempotency_outcome_complete',
+    ];
+    for (const unapprovedFn of unapprovedFunctions) {
+      expect(executeGrants[0]?.targets).not.toContain(unapprovedFn);
+    }
+
+    // 5. No role membership grants indirect migration-owner privileges to oracle_app or PUBLIC,
+    //    and oracle_migrator is NOLOGIN at steady state
+    expect(sqlBlocks).toContain(
+      'CREATE ROLE oracle_migrator NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOLOGIN;',
+    );
+    expect(sqlBlocks).toContain('REVOKE oracle_migrator FROM oracle_app, PUBLIC;');
+    expect(sqlBlocks).not.toMatch(/GRANT\s+oracle_migrator\s+TO/i);
+
+    // --- Part B: In-memory TypeScript simulation (not real PostgreSQL execution) of the
+    //             v1.6 privilege boundary and SECURITY DEFINER write functions ---
+    type RoleName = 'oracle_app' | 'oracle_migrator' | 'PUBLIC';
+    type TableName =
+      | 'oracle_ledger.official_predictions'
+      | 'oracle_ledger.prediction_events'
+      | 'oracle_ledger.publication_idempotency_keys';
+    type DmlOp = 'SELECT' | 'INSERT' | 'UPDATE' | 'DELETE' | 'TRUNCATE';
+
+    interface SimulatedPredictionRow {
+      prediction_id: string;
+      identity_digest: string;
+      sealed_payload: Record<string, unknown>;
+      payload_digest: string;
+      published_at: string;
+      recorded_at: string;
+    }
+
+    interface SimulatedEventRow {
+      prediction_id: string;
+      seq: 'e0' | 'e1';
+      kind: 'published' | 'resolved' | 'annulled';
+      occurred_at: string;
+      recorded_at: string;
+      envelope: Record<string, unknown>;
+      digest: string;
+      prev_digest: string | null;
+    }
+
+    interface SimulatedIdempotencyRow {
+      idempotency_key: string;
+      request_digest: string;
+      outcome: { kind: string; [k: string]: unknown };
+      recorded_at: string;
+    }
+
+    // In-memory TypeScript simulation of PostgreSQL role privileges, SECURITY DEFINER
+    // execution context switching, and table triggers.
+    class SimulatedControlledLedgerDb {
+      private predictions = new Map<string, SimulatedPredictionRow>();
+      private predictionsByIdentity = new Map<string, string>();
+      private events = new Map<string, SimulatedEventRow[]>();
+      private idempotency = new Map<string, SimulatedIdempotencyRow>();
+
+      private readonly tableGrants: Record<RoleName, Record<TableName, ReadonlySet<DmlOp>>> = {
+        PUBLIC: {
+          'oracle_ledger.official_predictions': new Set(),
+          'oracle_ledger.prediction_events': new Set(),
+          'oracle_ledger.publication_idempotency_keys': new Set(),
+        },
+        oracle_app: {
+          'oracle_ledger.official_predictions': new Set(['SELECT']),
+          'oracle_ledger.prediction_events': new Set(['SELECT']),
+          'oracle_ledger.publication_idempotency_keys': new Set(['SELECT']),
+        },
+        oracle_migrator: {
+          'oracle_ledger.official_predictions': new Set(['SELECT', 'INSERT']),
+          'oracle_ledger.prediction_events': new Set(['SELECT', 'INSERT']),
+          'oracle_ledger.publication_idempotency_keys': new Set(['SELECT', 'INSERT', 'UPDATE']),
+        },
+      };
+
+      private readonly executableFunctions: Record<RoleName, ReadonlySet<string>> = {
+        PUBLIC: new Set(),
+        oracle_app: new Set(approvedFunctions),
+        oracle_migrator: new Set(approvedFunctions),
+      };
+
+      private readonly roleMemberships: Record<RoleName, ReadonlySet<RoleName>> = {
+        PUBLIC: new Set(),
+        oracle_app: new Set(),
+        oracle_migrator: new Set(),
+      };
+
+      hasRoleMembership(member: RoleName, targetRole: RoleName): boolean {
+        return this.roleMemberships[member].has(targetRole);
+      }
+
+      private assertTablePrivilege(role: RoleName, table: TableName, op: DmlOp): void {
+        if (!this.tableGrants[role][table].has(op)) {
+          throw new Error(`42501: permission denied for table ${table} (role=${role}, op=${op})`);
+        }
+      }
+
+      private assertFunctionExecute(role: RoleName, fnName: string): void {
+        if (!this.executableFunctions[role].has(fnName)) {
+          throw new Error(`42501: permission denied for function ${fnName} (role=${role})`);
+        }
+      }
+
+      // Direct table operations attempted by a caller role
+      directInsertIdempotency(role: RoleName, row: SimulatedIdempotencyRow): void {
+        this.assertTablePrivilege(role, 'oracle_ledger.publication_idempotency_keys', 'INSERT');
+        if (!['__pending__', 'identity-conflict', 'rejected'].includes(row.outcome.kind)) {
+          throw new Error(
+            `23514: publication_idempotency_keys row ${row.idempotency_key} cannot be inserted directly with outcome kind ${row.outcome.kind}`,
+          );
+        }
+        this.idempotency.set(row.idempotency_key, structuredClone(row));
+      }
+
+      directInsertPrediction(role: RoleName, row: SimulatedPredictionRow): void {
+        this.assertTablePrivilege(role, 'oracle_ledger.official_predictions', 'INSERT');
+        this.predictions.set(row.prediction_id, structuredClone(row));
+      }
+
+      directInsertEvent(role: RoleName, row: SimulatedEventRow): void {
+        this.assertTablePrivilege(role, 'oracle_ledger.prediction_events', 'INSERT');
+        const list = this.events.get(row.prediction_id) ?? [];
+        list.push(structuredClone(row));
+        this.events.set(row.prediction_id, list);
+      }
+
+      directUpdatePrediction(role: RoleName, predictionId: string): void {
+        this.assertTablePrivilege(role, 'oracle_ledger.official_predictions', 'UPDATE');
+        throw new Error(
+          `23514: UPDATE on oracle_ledger.official_predictions is forbidden (${predictionId})`,
+        );
+      }
+
+      directDeleteEvent(role: RoleName, predictionId: string): void {
+        this.assertTablePrivilege(role, 'oracle_ledger.prediction_events', 'DELETE');
+        throw new Error(
+          `23514: DELETE on oracle_ledger.prediction_events is forbidden (${predictionId})`,
+        );
+      }
+
+      callUnapprovedFunction(role: RoleName, fnName: string): void {
+        this.assertFunctionExecute(role, fnName);
+      }
+
+      // Controlled SECURITY DEFINER Function 1: commit_official_publication
+      commitOfficialPublication(
+        caller: RoleName,
+        params: {
+          idempotencyKey: string;
+          requestDigest: string;
+          predictionId: string;
+          identityDigest: string;
+          sealedPayload: Record<string, unknown>;
+          payloadDigest: string;
+          publishedAt: string;
+          recordedAt: string;
+          e0Envelope: Record<string, unknown>;
+          e0Digest: string;
+        },
+      ): { status: string; outcome?: Record<string, unknown>; original?: Record<string, unknown> } {
+        this.assertFunctionExecute(caller, 'oracle_ledger.commit_official_publication');
+        // Runs as definer (oracle_migrator) with triggers active
+        const definer: RoleName = 'oracle_migrator';
+
+        if (params.sealedPayload.id !== params.predictionId || params.sealedPayload.demo !== false) {
+          throw new Error(
+            '23514: p_sealed_payload must be a non-demo official PredictionRecord object matching p_prediction_id',
+          );
+        }
+
+        // Step 1: Reserve with '__pending__'
+        if (this.idempotency.has(params.idempotencyKey)) {
+          const existing = this.idempotency.get(params.idempotencyKey)!;
+          if (existing.request_digest === params.requestDigest) {
+            return { status: 'replayed', original: structuredClone(existing.outcome) };
+          }
+          return { status: 'idempotency-conflict' };
+        }
+
+        this.directInsertIdempotency(definer, {
+          idempotency_key: params.idempotencyKey,
+          request_digest: params.requestDigest,
+          outcome: { kind: '__pending__' },
+          recorded_at: params.recordedAt,
+        });
+
+        // Step 2: Claim identity or read winner
+        let status: 'created' | 'existing';
+        let finalOutcome: { kind: string; [k: string]: unknown };
+        const existingPredId = this.predictionsByIdentity.get(params.identityDigest);
+        if (!existingPredId) {
+          this.directInsertPrediction(definer, {
+            prediction_id: params.predictionId,
+            identity_digest: params.identityDigest,
+            sealed_payload: params.sealedPayload,
+            payload_digest: params.payloadDigest,
+            published_at: params.publishedAt,
+            recorded_at: params.recordedAt,
+          });
+          this.predictionsByIdentity.set(params.identityDigest, params.predictionId);
+          this.directInsertEvent(definer, {
+            prediction_id: params.predictionId,
+            seq: 'e0',
+            kind: 'published',
+            occurred_at: params.publishedAt,
+            recorded_at: params.recordedAt,
+            envelope: params.e0Envelope,
+            digest: params.e0Digest,
+            prev_digest: null,
+          });
+          status = 'created';
+          finalOutcome = {
+            kind: 'created',
+            predictionId: params.predictionId,
+            identityDigest: params.identityDigest,
+            requestDigest: params.requestDigest,
+            record: params.sealedPayload,
+          };
+        } else {
+          const winner = this.predictions.get(existingPredId)!;
+          status = 'existing';
+          finalOutcome = {
+            kind: 'existing',
+            predictionId: winner.prediction_id,
+            identityDigest: params.identityDigest,
+            requestDigest: params.requestDigest,
+            record: winner.sealed_payload,
+          };
+        }
+
+        // Step 3: Finalize '__pending__' -> ('created' | 'existing'), verifying prediction exists
+        this.assertTablePrivilege(definer, 'oracle_ledger.publication_idempotency_keys', 'UPDATE');
+        const current = this.idempotency.get(params.idempotencyKey)!;
+        if (current.outcome.kind !== '__pending__') {
+          throw new Error('23514: row already finalized');
+        }
+        const refPred = this.predictions.get(String(finalOutcome.predictionId));
+        if (!refPred || refPred.identity_digest !== finalOutcome.identityDigest) {
+          throw new Error(
+            '23514: cannot finalize as created/existing without matching official_predictions row',
+          );
+        }
+        this.idempotency.set(params.idempotencyKey, {
+          ...current,
+          outcome: structuredClone(finalOutcome),
+        });
+
+        return { status, outcome: finalOutcome };
+      }
+
+      // Controlled SECURITY DEFINER Function 2: record_rejected_or_conflict_idempotency
+      recordRejectedOrConflictIdempotency(
+        caller: RoleName,
+        params: {
+          idempotencyKey: string;
+          requestDigest: string;
+          outcome: { kind: string; [k: string]: unknown };
+          recordedAt: string;
+        },
+      ): { status: string; outcome?: Record<string, unknown> } {
+        this.assertFunctionExecute(
+          caller,
+          'oracle_ledger.record_rejected_or_conflict_idempotency',
+        );
+        if (!['identity-conflict', 'rejected'].includes(params.outcome.kind)) {
+          throw new Error(
+            `23514: record_rejected_or_conflict_idempotency only accepts identity-conflict or rejected outcomes, got: ${params.outcome.kind}`,
+          );
+        }
+        const definer: RoleName = 'oracle_migrator';
+        if (this.idempotency.has(params.idempotencyKey)) {
+          const existing = this.idempotency.get(params.idempotencyKey)!;
+          return existing.request_digest === params.requestDigest
+            ? { status: 'replayed', outcome: structuredClone(existing.outcome) }
+            : { status: 'idempotency-conflict' };
+        }
+        this.directInsertIdempotency(definer, {
+          idempotency_key: params.idempotencyKey,
+          request_digest: params.requestDigest,
+          outcome: params.outcome,
+          recorded_at: params.recordedAt,
+        });
+        return { status: 'recorded', outcome: structuredClone(params.outcome) };
+      }
+
+      // Controlled SECURITY DEFINER Function 3: append_terminal_prediction_event
+      appendTerminalPredictionEvent(
+        caller: RoleName,
+        params: {
+          predictionId: string;
+          kind: 'resolved' | 'annulled' | 'published';
+          occurredAt: string;
+          recordedAt: string;
+          envelope: Record<string, unknown>;
+          digest: string;
+          prevDigest: string;
+        },
+      ): void {
+        this.assertFunctionExecute(caller, 'oracle_ledger.append_terminal_prediction_event');
+        if (params.kind !== 'resolved' && params.kind !== 'annulled') {
+          throw new Error(
+            `23514: append_terminal_prediction_event only permits resolved or annulled events, got: ${params.kind}`,
+          );
+        }
+        if (params.recordedAt <= params.occurredAt) {
+          throw new Error('23514: p_recorded_at must be strictly greater than p_occurred_at');
+        }
+        if (!this.predictions.has(params.predictionId)) {
+          throw new Error(`23503: official_predictions row ${params.predictionId} does not exist`);
+        }
+        const existingEvents = this.events.get(params.predictionId) ?? [];
+        const e0 = existingEvents.find((e) => e.seq === 'e0' && e.kind === 'published');
+        if (!e0) {
+          throw new Error(`23514: initial e0 published event missing for ${params.predictionId}`);
+        }
+        if (e0.digest !== params.prevDigest) {
+          throw new Error('23514: p_prev_digest does not match e0 digest');
+        }
+        if (params.occurredAt <= e0.occurred_at) {
+          throw new Error('23514: terminal event occurred_at must be strictly after e0 occurred_at');
+        }
+        if (existingEvents.some((e) => e.seq === 'e1' || e.kind !== 'published')) {
+          throw new Error(`23505: prediction_id ${params.predictionId} already has a terminal event (e1)`);
+        }
+        const definer: RoleName = 'oracle_migrator';
+        this.directInsertEvent(definer, {
+          prediction_id: params.predictionId,
+          seq: 'e1',
+          kind: params.kind,
+          occurred_at: params.occurredAt,
+          recorded_at: params.recordedAt,
+          envelope: params.envelope,
+          digest: params.digest,
+          prev_digest: params.prevDigest,
+        });
+      }
+    }
+
+    const db = new SimulatedControlledLedgerDb();
+    const digestA = 'a'.repeat(64);
+    const digestB = 'b'.repeat(64);
+    const digestC = 'c'.repeat(64);
+    const digestD = 'd'.repeat(64);
+
+    // 1. oracle_app has no role membership in oracle_migrator
+    expect(db.hasRoleMembership('oracle_app', 'oracle_migrator')).toBe(false);
+    expect(db.hasRoleMembership('PUBLIC', 'oracle_migrator')).toBe(false);
+
+    // 2. oracle_app cannot insert finalized idempotency rows, predictions, or events directly
+    expect(() =>
+      db.directInsertIdempotency('oracle_app', {
+        idempotency_key: 'k-direct',
+        request_digest: digestA,
+        outcome: { kind: 'created', predictionId: 'pred-0001' },
+        recorded_at: '2026-11-22T00:00:01.000Z',
+      }),
+    ).toThrow(/42501: permission denied for table oracle_ledger\.publication_idempotency_keys/);
+
+    expect(() =>
+      db.directInsertPrediction('oracle_app', {
+        prediction_id: 'pred-0001',
+        identity_digest: digestB,
+        sealed_payload: { id: 'pred-0001', demo: false },
+        payload_digest: digestC,
+        published_at: '2026-11-22T00:00:00.000Z',
+        recorded_at: '2026-11-22T00:00:01.000Z',
+      }),
+    ).toThrow(/42501: permission denied for table oracle_ledger\.official_predictions/);
+
+    expect(() =>
+      db.directInsertEvent('oracle_app', {
+        prediction_id: 'pred-0001',
+        seq: 'e0',
+        kind: 'published',
+        occurred_at: '2026-11-22T00:00:00.000Z',
+        recorded_at: '2026-11-22T00:00:01.000Z',
+        envelope: {},
+        digest: digestD,
+        prev_digest: null,
+      }),
+    ).toThrow(/42501: permission denied for table oracle_ledger\.prediction_events/);
+
+    expect(() => db.directUpdatePrediction('oracle_app', 'pred-0001')).toThrow(
+      /42501: permission denied for table oracle_ledger\.official_predictions/,
+    );
+    expect(() => db.directDeleteEvent('oracle_app', 'pred-0001')).toThrow(
+      /42501: permission denied for table oracle_ledger\.prediction_events/,
+    );
+
+    // 3. PUBLIC cannot execute any function, and oracle_app cannot execute unapproved functions
+    for (const fnName of approvedFunctions) {
+      expect(() => db.callUnapprovedFunction('PUBLIC', fnName)).toThrow(
+        /42501: permission denied for function/,
+      );
+    }
+    for (const fnName of unapprovedFunctions) {
+      expect(() => db.callUnapprovedFunction('oracle_app', fnName)).toThrow(
+        /42501: permission denied for function/,
+      );
+      expect(() => db.callUnapprovedFunction('PUBLIC', fnName)).toThrow(
+        /42501: permission denied for function/,
+      );
+    }
+
+    // 4. oracle_app cannot abuse record_rejected_or_conflict_idempotency to insert 'created' or 'existing'
+    expect(() =>
+      db.recordRejectedOrConflictIdempotency('oracle_app', {
+        idempotencyKey: 'k-forged',
+        requestDigest: digestA,
+        outcome: { kind: 'created', predictionId: 'pred-forged' },
+        recordedAt: '2026-11-22T00:00:01.000Z',
+      }),
+    ).toThrow(
+      /23514: record_rejected_or_conflict_idempotency only accepts identity-conflict or rejected outcomes/,
+    );
+
+    // 5. oracle_app CAN record a valid 'rejected' outcome via record_rejected_or_conflict_idempotency
+    const rejectedRes = db.recordRejectedOrConflictIdempotency('oracle_app', {
+      idempotencyKey: 'k-rejected-1',
+      requestDigest: digestA,
+      outcome: { kind: 'rejected', candidateId: 'cand-1' },
+      recordedAt: '2026-11-22T00:00:01.000Z',
+    });
+    expect(rejectedRes.status).toBe('recorded');
+
+    // 6. oracle_app CAN publish atomically via commit_official_publication
+    const pubRes = db.commitOfficialPublication('oracle_app', {
+      idempotencyKey: 'k-pub-1',
+      requestDigest: digestA,
+      predictionId: 'pred-0001',
+      identityDigest: digestB,
+      sealedPayload: { id: 'pred-0001', demo: false },
+      payloadDigest: digestC,
+      publishedAt: '2026-11-22T00:00:00.000Z',
+      recordedAt: '2026-11-22T00:00:01.000Z',
+      e0Envelope: { seq: 'e0', kind: 'published' },
+      e0Digest: digestD,
+    });
+    expect(pubRes.status).toBe('created');
+
+    // 7. oracle_app CAN append a single valid terminal 'resolved' event via append_terminal_prediction_event,
+    //    and any second terminal event or wrong prev_digest is rejected
+    expect(() =>
+      db.appendTerminalPredictionEvent('oracle_app', {
+        predictionId: 'pred-0001',
+        kind: 'published',
+        occurredAt: '2026-11-22T01:00:00.000Z',
+        recordedAt: '2026-11-22T01:00:01.000Z',
+        envelope: { seq: 'e1', kind: 'published' },
+        digest: 'e'.repeat(64),
+        prevDigest: digestD,
+      }),
+    ).toThrow(/23514: append_terminal_prediction_event only permits resolved or annulled events/);
+
+    expect(() =>
+      db.appendTerminalPredictionEvent('oracle_app', {
+        predictionId: 'pred-0001',
+        kind: 'resolved',
+        occurredAt: '2026-11-22T01:00:00.000Z',
+        recordedAt: '2026-11-22T01:00:01.000Z',
+        envelope: { seq: 'e1', kind: 'resolved' },
+        digest: 'e'.repeat(64),
+        prevDigest: 'f'.repeat(64),
+      }),
+    ).toThrow(/23514: p_prev_digest does not match e0 digest/);
+
+    expect(() =>
+      db.appendTerminalPredictionEvent('oracle_app', {
+        predictionId: 'pred-0001',
+        kind: 'resolved',
+        occurredAt: '2026-11-22T01:00:00.000Z',
+        recordedAt: '2026-11-22T01:00:01.000Z',
+        envelope: { seq: 'e1', kind: 'resolved' },
+        digest: 'e'.repeat(64),
+        prevDigest: digestD,
+      }),
+    ).not.toThrow();
+
+    expect(() =>
+      db.appendTerminalPredictionEvent('oracle_app', {
+        predictionId: 'pred-0001',
+        kind: 'annulled',
+        occurredAt: '2026-11-22T02:00:00.000Z',
+        recordedAt: '2026-11-22T02:00:01.000Z',
+        envelope: { seq: 'e1', kind: 'annulled' },
+        digest: '1'.repeat(64),
+        prevDigest: digestD,
+      }),
+    ).toThrow(/23505: prediction_id pred-0001 already has a terminal event \(e1\)/);
   });
 });
 
