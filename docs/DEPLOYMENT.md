@@ -62,3 +62,25 @@ done
 
 `vite preview` applies the SPA fallback itself, so a 200 here does **not** prove
 the host is configured. Always re-test against the real origin.
+
+## Neon GitHub Actions integration (`.github/workflows/neon-workflow.yml`)
+
+Pull requests automatically provision and clean up isolated temporary PostgreSQL
+branches in Neon via `.github/workflows/neon-workflow.yml`.
+
+### Required GitHub Actions settings
+
+| Type | Name | Description |
+|---|---|---|
+| Repository variable | `NEON_PROJECT_ID` | Neon project identifier (referenced via `${{ vars.NEON_PROJECT_ID }}`) |
+| Repository secret | `NEON_API_KEY` | Neon API key (referenced via `${{ secrets.NEON_API_KEY }}`; never logged or committed) |
+
+### Workflow lifecycle and guarantees
+
+- **Branch creation / reuse (`opened`, `reopened`, `synchronize`)**:
+  - Computes an RFC 3339 UTC timestamp 14 days in the future (`date -u --date '+14 days' +'%Y-%m-%dT%H:%M:%SZ'`) and passes it as `expires_at` to `neondatabase/create-branch-action@v6`.
+  - Creates (or reuses on `synchronize` / `reopened`) a branch named `preview/pr-<number>-<head_ref>`.
+  - Masks sensitive step outputs (`password`, `db_url`, `db_url_pooled`) in the runner log stream via `::add-mask::` and exposes only non-sensitive job outputs (`branch_id`, `created`, `db_host`, `db_host_pooled`) bound directly to `steps.create_neon_branch.outputs.*`.
+- **Branch deletion (`closed`)**:
+  - Deletes `preview/pr-<number>-<head_ref>` via `neondatabase/delete-branch-action@v3` when the pull request is closed or merged. If deletion is skipped for any reason, the 14-day `expires_at` TTL guarantees automatic cleanup in Neon.
+

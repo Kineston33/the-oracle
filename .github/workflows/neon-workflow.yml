@@ -1,0 +1,84 @@
+name: Create/Delete Neon Branch for Pull Request
+
+on:
+  pull_request:
+    types:
+      - opened
+      - reopened
+      - synchronize
+      - closed
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+
+permissions:
+  contents: read
+
+jobs:
+  setup:
+    name: Setup
+    runs-on: ubuntu-latest
+    outputs:
+      branch: ${{ steps.branch_name.outputs.current_branch }}
+    steps:
+      - name: Get PR head branch name
+        id: branch_name
+        env:
+          HEAD_REF: ${{ github.head_ref }}
+        run: echo "current_branch=${HEAD_REF}" >> "$GITHUB_OUTPUT"
+
+  create_neon_branch:
+    name: Create Neon Branch
+    needs: setup
+    if: >-
+      github.event_name == 'pull_request' && (
+      github.event.action == 'opened' ||
+      github.event.action == 'reopened' ||
+      github.event.action == 'synchronize')
+    runs-on: ubuntu-latest
+    outputs:
+      branch_id: ${{ steps.create_neon_branch.outputs.branch_id }}
+      created: ${{ steps.create_neon_branch.outputs.created }}
+      db_host: ${{ steps.create_neon_branch.outputs.db_host }}
+      db_host_pooled: ${{ steps.create_neon_branch.outputs.db_host_pooled }}
+    steps:
+      - name: Set 14-day branch expiration timestamp (RFC 3339 UTC)
+        id: expiration
+        run: echo "expires_at=$(date -u --date '+14 days' +'%Y-%m-%dT%H:%M:%SZ')" >> "$GITHUB_OUTPUT"
+
+      - name: Create Neon Branch
+        id: create_neon_branch
+        uses: neondatabase/create-branch-action@v6
+        with:
+          project_id: ${{ vars.NEON_PROJECT_ID }}
+          branch_name: preview/pr-${{ github.event.number }}-${{ needs.setup.outputs.branch }}
+          api_key: ${{ secrets.NEON_API_KEY }}
+          expires_at: ${{ steps.expiration.outputs.expires_at }}
+
+      - name: Mask connection credentials and log non-sensitive metadata
+        env:
+          DB_PASSWORD: ${{ steps.create_neon_branch.outputs.password }}
+          DB_URL: ${{ steps.create_neon_branch.outputs.db_url }}
+          DB_URL_POOLED: ${{ steps.create_neon_branch.outputs.db_url_pooled }}
+          BRANCH_ID: ${{ steps.create_neon_branch.outputs.branch_id }}
+          BRANCH_CREATED: ${{ steps.create_neon_branch.outputs.created }}
+          EXPIRES_AT: ${{ steps.expiration.outputs.expires_at }}
+        run: |
+          if [ -n "${DB_PASSWORD}" ]; then echo "::add-mask::${DB_PASSWORD}"; fi
+          if [ -n "${DB_URL}" ]; then echo "::add-mask::${DB_URL}"; fi
+          if [ -n "${DB_URL_POOLED}" ]; then echo "::add-mask::${DB_URL_POOLED}"; fi
+          echo "Neon branch ready: id=${BRANCH_ID}, created=${BRANCH_CREATED}, expires_at=${EXPIRES_AT}"
+
+  delete_neon_branch:
+    name: Delete Neon Branch
+    needs: setup
+    if: github.event_name == 'pull_request' && github.event.action == 'closed'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Delete Neon Branch
+        id: delete_neon_branch
+        uses: neondatabase/delete-branch-action@v3
+        with:
+          project_id: ${{ vars.NEON_PROJECT_ID }}
+          branch: preview/pr-${{ github.event.number }}-${{ needs.setup.outputs.branch }}
+          api_key: ${{ secrets.NEON_API_KEY }}
