@@ -9,7 +9,8 @@
 
 import { spawn } from 'node:child_process';
 import { EventEmitter } from 'node:events';
-import { dirname, resolve } from 'node:path';
+import { readFileSync } from 'node:fs';
+import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import pg from 'pg';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
@@ -37,13 +38,20 @@ import {
   type EmbeddedPostgresCluster,
 } from './embedded-pg.ts';
 import {
+  MigrationTargetSecurityError,
   PostgresPublicationRegistry,
   RuntimeRoleSecurityError,
+  executeSafeMigrationRun,
+  formatSafeMigrationReport,
+  probeDatabaseIdentity,
   redactSecrets,
   runLedgerMigrations,
   runLedgerSecurityAudit,
+  runMigrationCli,
   runOracleServerCli,
   startOracleServer,
+  validateMigrationConnectionUrl,
+  verifyMigrationTargetIdentity,
   verifyRuntimeDatabaseRole,
 } from './index.ts';
 
@@ -1485,6 +1493,495 @@ describe('Real PostgreSQL 16+ Integration Suite — Official Publication Protoco
       } finally {
         await extPool.end();
       }
+    }
+  });
+
+  it('14. enforces safe migration runner guards (MIGRATION_DATABASE_URL only, non-pooled, production blocked, anti-spoofing branch verification, and Neon neondb_owner role execution)', async () => {
+    // 1. Rejects missing MIGRATION_DATABASE_URL even when DATABASE_URL is present
+    expect(() =>
+      validateMigrationConnectionUrl(undefined, cluster.appConnectionString),
+    ).toThrow(MigrationTargetSecurityError);
+    expect(() =>
+      validateMigrationConnectionUrl('', cluster.appConnectionString),
+    ).toThrow(/MIGRATION_DATABASE_URL environment variable is required/);
+
+    // 2. Rejects when MIGRATION_DATABASE_URL is identical to runtime DATABASE_URL
+    expect(() =>
+      validateMigrationConnectionUrl(
+        cluster.adminConnectionString,
+        cluster.adminConnectionString,
+      ),
+    ).toThrow(/MIGRATION_DATABASE_URL must not be identical to runtime DATABASE_URL/);
+
+    // 3. Rejects pooled endpoints (-pooler) and pgbouncer=true
+    expect(() =>
+      validateMigrationConnectionUrl(
+        'postgresql://neondb_owner:secret@ep-cool-darkness-123456-pooler.us-east-2.aws.neon.tech/neondb?sslmode=require',
+      ),
+    ).toThrow(/uses a pooled endpoint \(-pooler\)/);
+    expect(() =>
+      validateMigrationConnectionUrl(
+        'postgresql://neondb_owner:secret@ep-cool-darkness-123456.us-east-2.aws.neon.tech/neondb?sslmode=require&pgbouncer=true',
+      ),
+    ).toThrow(/pgbouncer=true/);
+
+    // 4. Rejects connecting as oracle_app or oracle_migrator, or Neon host without SSL
+    expect(() =>
+      validateMigrationConnectionUrl(
+        'postgresql://oracle_app:secret@ep-cool-darkness-123456.us-east-2.aws.neon.tech/neondb?sslmode=require',
+      ),
+    ).toThrow(/cannot connect as role 'oracle_app'/);
+    expect(() =>
+      validateMigrationConnectionUrl(
+        'postgresql://neondb_owner:secret@ep-cool-darkness-123456.us-east-2.aws.neon.tech/neondb',
+      ),
+    ).toThrow(/must enforce SSL/);
+
+    // 4b. executeSafeMigrationRun aborts before connecting if ORACLE_APP_PASSWORD is missing or empty
+    await expect(
+      executeSafeMigrationRun({
+        migrationDatabaseUrl: cluster.adminConnectionString,
+        oracleAppPassword: '',
+      }),
+    ).rejects.toThrow(
+      /ORACLE_APP_PASSWORD environment variable is required/,
+    );
+
+    // 5. Anti-spoofing & production protection: verifyMigrationTargetIdentity blocks production
+    //    even when the operator passes expectedBranchName='staging-test'
+    const baseProbe = await probeDatabaseIdentity(adminPool);
+    const neonConnInfo = validateMigrationConnectionUrl(
+      'postgresql://neondb_owner:secret@ep-prod-endpoint-111.us-east-2.aws.neon.tech/neondb?sslmode=require',
+    );
+
+    // 5a. Neon control plane resolves endpoint to 'production' (or default=true) -> BLOCKED even if operator claims 'staging'
+    await expect(
+      verifyMigrationTargetIdentity({
+        connectionInfo: neonConnInfo,
+        probe: {
+          ...baseProbe,
+          neonProjectId: 'wispy-cell-45340306',
+          neonBranchId: 'br-prod-001',
+        },
+        expectedBranchName: 'staging-test',
+        branchResolver: async () => ({
+          projectId: 'wispy-cell-45340306',
+          branchId: 'br-prod-001',
+          branchName: 'production',
+          endpointId: 'ep-prod-endpoint-111',
+          endpointHost: 'ep-prod-endpoint-111.us-east-2.aws.neon.tech',
+          isDefault: true,
+          isPrimary: true,
+          isProtected: true,
+          parentId: null,
+          source: 'custom-resolver',
+        }),
+      }),
+    ).rejects.toThrow(
+      /Refusing to run migrations against protected\/production Neon branch 'production'/,
+    );
+
+    // 5b. Even if a branch is named 'staging-like', if Neon marks it isDefault=true or isProtected=true -> BLOCKED
+    await expect(
+      verifyMigrationTargetIdentity({
+        connectionInfo: neonConnInfo,
+        probe: {
+          ...baseProbe,
+          neonProjectId: 'wispy-cell-45340306',
+          neonBranchId: 'br-default-001',
+        },
+        branchResolver: async () => ({
+          projectId: 'wispy-cell-45340306',
+          branchId: 'br-default-001',
+          branchName: 'custom-default-branch',
+          endpointId: 'ep-prod-endpoint-111',
+          endpointHost: 'ep-prod-endpoint-111.us-east-2.aws.neon.tech',
+          isDefault: true,
+          isPrimary: false,
+          isProtected: false,
+          parentId: null,
+          source: 'custom-resolver',
+        }),
+      }),
+    ).rejects.toThrow(/protected\/production Neon branch/);
+
+    // 5c. Fail-closed when Neon control plane cannot resolve the branch and no server GUC proof is present
+    await expect(
+      verifyMigrationTargetIdentity({
+        connectionInfo: neonConnInfo,
+        probe: baseProbe,
+        expectedBranchName: 'staging-test',
+        branchResolver: async () => null,
+      }),
+    ).rejects.toThrow(/Unable to verify the real branch identity/);
+
+    // 5d. Blocks when database catalog comment marks the database as production (even on local loopback)
+    const localConnInfo = validateMigrationConnectionUrl(
+      cluster.adminConnectionString,
+    );
+    await expect(
+      verifyMigrationTargetIdentity({
+        connectionInfo: localConnInfo,
+        probe: {
+          ...baseProbe,
+          databaseComment: '{"oracleEnv":"production","branch":"production"}',
+        },
+        expectedBranchName: 'test-branch',
+      }),
+    ).rejects.toThrow(/marks this database as production/);
+
+    // 5e. Accepts a verified non-production Neon test branch from control plane
+    const verifiedTestTarget = await verifyMigrationTargetIdentity({
+      connectionInfo: validateMigrationConnectionUrl(
+        'postgresql://neondb_owner:secret@ep-test-branch-222.us-east-2.aws.neon.tech/neondb?sslmode=require',
+      ),
+      probe: {
+        ...baseProbe,
+        neonProjectId: 'wispy-cell-45340306',
+        neonBranchId: 'br-test-222',
+      },
+      expectedBranchName: 'preview/pr-5-test',
+      expectedBranchId: 'br-test-222',
+      branchResolver: async () => ({
+        projectId: 'wispy-cell-45340306',
+        branchId: 'br-test-222',
+        branchName: 'preview/pr-5-test',
+        endpointId: 'ep-test-branch-222',
+        endpointHost: 'ep-test-branch-222.us-east-2.aws.neon.tech',
+        isDefault: false,
+        isPrimary: false,
+        isProtected: false,
+        parentId: 'br-prod-001',
+        source: 'custom-resolver',
+      }),
+    });
+    expect(verifiedTestTarget).toEqual({
+      verificationMethod: 'neon-control-plane',
+      projectId: 'wispy-cell-45340306',
+      branchId: 'br-test-222',
+      branchName: 'preview/pr-5-test',
+      endpointId: 'ep-test-branch-222',
+      isProduction: false,
+    });
+
+    // 6. Full end-to-end execution of executeSafeMigrationRun & runMigrationCli as a Neon-style
+    //    non-superuser role (neondb_owner with CREATEDB CREATEROLE IN ROLE neon_superuser)
+    await adminPool.query(`
+      DO $$
+      BEGIN
+        IF NOT EXISTS (SELECT 1 FROM pg_catalog.pg_roles WHERE rolname = 'neon_superuser') THEN
+          CREATE ROLE neon_superuser NOLOGIN CREATEDB CREATEROLE BYPASSRLS;
+        END IF;
+        IF NOT EXISTS (SELECT 1 FROM pg_catalog.pg_roles WHERE rolname = 'neondb_owner') THEN
+          CREATE ROLE neondb_owner LOGIN PASSWORD 'neondb_owner_secret_pw' CREATEDB CREATEROLE IN ROLE neon_superuser;
+        END IF;
+        -- Because oracle_migrator and oracle_app were already created by postgres in beforeAll
+        -- on this shared cluster, grant neondb_owner ADMIN OPTION on them to match the exact
+        -- PostgreSQL 16 pg_auth_members state when neondb_owner creates them on a Neon branch.
+        GRANT oracle_migrator TO neondb_owner WITH ADMIN TRUE, INHERIT TRUE, SET TRUE;
+        GRANT oracle_app TO neondb_owner WITH ADMIN TRUE, INHERIT FALSE, SET FALSE;
+      END;
+      $$;
+    `);
+    await adminPool.query('CREATE DATABASE oracle_neon_branch_test OWNER neondb_owner');
+
+    const neonBranchTestUrl = new URL(cluster.adminConnectionString);
+    neonBranchTestUrl.username = 'neondb_owner';
+    neonBranchTestUrl.password = 'neondb_owner_secret_pw';
+    neonBranchTestUrl.pathname = '/oracle_neon_branch_test';
+
+    const appTestPassword = 'oracle_app_branch_test_pw_99';
+
+    // First run via executeSafeMigrationRun
+    const migrationReport = await executeSafeMigrationRun({
+      migrationDatabaseUrl: neonBranchTestUrl.toString(),
+      oracleAppPassword: appTestPassword,
+    });
+    expect(migrationReport.connection.database).toBe('oracle_neon_branch_test');
+    expect(migrationReport.connection.migrationUser).toBe('neondb_owner');
+    expect(migrationReport.audit.compliant).toBe(true);
+    expect(migrationReport.oracleApp.liveLoginVerified).toBe(true);
+
+    const formatted = formatSafeMigrationReport(migrationReport);
+    expect(formatted).toContain('§2.5 Audit Compliant  : PASS (0 violations)');
+    expect(formatted).toContain('Live Login Verified   : YES (authenticated as oracle_app)');
+    expect(formatted).not.toContain('neondb_owner_secret_pw');
+    expect(formatted).not.toContain(appTestPassword);
+    expect(formatted).not.toContain(neonBranchTestUrl.toString());
+
+    // Second (idempotent) run via runMigrationCli
+    const cliLogs: string[] = [];
+    const cliErrors: string[] = [];
+    const cliExits: number[] = [];
+    const cliResult = await runMigrationCli({
+      migrationDatabaseUrl: neonBranchTestUrl.toString(),
+      oracleAppPassword: appTestPassword,
+      argv: [],
+      logger: {
+        info: (m) => cliLogs.push(m),
+        error: (m) => cliErrors.push(m),
+      },
+      exit: (code) => cliExits.push(code),
+    });
+    expect(cliResult).not.toBeNull();
+    expect(cliErrors).toEqual([]);
+    expect(cliExits).toEqual([0]);
+    expect(cliLogs.join('\n')).not.toContain(appTestPassword);
+
+    // Verify startOracleServer starts cleanly against the newly migrated database using oracle_app
+    const runtimeBranchUrl = new URL(neonBranchTestUrl.toString());
+    runtimeBranchUrl.username = 'oracle_app';
+    runtimeBranchUrl.password = appTestPassword;
+    const runningOnBranch = await startOracleServer({
+      databaseUrl: runtimeBranchUrl.toString(),
+      port: 0,
+      host: '127.0.0.1',
+    });
+    try {
+      const res = await fetch(
+        `http://127.0.0.1:${runningOnBranch.port}/v1/predictions`,
+      );
+      expect(res.status).toBe(200);
+    } finally {
+      await runningOnBranch.close();
+    }
+  });
+
+  it('15. never interpolates ORACLE_APP_PASSWORD into SQL statement text, enforces preflight logging safety before sending $1, and aborts fail-closed when logging or role permissions are unsafe', async () => {
+    // Spin up a dedicated fresh PostgreSQL 16 cluster so we test both:
+    // (a) initial creation of oracle_app from scratch as non-superuser neondb_owner, and
+    // (b) idempotent re-execution (password rotation) on existing oracle_app.
+    const isolatedCluster = await startEmbeddedPostgres16();
+    try {
+      const superClient = new pg.Client({
+        connectionString: isolatedCluster.adminConnectionString,
+      });
+      await superClient.connect();
+      try {
+        // Enable server-level DDL logging to prove the password never lands in postgres.log
+        await superClient.query("ALTER SYSTEM SET log_statement = 'ddl'");
+        await superClient.query('SELECT pg_reload_conf()');
+
+        await superClient.query(
+          'CREATE ROLE neon_superuser NOLOGIN CREATEDB CREATEROLE BYPASSRLS',
+        );
+        await superClient.query(
+          "CREATE ROLE neondb_owner LOGIN PASSWORD 'neondb_owner_iso_pw' CREATEDB CREATEROLE IN ROLE neon_superuser",
+        );
+        await superClient.query(
+          "CREATE ROLE unprivileged_migrator LOGIN PASSWORD 'unpriv_pw' NOSUPERUSER NOCREATEDB NOCREATEROLE",
+        );
+        await superClient.query(
+          "CREATE ROLE peer_createrole LOGIN PASSWORD 'peer_pw' NOSUPERUSER NOCREATEDB CREATEROLE",
+        );
+        await superClient.query(
+          'CREATE DATABASE neondb OWNER neondb_owner',
+        );
+      } finally {
+        await superClient.end();
+      }
+
+      const neondbOwnerUrl = new URL(isolatedCluster.adminConnectionString);
+      neondbOwnerUrl.username = 'neondb_owner';
+      neondbOwnerUrl.password = 'neondb_owner_iso_pw';
+      neondbOwnerUrl.pathname = '/neondb';
+
+      const initialCanaryPw = 'InitCanary_NoSqlLiteral_2026!#A';
+      const rotatedCanaryPw = 'RotateCanary_NoSqlLiteral_2026!#B';
+      const blockedCanaryPw = 'BlockedCanary_NeverSent_2026!#C';
+
+      // Intercept every SQL text and parameter array sent through pg.Client.prototype.query
+      const capturedQueries: Array<{ sql: string; values: unknown[] }> = [];
+      const originalQuery = pg.Client.prototype.query;
+      pg.Client.prototype.query = function patchedQuery(
+        this: pg.Client,
+        ...args: unknown[]
+      ) {
+        const first = args[0];
+        const second = args[1];
+        const sqlText =
+          typeof first === 'string'
+            ? first
+            : first &&
+                typeof first === 'object' &&
+                'text' in first &&
+                typeof (first as { text?: unknown }).text === 'string'
+              ? ((first as { text: string }).text ?? '')
+              : '';
+        const values = Array.isArray(second)
+          ? second
+          : first &&
+              typeof first === 'object' &&
+              'values' in first &&
+              Array.isArray((first as { values?: unknown }).values)
+            ? (first as { values: unknown[] }).values
+            : [];
+        capturedQueries.push({ sql: sqlText, values });
+        return (originalQuery as (...a: unknown[]) => unknown).apply(
+          this,
+          args,
+        );
+      } as typeof pg.Client.prototype.query;
+
+      try {
+        // 1. Initial creation of oracle_app (role does not exist yet on isolatedCluster)
+        const firstReport = await executeSafeMigrationRun({
+          migrationDatabaseUrl: neondbOwnerUrl.toString(),
+          oracleAppPassword: initialCanaryPw,
+        });
+        expect(firstReport.audit.compliant).toBe(true);
+        expect(firstReport.oracleApp.liveLoginVerified).toBe(true);
+
+        // Verify NO SQL statement text ever contained initialCanaryPw
+        for (const q of capturedQueries) {
+          expect(q.sql).not.toContain(initialCanaryPw);
+        }
+        // Verify initialCanaryPw was passed ONLY as a $1 bind parameter to pg_temp.oracle_provision_app_role
+        const paramQueries1 = capturedQueries.filter((q) =>
+          q.values.includes(initialCanaryPw),
+        );
+        expect(paramQueries1).toHaveLength(1);
+        expect(paramQueries1[0]!.sql).toBe(
+          'SELECT pg_temp.oracle_provision_app_role($1::text)',
+        );
+
+        // Verify the logging guard ran BEFORE the $1 parameter query was sent
+        const setConfigIdx = capturedQueries.findIndex((q) =>
+          q.sql.includes("set_config('log_parameter_max_length_on_error', '0', true)"),
+        );
+        const paramSendIdx = capturedQueries.findIndex((q) =>
+          q.values.includes(initialCanaryPw),
+        );
+        expect(setConfigIdx).toBeGreaterThanOrEqual(0);
+        expect(setConfigIdx).toBeLessThan(paramSendIdx);
+
+        // 2. Idempotent re-execution with rotated password
+        capturedQueries.length = 0;
+        const secondReport = await executeSafeMigrationRun({
+          migrationDatabaseUrl: neondbOwnerUrl.toString(),
+          oracleAppPassword: rotatedCanaryPw,
+        });
+        expect(secondReport.audit.compliant).toBe(true);
+        expect(secondReport.oracleApp.liveLoginVerified).toBe(true);
+
+        for (const q of capturedQueries) {
+          expect(q.sql).not.toContain(rotatedCanaryPw);
+        }
+        const paramQueries2 = capturedQueries.filter((q) =>
+          q.values.includes(rotatedCanaryPw),
+        );
+        expect(paramQueries2).toHaveLength(1);
+        expect(paramQueries2[0]!.sql).toBe(
+          'SELECT pg_temp.oracle_provision_app_role($1::text)',
+        );
+
+        // 3. Fail-closed BEFORE sending password when role lacks CREATEROLE
+        capturedQueries.length = 0;
+        const unprivUrl = new URL(neondbOwnerUrl.toString());
+        unprivUrl.username = 'unprivileged_migrator';
+        unprivUrl.password = 'unpriv_pw';
+        await expect(
+          executeSafeMigrationRun({
+            migrationDatabaseUrl: unprivUrl.toString(),
+            oracleAppPassword: blockedCanaryPw,
+          }),
+        ).rejects.toThrow(
+          /lacks SUPERUSER and CREATEROLE privileges required to provision oracle_app; aborting before sending password/,
+        );
+        expect(
+          capturedQueries.some(
+            (q) =>
+              q.sql.includes(blockedCanaryPw) ||
+              q.values.includes(blockedCanaryPw),
+          ),
+        ).toBe(false);
+
+        // 4. Fail-closed BEFORE sending password when role has CREATEROLE but lacks ADMIN OPTION on existing oracle_app
+        capturedQueries.length = 0;
+        const peerUrl = new URL(neondbOwnerUrl.toString());
+        peerUrl.username = 'peer_createrole';
+        peerUrl.password = 'peer_pw';
+        await expect(
+          executeSafeMigrationRun({
+            migrationDatabaseUrl: peerUrl.toString(),
+            oracleAppPassword: blockedCanaryPw,
+          }),
+        ).rejects.toThrow(
+          /lacks ADMIN OPTION on existing role 'oracle_app'; aborting before sending password/,
+        );
+        expect(
+          capturedQueries.some(
+            (q) =>
+              q.sql.includes(blockedCanaryPw) ||
+              q.values.includes(blockedCanaryPw),
+          ),
+        ).toBe(false);
+
+        // 5. Fail-closed BEFORE sending password when server has log_statement = 'all'
+        //    and connected role is a non-superuser (cannot disable log_statement)
+        const superToggle = new pg.Client({
+          connectionString: isolatedCluster.adminConnectionString,
+        });
+        await superToggle.connect();
+        try {
+          await superToggle.query("ALTER SYSTEM SET log_statement = 'all'");
+          await superToggle.query('SELECT pg_reload_conf()');
+        } finally {
+          await superToggle.end();
+        }
+
+        capturedQueries.length = 0;
+        await expect(
+          executeSafeMigrationRun({
+            migrationDatabaseUrl: neondbOwnerUrl.toString(),
+            oracleAppPassword: blockedCanaryPw,
+          }),
+        ).rejects.toThrow(
+          /Cannot guarantee password-safe logging for non-superuser role 'neondb_owner'/,
+        );
+        // Verify blockedCanaryPw was NEVER sent over the wire (neither in SQL nor in bind values)
+        expect(
+          capturedQueries.some(
+            (q) =>
+              q.sql.includes(blockedCanaryPw) ||
+              q.values.includes(blockedCanaryPw),
+          ),
+        ).toBe(false);
+
+        // 6. When connected as superuser even with server log_statement = 'all',
+        //    provisionOracleAppPasswordSafely disables log_statement in a standalone query
+        //    BEFORE sending $1, so the password never appears in SQL text or postgres.log
+        capturedQueries.length = 0;
+        const superMigrateUrl = new URL(isolatedCluster.adminConnectionString);
+        superMigrateUrl.pathname = '/neondb';
+        const superCanaryPw = 'SuperCanary_SafeEvenWithAll_2026!#D';
+        const superReport = await executeSafeMigrationRun({
+          migrationDatabaseUrl: superMigrateUrl.toString(),
+          oracleAppPassword: superCanaryPw,
+        });
+        expect(superReport.audit.compliant).toBe(true);
+        expect(superReport.oracleApp.liveLoginVerified).toBe(true);
+        for (const q of capturedQueries) {
+          expect(q.sql).not.toContain(superCanaryPw);
+        }
+
+        // 7. Inspect the real PostgreSQL 16 server log file on disk and verify ZERO canary passwords leaked
+        const pgServerLog = readFileSync(
+          join(dirname(isolatedCluster.dataDir), 'postgres.log'),
+          'utf8',
+        );
+        expect(pgServerLog).toContain(
+          'CREATE OR REPLACE FUNCTION pg_temp.oracle_provision_app_role',
+        );
+        expect(pgServerLog).not.toContain(initialCanaryPw);
+        expect(pgServerLog).not.toContain(rotatedCanaryPw);
+        expect(pgServerLog).not.toContain(blockedCanaryPw);
+        expect(pgServerLog).not.toContain(superCanaryPw);
+      } finally {
+        pg.Client.prototype.query = originalQuery;
+      }
+    } finally {
+      await isolatedCluster.stop();
     }
   });
 });

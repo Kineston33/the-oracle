@@ -22,18 +22,50 @@ $$;
 -- 2. Provision and harden roles (oracle_migrator = NOLOGIN owner, oracle_app = runtime)
 DO $$
 DECLARE
-  v_membership RECORD;
+  v_membership   RECORD;
+  v_is_superuser BOOLEAN;
 BEGIN
+  SELECT r.rolsuper
+    INTO v_is_superuser
+    FROM pg_catalog.pg_roles AS r
+   WHERE r.rolname = CURRENT_USER;
+
   IF NOT EXISTS (SELECT 1 FROM pg_catalog.pg_roles WHERE rolname = 'oracle_migrator') THEN
     CREATE ROLE oracle_migrator NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOLOGIN;
-  ELSE
-    ALTER ROLE oracle_migrator NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOLOGIN;
+  ELSIF EXISTS (
+    SELECT 1
+      FROM pg_catalog.pg_roles
+     WHERE rolname = 'oracle_migrator'
+       AND (rolsuper OR rolcreatedb OR rolcreaterole OR rolinherit OR rolcanlogin)
+  ) THEN
+    IF COALESCE(v_is_superuser, FALSE) THEN
+      ALTER ROLE oracle_migrator NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOLOGIN;
+    ELSE
+      ALTER ROLE oracle_migrator NOCREATEDB NOCREATEROLE NOINHERIT NOLOGIN;
+    END IF;
+  END IF;
+
+  -- In PostgreSQL 16+, a non-superuser role with CREATEROLE (such as Neon's neondb_owner)
+  -- automatically receives ADMIN OPTION on roles it creates, but requires INHERIT and SET
+  -- privileges on oracle_migrator to execute CREATE SCHEMA ... AUTHORIZATION oracle_migrator
+  -- and ALTER ... OWNER TO oracle_migrator.
+  IF NOT COALESCE(v_is_superuser, FALSE) AND CURRENT_USER NOT IN ('oracle_migrator', 'oracle_app') THEN
+    EXECUTE pg_catalog.format('GRANT oracle_migrator TO %I WITH INHERIT TRUE, SET TRUE', CURRENT_USER);
   END IF;
 
   IF NOT EXISTS (SELECT 1 FROM pg_catalog.pg_roles WHERE rolname = 'oracle_app') THEN
     CREATE ROLE oracle_app NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOBYPASSRLS NOREPLICATION LOGIN;
-  ELSE
-    ALTER ROLE oracle_app NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOBYPASSRLS NOREPLICATION LOGIN;
+  ELSIF EXISTS (
+    SELECT 1
+      FROM pg_catalog.pg_roles
+     WHERE rolname = 'oracle_app'
+       AND (rolsuper OR rolcreatedb OR rolcreaterole OR rolinherit OR rolbypassrls OR rolreplication OR NOT rolcanlogin)
+  ) THEN
+    IF COALESCE(v_is_superuser, FALSE) THEN
+      ALTER ROLE oracle_app NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOBYPASSRLS NOREPLICATION LOGIN;
+    ELSE
+      ALTER ROLE oracle_app NOCREATEDB NOCREATEROLE NOINHERIT LOGIN;
+    END IF;
   END IF;
 
   -- Revoke any existing direct role memberships from oracle_app

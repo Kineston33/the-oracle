@@ -28,13 +28,16 @@ jobs:
         run: echo "current_branch=${HEAD_REF}" >> "$GITHUB_OUTPUT"
 
   create_neon_branch:
-    name: Create Neon Branch
+    name: Create Neon Branch & Run Safe Migration
     needs: setup
     if: >-
-      github.event_name == 'pull_request' && (
+      github.event_name == 'pull_request' &&
+      github.event.action != 'closed' && (
       github.event.action == 'opened' ||
       github.event.action == 'reopened' ||
-      github.event.action == 'synchronize')
+      github.event.action == 'synchronize') &&
+      github.head_ref != 'main' &&
+      github.head_ref != 'production'
     runs-on: ubuntu-latest
     outputs:
       branch_id: ${{ steps.create_neon_branch.outputs.branch_id }}
@@ -68,6 +71,91 @@ jobs:
           if [ -n "${DB_URL}" ]; then echo "::add-mask::${DB_URL}"; fi
           if [ -n "${DB_URL_POOLED}" ]; then echo "::add-mask::${DB_URL_POOLED}"; fi
           echo "Neon branch ready: id=${BRANCH_ID}, created=${BRANCH_CREATED}, expires_at=${EXPIRES_AT}"
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run safe PostgreSQL ledger migration and security audit on preview branch
+        if: >-
+          github.event_name == 'pull_request' &&
+          github.event.action != 'closed' && (
+          github.event.action == 'opened' ||
+          github.event.action == 'reopened' ||
+          github.event.action == 'synchronize') &&
+          github.head_ref != 'main' &&
+          github.head_ref != 'production' &&
+          startsWith(format('preview/pr-{0}-{1}', github.event.number, needs.setup.outputs.branch), 'preview/pr-')
+        env:
+          MIGRATION_DATABASE_URL: ${{ steps.create_neon_branch.outputs.db_url }}
+          NEON_API_KEY: ${{ secrets.NEON_API_KEY }}
+          ORACLE_APP_PASSWORD: ${{ secrets.ORACLE_APP_PASSWORD }}
+          EXPECTED_NEON_BRANCH: preview/pr-${{ github.event.number }}-${{ needs.setup.outputs.branch }}
+          EXPECTED_NEON_BRANCH_ID: ${{ steps.create_neon_branch.outputs.branch_id }}
+          DIRECT_DB_HOST: ${{ steps.create_neon_branch.outputs.db_host }}
+        run: |
+          set -euo pipefail
+          if [ -n "${ORACLE_APP_PASSWORD:-}" ]; then echo "::add-mask::${ORACLE_APP_PASSWORD}"; fi
+          if [ -n "${NEON_API_KEY:-}" ]; then echo "::add-mask::${NEON_API_KEY}"; fi
+          if [ -n "${MIGRATION_DATABASE_URL:-}" ]; then echo "::add-mask::${MIGRATION_DATABASE_URL}"; fi
+
+          if [ -z "${ORACLE_APP_PASSWORD:-}" ]; then
+            echo "::error::Missing required GitHub secret ORACLE_APP_PASSWORD. Configure ORACLE_APP_PASSWORD in repository Actions secrets to run Neon preview branch migrations."
+            exit 1
+          fi
+
+          if [ -z "${NEON_API_KEY:-}" ]; then
+            echo "::error::Missing required GitHub secret NEON_API_KEY."
+            exit 1
+          fi
+
+          if [ -z "${MIGRATION_DATABASE_URL:-}" ]; then
+            echo "::error::Missing direct connection output (db_url) from neondatabase/create-branch-action."
+            exit 1
+          fi
+
+          case "${EXPECTED_NEON_BRANCH}" in
+            preview/pr-*) ;;
+            *)
+              echo "::error::Refusing to run migration: target branch '${EXPECTED_NEON_BRANCH}' is not an isolated PR preview/ branch."
+              exit 1
+              ;;
+          esac
+
+          if [ "${EXPECTED_NEON_BRANCH}" = "production" ] || [ "${EXPECTED_NEON_BRANCH}" = "main" ]; then
+            echo "::error::Refusing to run migration against protected branch '${EXPECTED_NEON_BRANCH}'."
+            exit 1
+          fi
+
+          if [ -z "${EXPECTED_NEON_BRANCH_ID:-}" ]; then
+            echo "::error::Missing branch_id output from neondatabase/create-branch-action."
+            exit 1
+          fi
+
+          case "${DIRECT_DB_HOST:-}" in
+            *-pooler*)
+              echo "::error::Refusing to run migration: db_host is a pooled endpoint (-pooler)."
+              exit 1
+              ;;
+            ep-*.neon.tech|ep-*.neon.build) ;;
+            *)
+              echo "::error::Refusing to run migration: db_host is not a direct Neon compute endpoint (ep-...)."
+              exit 1
+              ;;
+          esac
+
+          unset DATABASE_URL
+          npm run db:migrate -- \
+            --expected-branch "${EXPECTED_NEON_BRANCH}" \
+            --expected-branch-id "${EXPECTED_NEON_BRANCH_ID}"
 
   delete_neon_branch:
     name: Delete Neon Branch

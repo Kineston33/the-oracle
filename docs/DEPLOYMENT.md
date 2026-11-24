@@ -112,6 +112,64 @@ Serving official predictions (`demo: false`) and the ledger read API
    - The Node.js server connects at runtime using `DATABASE_URL` configured for
      the least-privilege `oracle_app` role.
 
+### Safe PostgreSQL 16+ migration & `oracle_app` verification (`npm run db:migrate`)
+
+Before connecting Render (or any runtime host) with `DATABASE_URL`, initialize
+the target **test branch** in Neon using the dedicated migration CLI
+(`src/server/migrate.ts` via `npm run db:migrate`):
+
+```bash
+# 1. Obtain the DIRECT (non-pooled) administrative connection string for a
+#    non-production Neon test branch (e.g. preview/pr-5-... or test/init-check)
+#    in project wispy-cell-45340306:
+#      neon connection-string <test-branch-name> --project-id wispy-cell-45340306
+
+# 2. Execute the migration and §2.5 security audit against the test branch:
+MIGRATION_DATABASE_URL="postgresql://neondb_owner:<owner_password>@ep-<endpoint>.<region>.aws.neon.tech/neondb?sslmode=require" \
+  ORACLE_APP_PASSWORD="<strong_oracle_app_password>" \
+  npm run db:migrate -- --expected-branch "<test-branch-name>"
+```
+
+#### Mandatory safety & production-protection guarantees (`npm run db:migrate`)
+
+1. **Exclusive `MIGRATION_DATABASE_URL` (direct, non-pooled connection)**:
+   - Reads **only** `MIGRATION_DATABASE_URL` — never falls back to or uses
+     `DATABASE_URL`, and rejects any call where `MIGRATION_DATABASE_URL` equals
+     `DATABASE_URL`.
+   - Rejects pooled endpoints (`-pooler` in hostname or `pgbouncer=true` in
+     query string), non-SSL Neon URLs, and connections attempting to run as
+     `oracle_app` or `oracle_migrator`.
+2. **Production branch blocked by default (anti-spoofing branch verification)**:
+   - Never trusts a standalone environment variable label (such as
+     `NODE_ENV=staging` or `MIGRATION_EXPECTED_BRANCH=staging`) by itself.
+   - Probes the live PostgreSQL server (`pg_catalog.current_database()`,
+     `pg_control_system()`, `pg_is_in_recovery()`, `inet_server_addr()`,
+     `pg_shdescription`, and Neon hypervisor GUCs `neon.project_id`,
+     `neon.branch_id`, `neon.timeline_id`).
+   - Resolves the endpoint hostname (`ep-...`) to its authoritative Neon branch
+     via the Neon control plane (`neon` CLI or `NEON_API_KEY` REST API) or
+     verifies the server's `neon.branch_id` GUC against both
+     `MIGRATION_EXPECTED_BRANCH_ID` and `NEON_PRODUCTION_BRANCH_ID`.
+   - **Blocks execution immediately** if:
+     - The resolved branch is `production` / `main`, or has `default: true`,
+       `primary: true`, or `protected: true`;
+     - The database catalog description (`COMMENT ON DATABASE`) marks it as
+       `production`; or
+     - The real branch identity of a remote/Neon endpoint cannot be verified
+       (fail-closed).
+3. **Transactional DDL, `oracle_app` provisioning, and post-migration audit**:
+   - Executes `0001_oracle_ledger_v1_10.sql` and configures `oracle_app`'s login
+     password inside an explicit `BEGIN ... COMMIT` transaction (supporting both
+     PostgreSQL superusers and Neon's non-superuser `neondb_owner` role).
+   - Runs `runLedgerSecurityAudit()` (§2.5 Steps A, B, and C) and verifies zero
+     role-membership or privilege/ACL violations (`compliant: true`).
+   - When `ORACLE_APP_PASSWORD` is provided, opens a live verification
+     connection as `oracle_app` to confirm `CURRENT_USER = 'oracle_app'`,
+     `SESSION_USER = 'oracle_app'`, and `SELECT` access on the three ledger
+     tables.
+   - Prints a sanitized report without exposing passwords, connection strings,
+     API keys, or tokens.
+
 ### Installation, compilation, and startup commands
 
 ```bash
@@ -174,10 +232,11 @@ placeholder formats only:
 | Backend runtime (`src/server/index.ts`) | `PORT` | Optional (default `3001`) | TCP port for the Node.js HTTP read API server |
 | Backend runtime (`src/server/index.ts`) | `HOST` | Optional (default `0.0.0.0`) | Bind address for the Node.js HTTP read API server |
 | One-off migration / audit (`src/server/migrate.ts`) | `MIGRATION_DATABASE_URL` *(caller-supplied)* | Required when applying DDL | Direct (non-`-pooler`) PostgreSQL 16+ admin/migration connection string used to run `runLedgerMigrations()` and `runLedgerSecurityAudit()` |
-| One-off migration / audit (`src/server/migrate.ts`) | `ORACLE_APP_PASSWORD` *(caller-supplied)* | Optional | Password assigned to the `oracle_app` login role during migration |
+| One-off migration / audit (`src/server/migrate.ts`) | `ORACLE_APP_PASSWORD` *(caller-supplied)* | Required for `npm run db:migrate` | Strong password (>= 60 bits of entropy: 12+ chars with uppercase, lowercase, digits, and symbols) assigned to the `oracle_app` login role and verified via live TCP login |
 | GitHub Actions CI (`.github/workflows/postgres-ci.yml`) | `TEST_DATABASE_ADMIN_URL` | Set by CI workflow | Ephemeral connection string pointing to the per-run `postgres:16` Docker service container in GitHub Actions |
 | GitHub Actions Neon PR workflow (`.github/workflows/neon-workflow.yml`) | `vars.NEON_PROJECT_ID` | Required in GitHub Actions | Repository variable storing the Neon project ID (`wispy-cell-45340306`) |
-| GitHub Actions Neon PR workflow (`.github/workflows/neon-workflow.yml`) | `secrets.NEON_API_KEY` | Required in GitHub Actions | Repository secret storing the Neon API key used to create and delete temporary PR branches |
+| GitHub Actions Neon PR workflow (`.github/workflows/neon-workflow.yml`) | `secrets.NEON_API_KEY` | Required in GitHub Actions | Repository secret storing the Neon API key used to create/delete temporary PR branches and resolve branch identity |
+| GitHub Actions Neon PR workflow (`.github/workflows/neon-workflow.yml`) | `secrets.ORACLE_APP_PASSWORD` | Required in GitHub Actions | Repository secret storing the password assigned to `oracle_app` when running `npm run db:migrate` against temporary PR `preview/` branches |
 
 ---
 
@@ -207,10 +266,11 @@ build, and PostgreSQL 16 integration suite.
 |---|---|---|
 | Repository variable | `NEON_PROJECT_ID` | Neon project identifier (referenced via `${{ vars.NEON_PROJECT_ID }}`) |
 | Repository secret | `NEON_API_KEY` | Neon API key (referenced via `${{ secrets.NEON_API_KEY }}`; never logged or committed) |
+| Repository secret | `ORACLE_APP_PASSWORD` | Strong password (>= 60 bits of entropy) assigned to the restricted `oracle_app` runtime role during `npm run db:migrate` on the PR preview branch |
 
 ### Workflow lifecycle and guarantees
 
-- **Branch creation / reuse (`opened`, `reopened`, `synchronize`)**:
+- **Branch creation / reuse & safe migration (`opened`, `reopened`, `synchronize`)**:
   - Computes an RFC 3339 UTC timestamp 14 days in the future
     (`date -u --date '+14 days' +'%Y-%m-%dT%H:%M:%SZ'`) and passes it as
     `expires_at` to `neondatabase/create-branch-action@v6`.
@@ -220,6 +280,14 @@ build, and PostgreSQL 16 integration suite.
     runner log stream via `::add-mask::` and exposes only non-sensitive job
     outputs (`branch_id`, `created`, `db_host`, `db_host_pooled`) bound directly
     to `steps.create_neon_branch.outputs.*`.
+  - Installs Node.js 22 (`npm ci`) and runs `npm run db:migrate` against the
+    temporary `preview/pr-<number>-<head_ref>` branch using exclusively the
+    direct `steps.create_neon_branch.outputs.db_url` as `MIGRATION_DATABASE_URL`,
+    `secrets.NEON_API_KEY` for control-plane branch verification, and
+    `secrets.ORACLE_APP_PASSWORD` for `oracle_app` provisioning and live login
+    verification. Aborts immediately if `ORACLE_APP_PASSWORD` is missing, if the
+    endpoint is pooled, or if the target branch is not a verified `preview/pr-*`
+    branch.
 - **Branch deletion (`closed`)**:
   - Deletes `preview/pr-<number>-<head_ref>` via
     `neondatabase/delete-branch-action@v3` when the pull request is closed or
