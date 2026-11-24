@@ -3135,6 +3135,276 @@ describe('protocol v1.3 PostgreSQL transaction contract and retry semantics', ()
     // Scenario B: Compliant deployment where oracle_app has zero direct or transitive memberships
     expect(runRecursiveRoleAudit(roles, [])).toEqual([]);
   });
+
+  it('enforces v1.8 PostgreSQL 16 minimum-version guard and effective privilege audit queries (static SQL inspection + in-memory TypeScript simulation, not real PostgreSQL execution)', () => {
+    const contractDoc = readFileSync(
+      resolve(process.cwd(), 'docs/PUBLICATION-API-CONTRACT.md'),
+      'utf8',
+    );
+    const sqlBlocks = Array.from(
+      contractDoc.matchAll(/```sql\r?\n([\s\S]*?)```/g),
+      (m) => m[1],
+    ).join('\n');
+
+    // --- 1. Static SQL checks for PostgreSQL 16 minimum-version enforcement ---
+    expect(contractDoc).toContain('**Minimum supported PostgreSQL version**: **PostgreSQL 16**');
+    expect(sqlBlocks).toContain(
+      "v_server_version_num := pg_catalog.current_setting('server_version_num')::integer;",
+    );
+    expect(sqlBlocks).toContain(
+      "IF v_server_version_num < 160000 THEN\n    RAISE EXCEPTION\n      'The Oracle ledger contract v1.8 requires PostgreSQL 16 or newer (server_version_num >= 160000), got: %',\n      v_server_version_num\n      USING ERRCODE = '0A000';\n  END IF;",
+    );
+    expect(sqlBlocks).toContain(
+      "WHERE pg_catalog.current_setting('server_version_num')::integer < 160000",
+    );
+
+    // --- 2. Static SQL checks for effective table, schema, function, PUBLIC, and ownership audits ---
+    expect(sqlBlocks).toContain('WITH ledger_tables(table_name) AS (');
+    expect(sqlBlocks).toContain('forbidden_table_privs(priv) AS (');
+    expect(sqlBlocks).toContain('approved_functions(fn_sig, fn_name) AS (');
+    expect(sqlBlocks).toContain('effective_privilege_violations AS (');
+
+    // Effective table privilege checks (oracle_app and public)
+    expect(sqlBlocks).toContain(
+      "WHERE pg_catalog.has_table_privilege('oracle_app', lt.table_name, ftp.priv)",
+    );
+    expect(sqlBlocks).toContain(
+      "WHERE NOT pg_catalog.has_table_privilege('oracle_app', lt.table_name, 'SELECT')",
+    );
+    expect(sqlBlocks).toContain(
+      "WHERE pg_catalog.has_table_privilege('public', lt.table_name, p.priv)",
+    );
+
+    // Effective schema privilege checks (oracle_app and public)
+    expect(sqlBlocks).toContain(
+      "WHERE pg_catalog.has_schema_privilege('oracle_app', s.schema_name, 'CREATE')",
+    );
+    expect(sqlBlocks).toContain(
+      "WHERE NOT pg_catalog.has_schema_privilege('oracle_app', 'oracle_ledger', 'USAGE')",
+    );
+    expect(sqlBlocks).toContain(
+      "WHERE pg_catalog.has_schema_privilege('public', s.schema_name, s.priv)",
+    );
+
+    // Ownership checks across pg_namespace, pg_class, and pg_proc
+    expect(sqlBlocks).toContain('FROM pg_catalog.pg_namespace AS n');
+    expect(sqlBlocks).toContain('FROM pg_catalog.pg_class AS c');
+    expect(sqlBlocks).toContain('FROM pg_catalog.pg_proc AS p');
+
+    // Effective function EXECUTE checks for oracle_app and PUBLIC
+    expect(sqlBlocks).toContain(
+      "WHERE NOT pg_catalog.has_function_privilege('oracle_app', af.fn_sig, 'EXECUTE')",
+    );
+    expect(sqlBlocks).toContain(
+      "AND p.proname NOT IN (SELECT fn_name FROM approved_functions)\n    AND pg_catalog.has_function_privilege('oracle_app', p.oid, 'EXECUTE')",
+    );
+    expect(sqlBlocks).toContain(
+      "WHERE n.nspname = 'oracle_ledger'\n    AND pg_catalog.has_function_privilege('public', p.oid, 'EXECUTE')",
+    );
+
+    // Preservation of the recursive pg_auth_members role-membership audit
+    expect(sqlBlocks).toContain('WITH RECURSIVE role_membership_graph AS (');
+    expect(sqlBlocks).toContain('m.admin_option');
+    expect(sqlBlocks).toContain('m.inherit_option');
+    expect(sqlBlocks).toContain('m.set_option');
+
+    // --- 3. Deterministic in-memory TypeScript simulation (not real PostgreSQL execution)
+    //        of the PostgreSQL 16 preflight guard and effective-privilege evaluator ---
+    interface SimulatedCatalogState {
+      serverVersionNum: number;
+      oracleAppSuperOrInherit: boolean;
+      oracleMigratorCanLogin: boolean;
+      // Direct grants to oracle_app and PUBLIC (effective privilege for oracle_app = direct OR PUBLIC)
+      oracleAppTablePrivs: Record<string, Set<string>>;
+      publicTablePrivs: Record<string, Set<string>>;
+      oracleAppSchemaPrivs: Record<string, Set<string>>;
+      publicSchemaPrivs: Record<string, Set<string>>;
+      oracleAppOwnedObjects: string[];
+      oracleAppFunctionExec: Set<string>;
+      publicFunctionExec: Set<string>;
+    }
+
+    const LEDGER_TABLES = [
+      'oracle_ledger.official_predictions',
+      'oracle_ledger.prediction_events',
+      'oracle_ledger.publication_idempotency_keys',
+    ];
+    const FORBIDDEN_TABLE_PRIVS = [
+      'INSERT',
+      'UPDATE',
+      'DELETE',
+      'TRUNCATE',
+      'TRIGGER',
+      'REFERENCES',
+    ];
+    const APPROVED_FUNCTIONS = [
+      'commit_official_publication',
+      'record_rejected_or_conflict_idempotency',
+      'append_terminal_prediction_event',
+    ];
+    const ALL_ORACLE_LEDGER_FUNCTIONS = [
+      ...APPROVED_FUNCTIONS,
+      'enforce_append_only_ledger_row',
+      'enforce_publication_idempotency_immutability',
+      'enforce_publication_idempotency_no_truncate',
+      'enforce_publication_idempotency_outcome_complete',
+    ];
+
+    function runPreflightVersionGuard(serverVersionNum: number): void {
+      if (serverVersionNum < 160000) {
+        throw new Error(
+          `0A000: The Oracle ledger contract v1.8 requires PostgreSQL 16 or newer (server_version_num >= 160000), got: ${serverVersionNum}`,
+        );
+      }
+    }
+
+    function evaluateEffectivePrivilegeViolations(state: SimulatedCatalogState): string[] {
+      const violations: string[] = [];
+
+      // Effective privilege helper: in PostgreSQL, has_*_privilege('oracle_app', ...)
+      // is true if granted directly to oracle_app OR granted to PUBLIC.
+      const hasEffectiveTablePriv = (role: 'oracle_app' | 'public', tbl: string, priv: string) =>
+        role === 'public'
+          ? Boolean(state.publicTablePrivs[tbl]?.has(priv))
+          : Boolean(state.oracleAppTablePrivs[tbl]?.has(priv) || state.publicTablePrivs[tbl]?.has(priv));
+
+      const hasEffectiveSchemaPriv = (role: 'oracle_app' | 'public', schema: string, priv: string) =>
+        role === 'public'
+          ? Boolean(state.publicSchemaPrivs[schema]?.has(priv))
+          : Boolean(
+              state.oracleAppSchemaPrivs[schema]?.has(priv) ||
+                state.publicSchemaPrivs[schema]?.has(priv),
+            );
+
+      const hasEffectiveFnExec = (role: 'oracle_app' | 'public', fn: string) =>
+        role === 'public'
+          ? state.publicFunctionExec.has(fn)
+          : state.oracleAppFunctionExec.has(fn) || state.publicFunctionExec.has(fn);
+
+      if (state.serverVersionNum < 160000) {
+        violations.push('version_guard:server_version_num');
+      }
+      if (state.oracleAppSuperOrInherit) {
+        violations.push('role_attributes:oracle_app');
+      }
+      if (state.oracleMigratorCanLogin) {
+        violations.push('role_attributes:oracle_migrator');
+      }
+
+      for (const tbl of LEDGER_TABLES) {
+        for (const priv of FORBIDDEN_TABLE_PRIVS) {
+          if (hasEffectiveTablePriv('oracle_app', tbl, priv)) {
+            violations.push(`oracle_app_forbidden_table_priv:${tbl}:${priv}`);
+          }
+          if (hasEffectiveTablePriv('public', tbl, priv)) {
+            violations.push(`public_forbidden_table_priv:${tbl}:${priv}`);
+          }
+        }
+        if (!hasEffectiveTablePriv('oracle_app', tbl, 'SELECT')) {
+          violations.push(`oracle_app_missing_select_priv:${tbl}`);
+        }
+        if (hasEffectiveTablePriv('public', tbl, 'SELECT')) {
+          violations.push(`public_forbidden_table_priv:${tbl}:SELECT`);
+        }
+      }
+
+      for (const schema of ['oracle_ledger', 'public']) {
+        if (hasEffectiveSchemaPriv('oracle_app', schema, 'CREATE')) {
+          violations.push(`schema_privilege:${schema}:CREATE`);
+        }
+        if (hasEffectiveSchemaPriv('public', schema, 'CREATE')) {
+          violations.push(`public_schema_privilege:${schema}:CREATE`);
+        }
+      }
+      if (!hasEffectiveSchemaPriv('oracle_app', 'oracle_ledger', 'USAGE')) {
+        violations.push('schema_privilege:oracle_ledger:missing_USAGE');
+      }
+      if (hasEffectiveSchemaPriv('public', 'oracle_ledger', 'USAGE')) {
+        violations.push('public_schema_privilege:oracle_ledger:USAGE');
+      }
+
+      for (const owned of state.oracleAppOwnedObjects) {
+        violations.push(`oracle_app_owns_object:${owned}`);
+      }
+
+      for (const fn of APPROVED_FUNCTIONS) {
+        if (!hasEffectiveFnExec('oracle_app', fn)) {
+          violations.push(`oracle_app_missing_approved_execute:${fn}`);
+        }
+      }
+      for (const fn of ALL_ORACLE_LEDGER_FUNCTIONS) {
+        if (!APPROVED_FUNCTIONS.includes(fn) && hasEffectiveFnExec('oracle_app', fn)) {
+          violations.push(`oracle_app_unapproved_function_execute:${fn}`);
+        }
+        if (hasEffectiveFnExec('public', fn)) {
+          violations.push(`public_function_execute:${fn}`);
+        }
+      }
+
+      return violations;
+    }
+
+    const buildCompliantState = (): SimulatedCatalogState => ({
+      serverVersionNum: 160004,
+      oracleAppSuperOrInherit: false,
+      oracleMigratorCanLogin: false,
+      oracleAppTablePrivs: {
+        'oracle_ledger.official_predictions': new Set(['SELECT']),
+        'oracle_ledger.prediction_events': new Set(['SELECT']),
+        'oracle_ledger.publication_idempotency_keys': new Set(['SELECT']),
+      },
+      publicTablePrivs: {
+        'oracle_ledger.official_predictions': new Set(),
+        'oracle_ledger.prediction_events': new Set(),
+        'oracle_ledger.publication_idempotency_keys': new Set(),
+      },
+      oracleAppSchemaPrivs: {
+        oracle_ledger: new Set(['USAGE']),
+        public: new Set(),
+      },
+      publicSchemaPrivs: {
+        oracle_ledger: new Set(),
+        public: new Set(),
+      },
+      oracleAppOwnedObjects: [],
+      oracleAppFunctionExec: new Set(APPROVED_FUNCTIONS),
+      publicFunctionExec: new Set(),
+    });
+
+    // 1. PostgreSQL < 16 fails preflight version guard with SQLSTATE 0A000
+    expect(() => runPreflightVersionGuard(150008)).toThrow(
+      /0A000: The Oracle ledger contract v1\.8 requires PostgreSQL 16 or newer \(server_version_num >= 160000\), got: 150008/,
+    );
+    expect(() => runPreflightVersionGuard(160000)).not.toThrow();
+
+    // 2. Compliant PostgreSQL 16+ state yields zero effective-privilege violations
+    expect(evaluateEffectivePrivilegeViolations(buildCompliantState())).toEqual([]);
+
+    // 3. Granting INSERT to PUBLIC on a ledger table makes INSERT effective for both PUBLIC and oracle_app
+    const publicWriteLeak = buildCompliantState();
+    publicWriteLeak.publicTablePrivs['oracle_ledger.publication_idempotency_keys']!.add('INSERT');
+    expect(evaluateEffectivePrivilegeViolations(publicWriteLeak)).toEqual([
+      'oracle_app_forbidden_table_priv:oracle_ledger.publication_idempotency_keys:INSERT',
+      'public_forbidden_table_priv:oracle_ledger.publication_idempotency_keys:INSERT',
+    ]);
+
+    // 4. Leaving default PUBLIC EXECUTE on a trigger function is caught for both PUBLIC and oracle_app
+    const publicExecLeak = buildCompliantState();
+    publicExecLeak.publicFunctionExec.add('enforce_publication_idempotency_immutability');
+    expect(evaluateEffectivePrivilegeViolations(publicExecLeak)).toEqual([
+      'oracle_app_unapproved_function_execute:enforce_publication_idempotency_immutability',
+      'public_function_execute:enforce_publication_idempotency_immutability',
+    ]);
+
+    // 5. Ownership of any object or CREATE on oracle_ledger is flagged
+    const ownershipAndCreateLeak = buildCompliantState();
+    ownershipAndCreateLeak.oracleAppSchemaPrivs.oracle_ledger!.add('CREATE');
+    ownershipAndCreateLeak.oracleAppOwnedObjects.push('oracle_ledger.official_predictions');
+    expect(evaluateEffectivePrivilegeViolations(ownershipAndCreateLeak)).toEqual([
+      'schema_privilege:oracle_ledger:CREATE',
+      'oracle_app_owns_object:oracle_ledger.official_predictions',
+    ]);
+  });
 });
 
 

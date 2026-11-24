@@ -1,10 +1,17 @@
-# THE ORACLE — Publication API & Storage Contract (v1.7)
+# THE ORACLE — Publication API & Storage Contract (v1.8)
 
 This document specifies the storage invariants, transaction boundaries, `READ COMMITTED`
 isolation-level enforcement, `TRUNCATE` and privilege hardening, controlled `SECURITY DEFINER`
-database write boundary, indirect role-membership auditing, and read/write separation required
-to back **Official Publication Protocol v1.7** (`src/data/publication-types.ts` and
-`src/data/publication.ts`) with a persistent PostgreSQL database and HTTP service.
+database write boundary, PostgreSQL 16+ compatibility and effective-privilege auditing, and
+read/write separation required to back **Official Publication Protocol v1.8**
+(`src/data/publication-types.ts` and `src/data/publication.ts`) with a persistent PostgreSQL
+16+ database and HTTP service.
+
+> **Minimum supported PostgreSQL version**: **PostgreSQL 16** (`server_version_num >= 160000`).
+> The deployment role-membership audit inspects `pg_catalog.pg_auth_members.inherit_option` and
+> `pg_catalog.pg_auth_members.set_option`, which were introduced in PostgreSQL 16. Compatibility
+> with PostgreSQL versions older than 16 is not claimed and is explicitly rejected by the
+> preflight version guard in §2.5.
 
 > **Status in this repository**: No HTTP server and no PostgreSQL database are shipped or
 > running in this repository/sandbox. `InMemoryRegistry` (`src/data/publication.ts`)
@@ -17,8 +24,9 @@ to back **Official Publication Protocol v1.7** (`src/data/publication-types.ts` 
 > function, privilege, and transaction statements below are verified by static SQL contract
 > inspection and in-memory state-machine / privilege simulation tests rather than executed
 > against a live PostgreSQL instance. A production backend must implement the relational
-> constraints, PL/pgSQL triggers, `SECURITY DEFINER` write functions, role separation, and
-> `READ COMMITTED` ACID transaction specified below.
+> constraints, PL/pgSQL triggers, `SECURITY DEFINER` write functions, role separation,
+> deployment audit queries, and `READ COMMITTED` ACID transaction specified below on
+> PostgreSQL 16 or newer.
 
 ---
 
@@ -1221,37 +1229,85 @@ GRANT EXECUTE ON FUNCTION
 TO oracle_app;
 ```
 
-#### Auditing indirect role memberships and inherited privilege paths (`pg_catalog.pg_auth_members`)
+#### PostgreSQL 16+ version guard, indirect role-membership audit (`pg_catalog.pg_auth_members`), and effective privilege audit
 
 Executing `REVOKE oracle_migrator FROM oracle_app, PUBLIC;` only removes direct membership of
 `oracle_app` (and `PUBLIC`) in `oracle_migrator`. It does **not** by itself remove arbitrary
 pre-existing role memberships or prove that `oracle_app` has no indirect or transitive path to
-ownership, DDL, migration, or table-write capabilities (for example, through an intermediate
-group role granted `oracle_migrator`, through `SET ROLE` when `set_option` is enabled even on a
-`NOINHERIT` role, or through PostgreSQL predefined roles such as `pg_write_all_data`,
-`pg_read_all_data`, or `pg_database_owner`).
+ownership, DDL, migration, or table-write capabilities; furthermore, inspecting static `GRANT`
+statements in a migration script does not prove what privileges are actually effective in a
+live database catalog. In PostgreSQL, `oracle_app` could still acquire unintended capabilities
+through:
 
-Deployment verification must therefore inspect `pg_catalog.pg_auth_members` and
-`pg_catalog.pg_roles` recursively and verify **all four** conditions below before serving
-traffic:
+- pre-existing direct or transitive memberships in other roles (`pg_write_all_data`,
+  `pg_read_all_data`, `pg_database_owner`, or an intermediate group role granted
+  `oracle_migrator`),
+- `SET ROLE` if `pg_auth_members.set_option` is `true` even when `inherit_option` is `false`,
+- privileges granted to `PUBLIC` on schemas, tables, or functions (because `has_table_privilege`,
+  `has_schema_privilege`, and `has_function_privilege` evaluate privileges inherited via
+  `PUBLIC` as effective for every role), or
+- residual object ownership in `pg_catalog.pg_namespace`, `pg_catalog.pg_class`, or
+  `pg_catalog.pg_proc`.
 
-1. **Zero direct or transitive role memberships (`pg_catalog.pg_auth_members`)**:
-   The recursive catalog audit query below walks every direct and transitive role membership
-   reachable from `oracle_app` (including `inherit_option`, `set_option`, and `admin_option`,
-   as well as the privileged attributes of every reachable role) and **must return 0 rows**.
-2. **Unprivileged role attributes (`pg_catalog.pg_roles`)**:
-   `oracle_app` must have `rolsuper = false`, `rolinherit = false`, `rolcreaterole = false`,
-   `rolcreatedb = false`, `rolbypassrls = false`, and `rolreplication = false`.
-3. **Zero owned database objects**:
-   `oracle_app` must own **0** schemas (`pg_catalog.pg_namespace`), relations/tables
-   (`pg_catalog.pg_class`), or functions/procedures (`pg_catalog.pg_proc`).
-4. **Effective privilege verification**:
-   `oracle_app` must hold only `SELECT` on the three ledger tables and `EXECUTE` only on the
-   three approved `SECURITY DEFINER` write functions.
+Deployment verification must therefore run the **three executable audit steps** below before
+serving traffic:
+
+1. **Step A — PostgreSQL 16+ preflight version check (`server_version_num >= 160000`)**:
+   Because `pg_catalog.pg_auth_members.inherit_option` and `pg_catalog.pg_auth_members.set_option`
+   were introduced in **PostgreSQL 16**, **PostgreSQL 16** (`server_version_num >= 160000`) is
+   the minimum supported database version. If the server is older than PostgreSQL 16, the
+   preflight block below fails immediately with SQLSTATE `0A000` (`feature_not_supported`)
+   rather than silently omitting membership checks. Compatibility with PostgreSQL versions
+   older than 16 is not claimed.
+2. **Step B — Recursive direct and transitive role-membership audit (`pg_catalog.pg_auth_members` + `pg_catalog.pg_roles`)**:
+   Walks every direct and transitive role membership reachable from `oracle_app` (inspecting
+   `admin_option`, `inherit_option`, `set_option`, `rolsuper`, `rolcreatedb`, `rolcreaterole`,
+   `rolbypassrls`, and `rolreplication`) and **must return 0 rows**.
+3. **Step C — Executable effective-privilege and object-ownership audit (`has_table_privilege`, `has_schema_privilege`, `has_function_privilege`, `pg_roles`, `pg_namespace`, `pg_class`, `pg_proc`)**:
+   Evaluates the actual effective privileges in the live catalog (including privileges
+   inherited through `PUBLIC` or any role path) and **must return 0 violation rows**. Specifically,
+   Step C verifies:
+   - `oracle_app` has **no** `INSERT`, `UPDATE`, `DELETE`, `TRUNCATE`, `TRIGGER`, or
+     `REFERENCES` privilege on any ledger table (`official_predictions`, `prediction_events`,
+     `publication_idempotency_keys`) or any other relation in `oracle_ledger`.
+   - `oracle_app` **does** have `SELECT` privilege on all three ledger tables.
+   - `oracle_app` has **no** `CREATE` privilege on schema `oracle_ledger` or schema `public`,
+     and **does** have `USAGE` privilege on schema `oracle_ledger`.
+   - `oracle_app` has unprivileged role attributes (`rolsuper = false`, `rolinherit = false`,
+     `rolcreaterole = false`, `rolcreatedb = false`, `rolbypassrls = false`,
+     `rolreplication = false`) and owns **0** schemas (`pg_namespace`), relations (`pg_class`),
+     or functions (`pg_proc`), while `oracle_migrator` (`rolsuper = false`, `rolcanlogin = false`)
+     owns schema `oracle_ledger`, all three ledger tables, and all seven functions in
+     `oracle_ledger`.
+   - `oracle_app` has `EXECUTE` privilege on **exactly** the three approved `SECURITY DEFINER`
+     functions (`commit_official_publication`, `record_rejected_or_conflict_idempotency`,
+     `append_terminal_prediction_event`) and **cannot** execute any internal trigger function or
+     other function in `oracle_ledger`.
+   - `PUBLIC` has **no** write (`INSERT`, `UPDATE`, `DELETE`, `TRUNCATE`, `TRIGGER`,
+     `REFERENCES`) or `SELECT` privileges on any ledger table, **no** `CREATE` privilege on
+     `oracle_ledger` or `public`, and **cannot** execute any function in `oracle_ledger`
+     (neither the internal trigger functions nor the `SECURITY DEFINER` write functions).
 
 ```sql
--- Deployment audit query: recursively inspect all direct and transitive role
--- memberships and role attributes reachable from oracle_app.
+-- Step A: Preflight PostgreSQL 16+ version check (server_version_num >= 160000).
+-- Fails immediately with SQLSTATE 0A000 if connected to PostgreSQL < 16 rather than
+-- silently skipping pg_auth_members.inherit_option / set_option checks.
+DO $$
+DECLARE
+  v_server_version_num INTEGER;
+BEGIN
+  v_server_version_num := pg_catalog.current_setting('server_version_num')::integer;
+  IF v_server_version_num < 160000 THEN
+    RAISE EXCEPTION
+      'The Oracle ledger contract v1.8 requires PostgreSQL 16 or newer (server_version_num >= 160000), got: %',
+      v_server_version_num
+      USING ERRCODE = '0A000';
+  END IF;
+END;
+$$;
+
+-- Step B: Deployment audit query — recursively inspect all direct and transitive role
+-- memberships and role attributes reachable from oracle_app (requires PostgreSQL 16+).
 -- A compliant deployment MUST return 0 rows from this query.
 WITH RECURSIVE role_membership_graph AS (
   SELECT
@@ -1299,6 +1355,225 @@ JOIN pg_catalog.pg_roles AS r_base
   ON r_base.oid = g.base_role_oid
 JOIN pg_catalog.pg_roles AS r_granted
   ON r_granted.oid = g.granted_role_oid;
+
+-- Step C: Executable effective-privilege and ownership audit query.
+-- Evaluates actual effective privileges via has_table_privilege, has_schema_privilege,
+-- has_function_privilege, pg_roles, pg_namespace, pg_class, and pg_proc.
+-- A compliant deployment MUST return 0 violation rows from this query.
+WITH ledger_tables(table_name) AS (
+  VALUES
+    ('oracle_ledger.official_predictions'),
+    ('oracle_ledger.prediction_events'),
+    ('oracle_ledger.publication_idempotency_keys')
+),
+forbidden_table_privs(priv) AS (
+  VALUES
+    ('INSERT'),
+    ('UPDATE'),
+    ('DELETE'),
+    ('TRUNCATE'),
+    ('TRIGGER'),
+    ('REFERENCES')
+),
+approved_functions(fn_sig, fn_name) AS (
+  VALUES
+    (
+      'oracle_ledger.commit_official_publication(text,character,text,character,jsonb,character,timestamp with time zone,timestamp with time zone,jsonb,character)',
+      'commit_official_publication'
+    ),
+    (
+      'oracle_ledger.record_rejected_or_conflict_idempotency(text,character,jsonb,timestamp with time zone)',
+      'record_rejected_or_conflict_idempotency'
+    ),
+    (
+      'oracle_ledger.append_terminal_prediction_event(text,text,timestamp with time zone,timestamp with time zone,jsonb,character,character)',
+      'append_terminal_prediction_event'
+    )
+),
+effective_privilege_violations AS (
+  -- 1. Verify PostgreSQL 16+ minimum version inside the query result set as well
+  SELECT
+    'version_guard'::text AS check_category,
+    'server_version_num'::text AS object_name,
+    'PostgreSQL 16+ (server_version_num >= 160000) is required'::text AS violation_detail
+  WHERE pg_catalog.current_setting('server_version_num')::integer < 160000
+
+  UNION ALL
+
+  -- 2. Verify oracle_app and oracle_migrator role flags in pg_catalog.pg_roles
+  SELECT
+    'role_attributes',
+    r.rolname,
+    'oracle_app has forbidden privileged role attribute (rolsuper/rolinherit/rolcreaterole/rolcreatedb/rolbypassrls/rolreplication)'
+  FROM pg_catalog.pg_roles AS r
+  WHERE r.rolname = 'oracle_app'
+    AND (
+      r.rolsuper
+      OR r.rolinherit
+      OR r.rolcreaterole
+      OR r.rolcreatedb
+      OR r.rolbypassrls
+      OR r.rolreplication
+      OR NOT r.rolcanlogin
+    )
+
+  UNION ALL
+
+  SELECT
+    'role_attributes',
+    r.rolname,
+    'oracle_migrator must be NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOLOGIN in steady state'
+  FROM pg_catalog.pg_roles AS r
+  WHERE r.rolname = 'oracle_migrator'
+    AND (
+      r.rolsuper
+      OR r.rolinherit
+      OR r.rolcreaterole
+      OR r.rolcreatedb
+      OR r.rolcanlogin
+    )
+
+  UNION ALL
+
+  -- 3. Verify oracle_app has NO forbidden table privileges (INSERT, UPDATE, DELETE, TRUNCATE, TRIGGER, REFERENCES)
+  SELECT
+    'oracle_app_forbidden_table_priv',
+    lt.table_name,
+    'oracle_app has forbidden effective privilege ' || ftp.priv
+  FROM ledger_tables AS lt
+  CROSS JOIN forbidden_table_privs AS ftp
+  WHERE pg_catalog.has_table_privilege('oracle_app', lt.table_name, ftp.priv)
+
+  UNION ALL
+
+  -- 4. Verify oracle_app HAS effective SELECT privilege on all three ledger tables
+  SELECT
+    'oracle_app_missing_select_priv',
+    lt.table_name,
+    'oracle_app is missing required SELECT privilege'
+  FROM ledger_tables AS lt
+  WHERE NOT pg_catalog.has_table_privilege('oracle_app', lt.table_name, 'SELECT')
+
+  UNION ALL
+
+  -- 5. Verify PUBLIC has NO write or SELECT privileges on any ledger table
+  SELECT
+    'public_forbidden_table_priv',
+    lt.table_name,
+    'PUBLIC has forbidden effective table privilege ' || p.priv
+  FROM ledger_tables AS lt
+  CROSS JOIN (
+    SELECT priv FROM forbidden_table_privs
+    UNION ALL
+    SELECT 'SELECT'
+  ) AS p(priv)
+  WHERE pg_catalog.has_table_privilege('public', lt.table_name, p.priv)
+
+  UNION ALL
+
+  -- 6. Verify schema privileges via has_schema_privilege (no CREATE on oracle_ledger or public; USAGE on oracle_ledger for oracle_app only)
+  SELECT
+    'schema_privilege',
+    s.schema_name,
+    'oracle_app has forbidden CREATE privilege on schema ' || s.schema_name
+  FROM (VALUES ('oracle_ledger'), ('public')) AS s(schema_name)
+  WHERE pg_catalog.has_schema_privilege('oracle_app', s.schema_name, 'CREATE')
+
+  UNION ALL
+
+  SELECT
+    'schema_privilege',
+    'oracle_ledger',
+    'oracle_app is missing required USAGE privilege on schema oracle_ledger'
+  WHERE NOT pg_catalog.has_schema_privilege('oracle_app', 'oracle_ledger', 'USAGE')
+
+  UNION ALL
+
+  SELECT
+    'public_schema_privilege',
+    s.schema_name,
+    'PUBLIC has forbidden ' || s.priv || ' privilege on schema ' || s.schema_name
+  FROM (
+    VALUES
+      ('oracle_ledger', 'CREATE'),
+      ('oracle_ledger', 'USAGE'),
+      ('public', 'CREATE')
+  ) AS s(schema_name, priv)
+  WHERE pg_catalog.has_schema_privilege('public', s.schema_name, s.priv)
+
+  UNION ALL
+
+  -- 7. Verify oracle_app owns zero schemas, relations, or functions
+  SELECT
+    'oracle_app_owns_schema',
+    n.nspname,
+    'oracle_app must not own any schema'
+  FROM pg_catalog.pg_namespace AS n
+  JOIN pg_catalog.pg_roles AS r ON r.oid = n.nspowner
+  WHERE r.rolname = 'oracle_app'
+
+  UNION ALL
+
+  SELECT
+    'oracle_app_owns_relation',
+    n.nspname || '.' || c.relname,
+    'oracle_app must not own any table, sequence, or view'
+  FROM pg_catalog.pg_class AS c
+  JOIN pg_catalog.pg_namespace AS n ON n.oid = c.relnamespace
+  JOIN pg_catalog.pg_roles AS r ON r.oid = c.relowner
+  WHERE r.rolname = 'oracle_app'
+
+  UNION ALL
+
+  SELECT
+    'oracle_app_owns_function',
+    n.nspname || '.' || p.proname,
+    'oracle_app must not own any function or procedure'
+  FROM pg_catalog.pg_proc AS p
+  JOIN pg_catalog.pg_namespace AS n ON n.oid = p.pronamespace
+  JOIN pg_catalog.pg_roles AS r ON r.oid = p.proowner
+  WHERE r.rolname = 'oracle_app'
+
+  UNION ALL
+
+  -- 8. Verify oracle_app has EXECUTE on all three approved SECURITY DEFINER functions
+  SELECT
+    'oracle_app_missing_approved_execute',
+    af.fn_sig,
+    'oracle_app is missing EXECUTE privilege on approved function ' || af.fn_name
+  FROM approved_functions AS af
+  WHERE NOT pg_catalog.has_function_privilege('oracle_app', af.fn_sig, 'EXECUTE')
+
+  UNION ALL
+
+  -- 9. Verify oracle_app CANNOT execute any unapproved or trigger function in oracle_ledger
+  SELECT
+    'oracle_app_unapproved_function_execute',
+    n.nspname || '.' || p.proname,
+    'oracle_app has forbidden EXECUTE privilege on unapproved function ' || n.nspname || '.' || p.proname
+  FROM pg_catalog.pg_proc AS p
+  JOIN pg_catalog.pg_namespace AS n ON n.oid = p.pronamespace
+  WHERE n.nspname = 'oracle_ledger'
+    AND p.proname NOT IN (SELECT fn_name FROM approved_functions)
+    AND pg_catalog.has_function_privilege('oracle_app', p.oid, 'EXECUTE')
+
+  UNION ALL
+
+  -- 10. Verify PUBLIC CANNOT execute ANY function in oracle_ledger (approved or unapproved)
+  SELECT
+    'public_function_execute',
+    n.nspname || '.' || p.proname,
+    'PUBLIC has forbidden EXECUTE privilege on function ' || n.nspname || '.' || p.proname
+  FROM pg_catalog.pg_proc AS p
+  JOIN pg_catalog.pg_namespace AS n ON n.oid = p.pronamespace
+  WHERE n.nspname = 'oracle_ledger'
+    AND pg_catalog.has_function_privilege('public', p.oid, 'EXECUTE')
+)
+SELECT
+  check_category,
+  object_name,
+  violation_detail
+FROM effective_privilege_violations;
 ```
 
 > **Honest boundary of database triggers, `SECURITY DEFINER` write functions, digest checks, and role separation**:
