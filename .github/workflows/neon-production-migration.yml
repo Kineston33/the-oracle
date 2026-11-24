@@ -1,0 +1,138 @@
+name: Official Production Migration Protocol v1.0 (Neon)
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirm_production:
+        description: "Type APPLY_PRODUCTION_MIGRATION to authorize the production database migration"
+        required: true
+        type: string
+      expected_branch:
+        description: "Target Neon branch name (must be exactly 'production')"
+        required: true
+        default: "production"
+        type: string
+
+concurrency:
+  group: neon-production-migration
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  apply_production_migration:
+    name: Verify Identity, Apply Production Migration & Run §2.5 Security Audit
+    if: >-
+      github.event_name == 'workflow_dispatch' &&
+      github.ref == 'refs/heads/main' &&
+      github.ref_name == 'main' &&
+      inputs.confirm_production == 'APPLY_PRODUCTION_MIGRATION' &&
+      inputs.expected_branch == 'production'
+    runs-on: ubuntu-latest
+    environment: production-migration
+    steps:
+      - name: Verify manual dispatch on main and confirmation phrase
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          GIT_REF: ${{ github.ref }}
+          GIT_REF_NAME: ${{ github.ref_name }}
+          CONFIRM_PRODUCTION: ${{ inputs.confirm_production }}
+          EXPECTED_BRANCH: ${{ inputs.expected_branch }}
+        run: |
+          set -euo pipefail
+          if [ "${EVENT_NAME}" != "workflow_dispatch" ]; then
+            echo "::error::Production migration workflow can only run via manual workflow_dispatch."
+            exit 1
+          fi
+          if [ "${GIT_REF}" != "refs/heads/main" ] || [ "${GIT_REF_NAME}" != "main" ]; then
+            echo "::error::Production migration workflow must be dispatched from the 'main' branch (got ref='${GIT_REF}')."
+            exit 1
+          fi
+          if [ "${CONFIRM_PRODUCTION}" != "APPLY_PRODUCTION_MIGRATION" ]; then
+            echo "::error::Invalid confirmation phrase. You must type exactly APPLY_PRODUCTION_MIGRATION."
+            exit 1
+          fi
+          if [ "${EXPECTED_BRANCH}" != "production" ]; then
+            echo "::error::Expected branch input must be exactly 'production'."
+            exit 1
+          fi
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Execute production-authorized PostgreSQL ledger migration and §2.5 security audit
+        env:
+          MIGRATION_DATABASE_URL: ${{ secrets.PRODUCTION_MIGRATION_DATABASE_URL }}
+          NEON_API_KEY: ${{ secrets.NEON_API_KEY }}
+          ORACLE_APP_PASSWORD: ${{ secrets.ORACLE_APP_PASSWORD }}
+          NEON_PROJECT_ID: ${{ vars.NEON_PROJECT_ID }}
+          NEON_PRODUCTION_BRANCH_ID: ${{ vars.NEON_PRODUCTION_BRANCH_ID }}
+          CONFIRM_PRODUCTION: ${{ inputs.confirm_production }}
+          EXPECTED_BRANCH: ${{ inputs.expected_branch }}
+        run: |
+          set -euo pipefail
+          if [ -n "${MIGRATION_DATABASE_URL:-}" ]; then echo "::add-mask::${MIGRATION_DATABASE_URL}"; fi
+          if [ -n "${NEON_API_KEY:-}" ]; then echo "::add-mask::${NEON_API_KEY}"; fi
+          if [ -n "${ORACLE_APP_PASSWORD:-}" ]; then echo "::add-mask::${ORACLE_APP_PASSWORD}"; fi
+
+          if [ "${CONFIRM_PRODUCTION:-}" != "APPLY_PRODUCTION_MIGRATION" ]; then
+            echo "::error::Invalid confirmation phrase. Expected APPLY_PRODUCTION_MIGRATION."
+            exit 1
+          fi
+
+          if [ "${EXPECTED_BRANCH:-}" != "production" ]; then
+            echo "::error::Expected branch must be 'production'."
+            exit 1
+          fi
+
+          if [ -z "${MIGRATION_DATABASE_URL:-}" ]; then
+            echo "::error::Missing required environment secret PRODUCTION_MIGRATION_DATABASE_URL in 'production-migration' GitHub Environment."
+            exit 1
+          fi
+
+          if [ -z "${NEON_API_KEY:-}" ]; then
+            echo "::error::Missing required secret NEON_API_KEY."
+            exit 1
+          fi
+
+          if [ -z "${ORACLE_APP_PASSWORD:-}" ]; then
+            echo "::error::Missing required secret ORACLE_APP_PASSWORD."
+            exit 1
+          fi
+
+          if [ -z "${NEON_PROJECT_ID:-}" ]; then
+            echo "::error::Missing required variable NEON_PROJECT_ID."
+            exit 1
+          fi
+
+          if [ -z "${NEON_PRODUCTION_BRANCH_ID:-}" ]; then
+            echo "::error::Missing required variable NEON_PRODUCTION_BRANCH_ID."
+            exit 1
+          fi
+
+          case "${NEON_PRODUCTION_BRANCH_ID}" in
+            br-*) ;;
+            *)
+              echo "::error::NEON_PRODUCTION_BRANCH_ID must be a valid Neon branch ID starting with 'br-'."
+              exit 1
+              ;;
+          esac
+
+          unset DATABASE_URL
+          npm run db:migrate -- \
+            --allow-production-migration \
+            --confirm-production "${CONFIRM_PRODUCTION}" \
+            --expected-project-id "${NEON_PROJECT_ID}" \
+            --expected-branch "production" \
+            --expected-branch-id "${NEON_PRODUCTION_BRANCH_ID}" \
+            --production-branch-id "${NEON_PRODUCTION_BRANCH_ID}"

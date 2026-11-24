@@ -39,12 +39,14 @@ import {
 } from './embedded-pg.ts';
 import {
   MigrationTargetSecurityError,
+  PRODUCTION_CONFIRMATION_PHRASE,
   PostgresPublicationRegistry,
   RuntimeRoleSecurityError,
   executeSafeMigrationRun,
   formatSafeMigrationReport,
   isMainModule,
   isMigrateMainModule,
+  parseMigrationCliArgs,
   probeDatabaseIdentity,
   provisionOracleAppPasswordSafely,
   redactSecrets,
@@ -2208,5 +2210,361 @@ describe('Real PostgreSQL 16+ Integration Suite — Official Publication Protoco
     expect(migrateStderr.join('')).toContain(
       '[the-oracle:migrate] Refusing to execute database migration: MIGRATION_DATABASE_URL environment variable is required',
     );
+  });
+
+  it('17. enforces Official Production Migration Protocol v1.0 (rejecting production without explicit CLI authorization, wrong confirmation phrase, wrong branch/project ID, missing/failed API verification, GUC-only fallback, or pooled URLs, and accepting only when all exact checks pass)', async () => {
+    const baseProbe = await probeDatabaseIdentity(adminPool);
+    const directProdConnInfo = validateMigrationConnectionUrl(
+      'postgresql://neondb_owner:secret@ep-prod-endpoint-111.us-east-2.aws.neon.tech/neondb?sslmode=require',
+    );
+    const prodProbe = {
+      ...baseProbe,
+      currentUser: 'neondb_owner',
+      sessionUser: 'neondb_owner',
+      neonProjectId: 'wispy-cell-45340306',
+      neonBranchId: 'br-prod-001',
+    };
+    const validProdResolved = {
+      projectId: 'wispy-cell-45340306',
+      branchId: 'br-prod-001',
+      branchName: 'production',
+      endpointId: 'ep-prod-endpoint-111',
+      endpointHost: 'ep-prod-endpoint-111.us-east-2.aws.neon.tech',
+      isDefault: true,
+      isPrimary: true,
+      isProtected: true,
+      parentId: null,
+      source: 'neon-api' as const,
+    };
+
+    // 1. CLI argument parser verifies dedicated flags
+    const parsedDefault = parseMigrationCliArgs([
+      '--expected-branch',
+      'preview/pr-6-test',
+      '--expected-branch-id',
+      'br-test-123',
+    ]);
+    expect(parsedDefault.allowProductionMigration).toBe(false);
+    expect(parsedDefault.confirmProductionPhrase).toBeUndefined();
+
+    const parsedProdCli = parseMigrationCliArgs([
+      '--allow-production-migration',
+      '--confirm-production',
+      PRODUCTION_CONFIRMATION_PHRASE,
+      '--expected-project-id',
+      'wispy-cell-45340306',
+      '--expected-branch',
+      'production',
+      '--expected-branch-id',
+      'br-prod-001',
+      '--production-branch-id',
+      'br-prod-001',
+    ]);
+    expect(parsedProdCli).toEqual({
+      allowProductionMigration: true,
+      confirmProductionPhrase: 'APPLY_PRODUCTION_MIGRATION',
+      expectedProjectId: 'wispy-cell-45340306',
+      expectedBranchName: 'production',
+      expectedBranchId: 'br-prod-001',
+      productionBranchId: 'br-prod-001',
+      json: false,
+    });
+
+    // 2. Production rejected without explicit authorization (even if environment variables try to spoof it)
+    const savedAllowEnv = process.env.ALLOW_PRODUCTION_MIGRATION;
+    const savedConfirmEnv = process.env.CONFIRM_PRODUCTION;
+    process.env.ALLOW_PRODUCTION_MIGRATION = 'true';
+    process.env.CONFIRM_PRODUCTION = 'APPLY_PRODUCTION_MIGRATION';
+    try {
+      await expect(
+        verifyMigrationTargetIdentity({
+          connectionInfo: directProdConnInfo,
+          probe: prodProbe,
+          expectedProjectId: 'wispy-cell-45340306',
+          expectedBranchName: 'production',
+          expectedBranchId: 'br-prod-001',
+          productionBranchId: 'br-prod-001',
+          neonApiKey: 'napi_test_key',
+          branchResolver: async () => validProdResolved,
+        }),
+      ).rejects.toThrow(
+        /Expected branch 'production' is a protected production branch name; migrations against production are blocked by default/,
+      );
+    } finally {
+      if (savedAllowEnv === undefined) {
+        delete process.env.ALLOW_PRODUCTION_MIGRATION;
+      } else {
+        process.env.ALLOW_PRODUCTION_MIGRATION = savedAllowEnv;
+      }
+      if (savedConfirmEnv === undefined) {
+        delete process.env.CONFIRM_PRODUCTION;
+      } else {
+        process.env.CONFIRM_PRODUCTION = savedConfirmEnv;
+      }
+    }
+
+    // 3. Production rejected if typed confirmation phrase is missing or incorrect
+    await expect(
+      verifyMigrationTargetIdentity({
+        connectionInfo: directProdConnInfo,
+        probe: prodProbe,
+        expectedProjectId: 'wispy-cell-45340306',
+        expectedBranchName: 'production',
+        expectedBranchId: 'br-prod-001',
+        productionBranchId: 'br-prod-001',
+        neonApiKey: 'napi_test_key',
+        productionAuthorization: {
+          allowProductionMigration: true,
+          confirmProductionPhrase: 'apply_production_migration', // wrong case
+        },
+        branchResolver: async () => validProdResolved,
+      }),
+    ).rejects.toThrow(
+      /Production migration requires explicit confirmation phrase 'APPLY_PRODUCTION_MIGRATION'/,
+    );
+
+    await expect(
+      verifyMigrationTargetIdentity({
+        connectionInfo: directProdConnInfo,
+        probe: prodProbe,
+        expectedProjectId: 'wispy-cell-45340306',
+        expectedBranchName: 'production',
+        expectedBranchId: 'br-prod-001',
+        productionBranchId: 'br-prod-001',
+        neonApiKey: 'napi_test_key',
+        productionAuthorization: {
+          allowProductionMigration: false,
+          confirmProductionPhrase: 'APPLY_PRODUCTION_MIGRATION',
+        },
+        branchResolver: async () => validProdResolved,
+      }),
+    ).rejects.toThrow(
+      /Production migration requires the explicit --allow-production-migration CLI flag/,
+    );
+
+    // 4. Production rejected with wrong branch ID (expectedBranchId !== productionBranchId or API mismatch)
+    await expect(
+      verifyMigrationTargetIdentity({
+        connectionInfo: directProdConnInfo,
+        probe: prodProbe,
+        expectedProjectId: 'wispy-cell-45340306',
+        expectedBranchName: 'production',
+        expectedBranchId: 'br-wrong-999',
+        productionBranchId: 'br-prod-001',
+        neonApiKey: 'napi_test_key',
+        productionAuthorization: {
+          allowProductionMigration: true,
+          confirmProductionPhrase: 'APPLY_PRODUCTION_MIGRATION',
+        },
+        branchResolver: async () => validProdResolved,
+      }),
+    ).rejects.toThrow(/Production migration branch ID mismatch/);
+
+    await expect(
+      verifyMigrationTargetIdentity({
+        connectionInfo: directProdConnInfo,
+        probe: prodProbe,
+        expectedProjectId: 'wispy-cell-45340306',
+        expectedBranchName: 'production',
+        expectedBranchId: 'br-wrong-999',
+        productionBranchId: 'br-wrong-999',
+        neonApiKey: 'napi_test_key',
+        productionAuthorization: {
+          allowProductionMigration: true,
+          confirmProductionPhrase: 'APPLY_PRODUCTION_MIGRATION',
+        },
+        branchResolver: async () => validProdResolved,
+      }),
+    ).rejects.toThrow(
+      /does not match expected production branch ID 'br-wrong-999'/,
+    );
+
+    // 5. Production rejected with wrong project ID (caller vs .neon or server GUC vs .neon)
+    await expect(
+      verifyMigrationTargetIdentity({
+        connectionInfo: directProdConnInfo,
+        probe: prodProbe,
+        expectedProjectId: 'wrong-project-id-000',
+        expectedBranchName: 'production',
+        expectedBranchId: 'br-prod-001',
+        productionBranchId: 'br-prod-001',
+        neonApiKey: 'napi_test_key',
+        productionAuthorization: {
+          allowProductionMigration: true,
+          confirmProductionPhrase: 'APPLY_PRODUCTION_MIGRATION',
+        },
+        branchResolver: async () => validProdResolved,
+      }),
+    ).rejects.toThrow(/Production migration project ID mismatch/);
+
+    await expect(
+      verifyMigrationTargetIdentity({
+        connectionInfo: directProdConnInfo,
+        probe: {
+          ...prodProbe,
+          neonProjectId: 'other-project-999',
+        },
+        expectedProjectId: 'wispy-cell-45340306',
+        expectedBranchName: 'production',
+        expectedBranchId: 'br-prod-001',
+        productionBranchId: 'br-prod-001',
+        neonApiKey: 'napi_test_key',
+        productionAuthorization: {
+          allowProductionMigration: true,
+          confirmProductionPhrase: 'APPLY_PRODUCTION_MIGRATION',
+        },
+        branchResolver: async () => validProdResolved,
+      }),
+    ).rejects.toThrow(/Server GUC neon\.project_id \('other-project-999'\) does not match/);
+
+    // 6. Production rejected if API verification fails, is unavailable, or falls back to GUC/CLI
+    await expect(
+      verifyMigrationTargetIdentity({
+        connectionInfo: directProdConnInfo,
+        probe: prodProbe,
+        expectedProjectId: 'wispy-cell-45340306',
+        expectedBranchName: 'production',
+        expectedBranchId: 'br-prod-001',
+        productionBranchId: 'br-prod-001',
+        neonApiKey: '',
+        productionAuthorization: {
+          allowProductionMigration: true,
+          confirmProductionPhrase: 'APPLY_PRODUCTION_MIGRATION',
+        },
+        branchResolver: async () => validProdResolved,
+      }),
+    ).rejects.toThrow(/Production migration requires NEON_API_KEY/);
+
+    await expect(
+      verifyMigrationTargetIdentity({
+        connectionInfo: directProdConnInfo,
+        probe: prodProbe,
+        expectedProjectId: 'wispy-cell-45340306',
+        expectedBranchName: 'production',
+        expectedBranchId: 'br-prod-001',
+        productionBranchId: 'br-prod-001',
+        neonApiKey: 'napi_test_key',
+        productionAuthorization: {
+          allowProductionMigration: true,
+          confirmProductionPhrase: 'APPLY_PRODUCTION_MIGRATION',
+        },
+        branchResolver: async () => null, // Simulate API failure even though prodProbe.neonBranchId === 'br-prod-001'
+      }),
+    ).rejects.toThrow(
+      /authoritative Neon API verification failed or was unavailable .* \(GUC-only fallback is forbidden for production\)/,
+    );
+
+    await expect(
+      verifyMigrationTargetIdentity({
+        connectionInfo: directProdConnInfo,
+        probe: prodProbe,
+        expectedProjectId: 'wispy-cell-45340306',
+        expectedBranchName: 'production',
+        expectedBranchId: 'br-prod-001',
+        productionBranchId: 'br-prod-001',
+        neonApiKey: 'napi_test_key',
+        productionAuthorization: {
+          allowProductionMigration: true,
+          confirmProductionPhrase: 'APPLY_PRODUCTION_MIGRATION',
+        },
+        branchResolver: async () => ({
+          ...validProdResolved,
+          source: 'neon-cli',
+        }),
+      }),
+    ).rejects.toThrow(/GUC-only fallback is forbidden for production/);
+
+    // 7. Production rejected if endpoint does not map to expected branch or branch is not default/primary
+    await expect(
+      verifyMigrationTargetIdentity({
+        connectionInfo: directProdConnInfo,
+        probe: prodProbe,
+        expectedProjectId: 'wispy-cell-45340306',
+        expectedBranchName: 'production',
+        expectedBranchId: 'br-prod-001',
+        productionBranchId: 'br-prod-001',
+        neonApiKey: 'napi_test_key',
+        productionAuthorization: {
+          allowProductionMigration: true,
+          confirmProductionPhrase: 'APPLY_PRODUCTION_MIGRATION',
+        },
+        branchResolver: async () => ({
+          ...validProdResolved,
+          endpointId: 'ep-different-endpoint-999',
+        }),
+      }),
+    ).rejects.toThrow(/does not match connected endpoint/);
+
+    await expect(
+      verifyMigrationTargetIdentity({
+        connectionInfo: directProdConnInfo,
+        probe: prodProbe,
+        expectedProjectId: 'wispy-cell-45340306',
+        expectedBranchName: 'production',
+        expectedBranchId: 'br-prod-001',
+        productionBranchId: 'br-prod-001',
+        neonApiKey: 'napi_test_key',
+        productionAuthorization: {
+          allowProductionMigration: true,
+          confirmProductionPhrase: 'APPLY_PRODUCTION_MIGRATION',
+        },
+        branchResolver: async () => ({
+          ...validProdResolved,
+          isDefault: false,
+          isPrimary: false,
+        }),
+      }),
+    ).rejects.toThrow(/is neither the default nor primary production branch/);
+
+    // 8. Production rejected if pooled connection is used or connected role is oracle_app / oracle_migrator
+    expect(() =>
+      validateMigrationConnectionUrl(
+        'postgresql://neondb_owner:secret@ep-prod-endpoint-111-pooler.us-east-2.aws.neon.tech/neondb?sslmode=require',
+      ),
+    ).toThrow(/uses a pooled endpoint \(-pooler\)/);
+
+    await expect(
+      verifyMigrationTargetIdentity({
+        connectionInfo: directProdConnInfo,
+        probe: {
+          ...prodProbe,
+          currentUser: 'oracle_app',
+        },
+        expectedProjectId: 'wispy-cell-45340306',
+        expectedBranchName: 'production',
+        expectedBranchId: 'br-prod-001',
+        productionBranchId: 'br-prod-001',
+        neonApiKey: 'napi_test_key',
+        productionAuthorization: {
+          allowProductionMigration: true,
+          confirmProductionPhrase: 'APPLY_PRODUCTION_MIGRATION',
+        },
+        branchResolver: async () => validProdResolved,
+      }),
+    ).rejects.toThrow(/never as oracle_app or oracle_migrator/);
+
+    // 9. Production ACCEPTED only when ALL exact checks pass
+    const authorizedProdTarget = await verifyMigrationTargetIdentity({
+      connectionInfo: directProdConnInfo,
+      probe: prodProbe,
+      expectedProjectId: 'wispy-cell-45340306',
+      expectedBranchName: 'production',
+      expectedBranchId: 'br-prod-001',
+      productionBranchId: 'br-prod-001',
+      neonApiKey: 'napi_test_key',
+      productionAuthorization: {
+        allowProductionMigration: true,
+        confirmProductionPhrase: 'APPLY_PRODUCTION_MIGRATION',
+      },
+      branchResolver: async () => validProdResolved,
+    });
+    expect(authorizedProdTarget).toEqual({
+      verificationMethod: 'neon-control-plane',
+      projectId: 'wispy-cell-45340306',
+      branchId: 'br-prod-001',
+      branchName: 'production',
+      endpointId: 'ep-prod-endpoint-111',
+      isProduction: true,
+    });
   });
 });

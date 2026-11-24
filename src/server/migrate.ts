@@ -944,13 +944,31 @@ function isProtectedProductionBranchName(name: string): boolean {
   );
 }
 
+export const PRODUCTION_CONFIRMATION_PHRASE =
+  'APPLY_PRODUCTION_MIGRATION' as const;
+
+export interface ProductionMigrationAuthorization {
+  /**
+   * Must be set to `true` via explicit CLI flag `--allow-production-migration`
+   * (never via environment variable alone).
+   */
+  allowProductionMigration: boolean;
+  /**
+   * Must exactly equal `APPLY_PRODUCTION_MIGRATION` via `--confirm-production`.
+   */
+  confirmProductionPhrase?: string;
+}
+
 export interface VerifyMigrationTargetOptions {
   connectionInfo: ParsedMigrationConnectionInfo;
   probe: DatabaseIdentityProbe;
   repoNeonContext?: RepoNeonContext;
+  expectedProjectId?: string;
   expectedBranchName?: string;
   expectedBranchId?: string;
   productionBranchId?: string;
+  neonApiKey?: string;
+  productionAuthorization?: ProductionMigrationAuthorization;
   branchResolver?: NeonBranchResolver;
 }
 
@@ -963,7 +981,7 @@ export interface VerifiedMigrationTarget {
   branchId: string | null;
   branchName: string | null;
   endpointId: string | null;
-  isProduction: false;
+  isProduction: boolean;
 }
 
 /**
@@ -979,6 +997,10 @@ export async function verifyMigrationTargetIdentity(
 ): Promise<VerifiedMigrationTarget> {
   const { connectionInfo, probe } = options;
   const repoContext = options.repoNeonContext ?? loadRepoNeonContext();
+  const prodAuth = options.productionAuthorization;
+  const isProdAuthRequested =
+    Boolean(prodAuth?.allowProductionMigration) ||
+    Boolean(prodAuth?.confirmProductionPhrase);
   const violations: string[] = [];
 
   if (probe.serverVersionNum < 160000) {
@@ -1004,6 +1026,180 @@ export async function verifyMigrationTargetIdentity(
     );
   }
 
+  // ==========================================================================
+  // Explicitly Authorized Production Migration Path (Fail-Closed Protocol v1.0)
+  // ==========================================================================
+  if (isProdAuthRequested) {
+    if (prodAuth?.allowProductionMigration !== true) {
+      violations.push(
+        'Production migration requires the explicit --allow-production-migration CLI flag',
+      );
+    }
+
+    if (prodAuth?.confirmProductionPhrase !== PRODUCTION_CONFIRMATION_PHRASE) {
+      violations.push(
+        `Production migration requires explicit confirmation phrase '${PRODUCTION_CONFIRMATION_PHRASE}' via --confirm-production`,
+      );
+    }
+
+    const expectedBranchName = options.expectedBranchName?.trim() ?? '';
+    if (expectedBranchName !== 'production') {
+      violations.push(
+        `Production migration requires --expected-branch to be exactly 'production', got '${expectedBranchName || '<empty>'}'`,
+      );
+    }
+
+    const expectedBranchId = options.expectedBranchId?.trim() ?? '';
+    const productionBranchId = options.productionBranchId?.trim() ?? '';
+    if (!expectedBranchId || !/^br-[a-z0-9-]+$/i.test(expectedBranchId)) {
+      violations.push(
+        `Production migration requires a valid --expected-branch-id ('br-...'), got '${expectedBranchId || '<empty>'}'`,
+      );
+    }
+    if (!productionBranchId || !/^br-[a-z0-9-]+$/i.test(productionBranchId)) {
+      violations.push(
+        `Production migration requires a valid --production-branch-id / NEON_PRODUCTION_BRANCH_ID ('br-...'), got '${productionBranchId || '<empty>'}'`,
+      );
+    }
+    if (
+      expectedBranchId &&
+      productionBranchId &&
+      expectedBranchId !== productionBranchId
+    ) {
+      violations.push(
+        `Production migration branch ID mismatch: --expected-branch-id ('${expectedBranchId}') must equal --production-branch-id ('${productionBranchId}')`,
+      );
+    }
+
+    const repoProjectId = repoContext.projectId?.trim() ?? '';
+    const callerProjectId =
+      options.expectedProjectId?.trim() ??
+      process.env.NEON_PROJECT_ID?.trim() ??
+      '';
+    if (!repoProjectId) {
+      violations.push(
+        'Repository .neon file is missing a valid projectId required for production migration verification',
+      );
+    }
+    if (!callerProjectId) {
+      violations.push(
+        'Production migration requires NEON_PROJECT_ID (or --expected-project-id) matching repository .neon projectId',
+      );
+    }
+    if (
+      repoProjectId &&
+      callerProjectId &&
+      repoProjectId !== callerProjectId
+    ) {
+      violations.push(
+        `Production migration project ID mismatch: NEON_PROJECT_ID ('${callerProjectId}') does not match repository .neon projectId ('${repoProjectId}')`,
+      );
+    }
+
+    if (
+      probe.neonProjectId &&
+      repoProjectId &&
+      probe.neonProjectId !== repoProjectId
+    ) {
+      violations.push(
+        `Server GUC neon.project_id ('${probe.neonProjectId}') does not match repository .neon projectId ('${repoProjectId}')`,
+      );
+    }
+
+    if (
+      !connectionInfo.isNeonHost ||
+      connectionInfo.isLoopback ||
+      !connectionInfo.neonEndpointId
+    ) {
+      violations.push(
+        `Production migration requires a direct Neon compute endpoint host ('ep-...neon.tech'), got '${connectionInfo.host}'`,
+      );
+    }
+
+    const apiKey =
+      options.neonApiKey?.trim() ?? process.env.NEON_API_KEY?.trim() ?? '';
+    if (!apiKey) {
+      violations.push(
+        'Production migration requires NEON_API_KEY for authoritative Neon API verification',
+      );
+    }
+
+    if (violations.length > 0) {
+      throw new MigrationTargetSecurityError(violations);
+    }
+
+    const resolver = options.branchResolver ?? defaultNeonBranchResolver;
+    const resolved = await resolver({
+      projectId: repoProjectId,
+      endpointId: connectionInfo.neonEndpointId,
+      host: connectionInfo.host,
+      serverBranchId: probe.neonBranchId,
+    });
+
+    // Fallback GUC-only or CLI-only resolution is strictly forbidden for production
+    if (!resolved || resolved.source === 'neon-cli') {
+      throw new MigrationTargetSecurityError([
+        `Production migration aborted: authoritative Neon API verification failed or was unavailable for endpoint '${String(connectionInfo.neonEndpointId)}' (GUC-only fallback is forbidden for production)`,
+      ]);
+    }
+
+    if (resolved.projectId !== repoProjectId) {
+      violations.push(
+        `Authoritative Neon API projectId ('${resolved.projectId}') does not match expected projectId ('${repoProjectId}')`,
+      );
+    }
+
+    if (
+      resolved.endpointId.toLowerCase() !==
+        connectionInfo.neonEndpointId!.toLowerCase() ||
+      resolved.endpointHost.toLowerCase() !== connectionInfo.host.toLowerCase()
+    ) {
+      violations.push(
+        `Authoritative Neon API endpoint ('${resolved.endpointId}' / '${resolved.endpointHost}') does not match connected endpoint ('${connectionInfo.neonEndpointId}' / '${connectionInfo.host}')`,
+      );
+    }
+
+    if (resolved.branchId !== expectedBranchId) {
+      violations.push(
+        `Authoritative Neon API resolved endpoint '${connectionInfo.neonEndpointId}' to branch '${resolved.branchName}' ('${resolved.branchId}'), which does not match expected production branch ID '${expectedBranchId}'`,
+      );
+    }
+
+    if (resolved.branchName !== 'production') {
+      violations.push(
+        `Authoritative Neon API resolved branch name is '${resolved.branchName}', expected exactly 'production'`,
+      );
+    }
+
+    if (!resolved.isDefault && !resolved.isPrimary) {
+      violations.push(
+        `Authoritative Neon API branch '${resolved.branchName}' ('${resolved.branchId}') is neither the default nor primary production branch (default=${resolved.isDefault}, primary=${resolved.isPrimary})`,
+      );
+    }
+
+    if (probe.neonBranchId && probe.neonBranchId !== resolved.branchId) {
+      violations.push(
+        `Branch identity mismatch: Neon API resolved branch '${resolved.branchId}', but PostgreSQL server GUC neon.branch_id reported '${probe.neonBranchId}'`,
+      );
+    }
+
+    if (violations.length > 0) {
+      throw new MigrationTargetSecurityError(violations);
+    }
+
+    return {
+      verificationMethod: 'neon-control-plane',
+      projectId: resolved.projectId,
+      branchId: resolved.branchId,
+      branchName: resolved.branchName,
+      endpointId: resolved.endpointId,
+      isProduction: true,
+    };
+  }
+
+  // ==========================================================================
+  // Default Non-Production Migration Path (Production Strictly Blocked)
+  // ==========================================================================
   if (isDatabaseCommentMarkedProduction(probe.databaseComment)) {
     violations.push(
       `Database catalog description on '${probe.databaseName}' marks this database as production; migrations against production are blocked by default`,
@@ -1019,7 +1215,19 @@ export async function verifyMigrationTargetIdentity(
     );
   }
 
-  const expectedProjectId = repoContext.projectId ?? 'wispy-cell-45340306';
+  const expectedProjectId =
+    options.expectedProjectId?.trim() ||
+    repoContext.projectId ||
+    'wispy-cell-45340306';
+  if (
+    repoContext.projectId &&
+    options.expectedProjectId &&
+    options.expectedProjectId.trim() !== repoContext.projectId
+  ) {
+    violations.push(
+      `Expected projectId '${options.expectedProjectId.trim()}' does not match repository Neon projectId '${repoContext.projectId}'`,
+    );
+  }
   if (
     probe.neonProjectId &&
     expectedProjectId &&
@@ -1192,6 +1400,10 @@ export interface SafeMigrationExecutionOptions {
    */
   oracleAppPassword?: string;
   /**
+   * Optional expected Neon project ID (`--expected-project-id` or `NEON_PROJECT_ID`).
+   */
+  expectedProjectId?: string;
+  /**
    * Optional expected branch name (`--expected-branch` or `MIGRATION_EXPECTED_BRANCH`).
    */
   expectedBranchName?: string;
@@ -1203,6 +1415,14 @@ export interface SafeMigrationExecutionOptions {
    * Optional Neon production branch ID (`--production-branch-id` or `NEON_PRODUCTION_BRANCH_ID`).
    */
   productionBranchId?: string;
+  /**
+   * Optional Neon API key override (defaults to `process.env.NEON_API_KEY`).
+   */
+  neonApiKey?: string;
+  /**
+   * Explicit production migration authorization. Never populated from environment variables.
+   */
+  productionAuthorization?: ProductionMigrationAuthorization;
   /**
    * Optional custom Neon branch resolver (used in tests or custom control-plane integrations).
    */
@@ -1246,6 +1466,8 @@ export async function executeSafeMigrationRun(
   const runtimeUrl = options?.runtimeDatabaseUrl ?? process.env.DATABASE_URL;
   const oracleAppPassword =
     options?.oracleAppPassword ?? process.env.ORACLE_APP_PASSWORD;
+  const expectedProjectId =
+    options?.expectedProjectId ?? process.env.NEON_PROJECT_ID;
   const expectedBranchName =
     options?.expectedBranchName ?? process.env.MIGRATION_EXPECTED_BRANCH;
   const expectedBranchId =
@@ -1278,9 +1500,12 @@ export async function executeSafeMigrationRun(
     const targetIdentity = await verifyMigrationTargetIdentity({
       connectionInfo,
       probe,
+      expectedProjectId,
       expectedBranchName,
       expectedBranchId,
       productionBranchId,
+      neonApiKey: options?.neonApiKey,
+      productionAuthorization: options?.productionAuthorization,
       branchResolver: options?.branchResolver,
     });
 
@@ -1404,7 +1629,7 @@ export function formatSafeMigrationReport(
     `Branch Verification   : ${report.targetIdentity.verificationMethod}`,
     `Neon Project ID       : ${report.targetIdentity.projectId ?? 'local'}`,
     `Verified Branch       : ${report.targetIdentity.branchName ?? 'n/a'}${report.targetIdentity.branchId ? ` (${report.targetIdentity.branchId})` : ''}`,
-    `Production Protected  : YES (target confirmed non-production)`,
+    `Production Protected  : ${report.targetIdentity.isProduction ? 'AUTHORIZED PRODUCTION MIGRATION (verified default/primary Neon production branch)' : 'YES (target confirmed non-production)'}`,
     '--------------------------------------------------------------------------------',
     'Migration & §2.5 Security Audit',
     '--------------------------------------------------------------------------------',
@@ -1435,32 +1660,50 @@ export interface RunMigrationCliOptions extends SafeMigrationExecutionOptions {
   exit?: (code: number) => void;
 }
 
-function parseMigrationCliArgs(argv: readonly string[]): {
+export function parseMigrationCliArgs(argv: readonly string[]): {
+  expectedProjectId?: string;
   expectedBranchName?: string;
   expectedBranchId?: string;
   productionBranchId?: string;
+  allowProductionMigration: boolean;
+  confirmProductionPhrase?: string;
   json: boolean;
 } {
+  let expectedProjectId: string | undefined;
   let expectedBranchName: string | undefined;
   let expectedBranchId: string | undefined;
   let productionBranchId: string | undefined;
+  let allowProductionMigration = false;
+  let confirmProductionPhrase: string | undefined;
   let json = false;
 
   for (let i = 0; i < argv.length; i += 1) {
     const arg = argv[i]!;
     if (arg === '--json') {
       json = true;
-    } else if (arg === '--expected-branch' && argv[i + 1]) {
+    } else if (arg === '--allow-production-migration') {
+      allowProductionMigration = true;
+    } else if (arg === '--confirm-production' && argv[i + 1] !== undefined) {
+      confirmProductionPhrase = argv[i + 1];
+      i += 1;
+    } else if (arg.startsWith('--confirm-production=')) {
+      confirmProductionPhrase = arg.slice('--confirm-production='.length);
+    } else if (arg === '--expected-project-id' && argv[i + 1] !== undefined) {
+      expectedProjectId = argv[i + 1];
+      i += 1;
+    } else if (arg.startsWith('--expected-project-id=')) {
+      expectedProjectId = arg.slice('--expected-project-id='.length);
+    } else if (arg === '--expected-branch' && argv[i + 1] !== undefined) {
       expectedBranchName = argv[i + 1];
       i += 1;
     } else if (arg.startsWith('--expected-branch=')) {
       expectedBranchName = arg.slice('--expected-branch='.length);
-    } else if (arg === '--expected-branch-id' && argv[i + 1]) {
+    } else if (arg === '--expected-branch-id' && argv[i + 1] !== undefined) {
       expectedBranchId = argv[i + 1];
       i += 1;
     } else if (arg.startsWith('--expected-branch-id=')) {
       expectedBranchId = arg.slice('--expected-branch-id='.length);
-    } else if (arg === '--production-branch-id' && argv[i + 1]) {
+    } else if (arg === '--production-branch-id' && argv[i + 1] !== undefined) {
       productionBranchId = argv[i + 1];
       i += 1;
     } else if (arg.startsWith('--production-branch-id=')) {
@@ -1469,9 +1712,12 @@ function parseMigrationCliArgs(argv: readonly string[]): {
   }
 
   return {
+    expectedProjectId,
     expectedBranchName,
     expectedBranchId,
     productionBranchId,
+    allowProductionMigration,
+    confirmProductionPhrase,
     json,
   };
 }
@@ -1488,15 +1734,28 @@ export async function runMigrationCli(
     options?.argv ?? process.argv.slice(2),
   );
 
+  const cliProductionAuth: ProductionMigrationAuthorization | undefined =
+    parsedArgs.allowProductionMigration ||
+    parsedArgs.confirmProductionPhrase !== undefined
+      ? {
+          allowProductionMigration: parsedArgs.allowProductionMigration,
+          confirmProductionPhrase: parsedArgs.confirmProductionPhrase,
+        }
+      : undefined;
+
   try {
     const report = await executeSafeMigrationRun({
       ...options,
+      expectedProjectId:
+        options?.expectedProjectId ?? parsedArgs.expectedProjectId,
       expectedBranchName:
         options?.expectedBranchName ?? parsedArgs.expectedBranchName,
       expectedBranchId:
         options?.expectedBranchId ?? parsedArgs.expectedBranchId,
       productionBranchId:
         options?.productionBranchId ?? parsedArgs.productionBranchId,
+      productionAuthorization:
+        options?.productionAuthorization ?? cliProductionAuth,
     });
 
     if (parsedArgs.json) {
