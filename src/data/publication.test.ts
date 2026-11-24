@@ -3152,54 +3152,68 @@ describe('protocol v1.3 PostgreSQL transaction contract and retry semantics', ()
       "v_server_version_num := pg_catalog.current_setting('server_version_num')::integer;",
     );
     expect(sqlBlocks).toContain(
-      "IF v_server_version_num < 160000 THEN\n    RAISE EXCEPTION\n      'The Oracle ledger contract v1.8 requires PostgreSQL 16 or newer (server_version_num >= 160000), got: %',\n      v_server_version_num\n      USING ERRCODE = '0A000';\n  END IF;",
+      "IF v_server_version_num < 160000 THEN\n    RAISE EXCEPTION\n      'The Oracle ledger contract v1.9 requires PostgreSQL 16 or newer (server_version_num >= 160000), got: %',\n      v_server_version_num\n      USING ERRCODE = '0A000';\n  END IF;",
     );
     expect(sqlBlocks).toContain(
       "WHERE pg_catalog.current_setting('server_version_num')::integer < 160000",
     );
 
-    // --- 2. Static SQL checks for effective table, schema, function, PUBLIC, and ownership audits ---
-    expect(sqlBlocks).toContain('WITH ledger_tables(table_name) AS (');
+    // --- 2. Static SQL checks for effective table, schema, function, PUBLIC ACL, and ownership audits ---
+    expect(sqlBlocks).toContain(
+      'WITH required_ledger_tables(schema_name, rel_name, qualified_name) AS (',
+    );
     expect(sqlBlocks).toContain('forbidden_table_privs(priv) AS (');
-    expect(sqlBlocks).toContain('approved_functions(fn_sig, fn_name) AS (');
+    expect(sqlBlocks).toContain(
+      'expected_ledger_functions(fn_sig, fn_name, is_approved_for_app) AS (',
+    );
     expect(sqlBlocks).toContain('effective_privilege_violations AS (');
 
-    // Effective table privilege checks (oracle_app and public)
+    // Never pass pseudo-role 'public' as a string to has_table_privilege, has_schema_privilege, or has_function_privilege
+    expect(sqlBlocks).not.toMatch(/has_table_privilege\s*\(\s*'public'/i);
+    expect(sqlBlocks).not.toMatch(/has_schema_privilege\s*\(\s*'public'/i);
+    expect(sqlBlocks).not.toMatch(/has_function_privilege\s*\(\s*'public'/i);
+    expect(sqlBlocks).not.toMatch(/has_sequence_privilege\s*\(\s*'public'/i);
+
+    // Effective table privilege checks across all relations in oracle_ledger for oracle_app
     expect(sqlBlocks).toContain(
-      "WHERE pg_catalog.has_table_privilege('oracle_app', lt.table_name, ftp.priv)",
+      "WHERE n.nspname = 'oracle_ledger'\n    AND c.relkind IN ('r', 'p', 'v', 'm', 'f')\n    AND pg_catalog.has_table_privilege('oracle_app', c.oid, ftp.priv)",
     );
     expect(sqlBlocks).toContain(
-      "WHERE NOT pg_catalog.has_table_privilege('oracle_app', lt.table_name, 'SELECT')",
-    );
-    expect(sqlBlocks).toContain(
-      "WHERE pg_catalog.has_table_privilege('public', lt.table_name, p.priv)",
+      "AND pg_catalog.has_table_privilege('oracle_app', c.oid, 'SELECT')",
     );
 
-    // Effective schema privilege checks (oracle_app and public)
+    // Effective schema privilege checks for oracle_app
     expect(sqlBlocks).toContain(
       "WHERE pg_catalog.has_schema_privilege('oracle_app', s.schema_name, 'CREATE')",
     );
     expect(sqlBlocks).toContain(
       "WHERE NOT pg_catalog.has_schema_privilege('oracle_app', 'oracle_ledger', 'USAGE')",
     );
-    expect(sqlBlocks).toContain(
-      "WHERE pg_catalog.has_schema_privilege('public', s.schema_name, s.priv)",
-    );
 
-    // Ownership checks across pg_namespace, pg_class, and pg_proc
+    // PUBLIC ACL inspection via pg_catalog.aclexplode + pg_catalog.acldefault and acl.grantee = 0::oid
+    expect(sqlBlocks).toContain('CROSS JOIN LATERAL pg_catalog.aclexplode(');
+    expect(sqlBlocks).toContain(
+      "COALESCE(n.nspacl, pg_catalog.acldefault('n'::\"char\", n.nspowner))",
+    );
+    expect(sqlBlocks).toContain(
+      "COALESCE(p.proacl, pg_catalog.acldefault('f'::\"char\", p.proowner))",
+    );
+    expect(sqlBlocks).toContain('AND acl.grantee = 0::oid');
+
+    // Ownership checks across pg_namespace, pg_class, and pg_proc (both oracle_migrator required ownership and oracle_app zero ownership)
     expect(sqlBlocks).toContain('FROM pg_catalog.pg_namespace AS n');
     expect(sqlBlocks).toContain('FROM pg_catalog.pg_class AS c');
     expect(sqlBlocks).toContain('FROM pg_catalog.pg_proc AS p');
+    expect(sqlBlocks).toContain(
+      "WHERE p.oid = pg_catalog.to_regprocedure(ef.fn_sig)\n       AND r.rolname = 'oracle_migrator'",
+    );
 
-    // Effective function EXECUTE checks for oracle_app and PUBLIC
+    // Effective function EXECUTE checks for oracle_app by exact signature/OID
     expect(sqlBlocks).toContain(
-      "WHERE NOT pg_catalog.has_function_privilege('oracle_app', af.fn_sig, 'EXECUTE')",
+      "OR NOT pg_catalog.has_function_privilege('oracle_app', ef.fn_sig, 'EXECUTE')",
     );
     expect(sqlBlocks).toContain(
-      "AND p.proname NOT IN (SELECT fn_name FROM approved_functions)\n    AND pg_catalog.has_function_privilege('oracle_app', p.oid, 'EXECUTE')",
-    );
-    expect(sqlBlocks).toContain(
-      "WHERE n.nspname = 'oracle_ledger'\n    AND pg_catalog.has_function_privilege('public', p.oid, 'EXECUTE')",
+      "AND p.oid = pg_catalog.to_regprocedure(ef.fn_sig)\n    )\n    AND pg_catalog.has_function_privilege('oracle_app', p.oid, 'EXECUTE')",
     );
 
     // Preservation of the recursive pg_auth_members role-membership audit
@@ -3253,7 +3267,7 @@ describe('protocol v1.3 PostgreSQL transaction contract and retry semantics', ()
     function runPreflightVersionGuard(serverVersionNum: number): void {
       if (serverVersionNum < 160000) {
         throw new Error(
-          `0A000: The Oracle ledger contract v1.8 requires PostgreSQL 16 or newer (server_version_num >= 160000), got: ${serverVersionNum}`,
+          `0A000: The Oracle ledger contract v1.9 requires PostgreSQL 16 or newer (server_version_num >= 160000), got: ${serverVersionNum}`,
         );
       }
     }
@@ -3373,7 +3387,7 @@ describe('protocol v1.3 PostgreSQL transaction contract and retry semantics', ()
 
     // 1. PostgreSQL < 16 fails preflight version guard with SQLSTATE 0A000
     expect(() => runPreflightVersionGuard(150008)).toThrow(
-      /0A000: The Oracle ledger contract v1\.8 requires PostgreSQL 16 or newer \(server_version_num >= 160000\), got: 150008/,
+      /0A000: The Oracle ledger contract v1\.9 requires PostgreSQL 16 or newer \(server_version_num >= 160000\), got: 150008/,
     );
     expect(() => runPreflightVersionGuard(160000)).not.toThrow();
 
@@ -3403,6 +3417,511 @@ describe('protocol v1.3 PostgreSQL transaction contract and retry semantics', ()
     expect(evaluateEffectivePrivilegeViolations(ownershipAndCreateLeak)).toEqual([
       'schema_privilege:oracle_ledger:CREATE',
       'oracle_app_owns_object:oracle_ledger.official_predictions',
+    ]);
+  });
+
+  it('enforces v1.9 PUBLIC catalog ACL inspection (aclexplode/acldefault), complete role attributes (including oracle_migrator NOINHERIT), exact-signature object ownership, and full oracle_ledger relation scope (static SQL inspection + in-memory TypeScript simulation, not real PostgreSQL execution)', () => {
+    const contractDoc = readFileSync(
+      resolve(process.cwd(), 'docs/PUBLICATION-API-CONTRACT.md'),
+      'utf8',
+    );
+    const sqlBlocks = Array.from(
+      contractDoc.matchAll(/```sql\r?\n([\s\S]*?)```/g),
+      (m) => m[1],
+    ).join('\n');
+
+    // --- Part A: Static SQL inspection of v1.9 catalog audit requirements ---
+    expect(contractDoc).toContain('# THE ORACLE — Publication API & Storage Contract (v1.9)');
+    expect(contractDoc).toMatch(
+      /Real PostgreSQL execution remains unverified in this[\s>]+environment because no live PostgreSQL server is available/i,
+    );
+
+    // 1. Complete role attribute checks for oracle_app and oracle_migrator (including rolinherit)
+    expect(sqlBlocks).toContain(
+      "WHERE r.rolname = 'oracle_app'\n    AND (\n      r.rolsuper\n      OR r.rolinherit\n      OR r.rolcreatedb\n      OR r.rolcreaterole\n      OR r.rolbypassrls\n      OR r.rolreplication\n      OR NOT r.rolcanlogin\n    )",
+    );
+    expect(sqlBlocks).toContain(
+      "WHERE r.rolname = 'oracle_migrator'\n    AND (\n      r.rolsuper\n      OR r.rolinherit\n      OR r.rolcreatedb\n      OR r.rolcreaterole\n      OR r.rolcanlogin\n    )",
+    );
+
+    // 2. All seven expected functions in oracle_ledger are enumerated with exact canonical signatures
+    const expectedFunctionSignatures = [
+      'oracle_ledger.commit_official_publication(text,character,text,character,jsonb,character,timestamp with time zone,timestamp with time zone,jsonb,character)',
+      'oracle_ledger.record_rejected_or_conflict_idempotency(text,character,jsonb,timestamp with time zone)',
+      'oracle_ledger.append_terminal_prediction_event(text,text,timestamp with time zone,timestamp with time zone,jsonb,character,character)',
+      'oracle_ledger.enforce_append_only_ledger_row()',
+      'oracle_ledger.enforce_publication_idempotency_immutability()',
+      'oracle_ledger.enforce_publication_idempotency_no_truncate()',
+      'oracle_ledger.enforce_publication_idempotency_outcome_complete()',
+    ];
+    for (const sig of expectedFunctionSignatures) {
+      expect(sqlBlocks).toContain(`'${sig}'`);
+    }
+
+    // 3. Required ownership checks for schema oracle_ledger, the 3 ledger tables, and all 7 functions
+    expect(sqlBlocks).toContain("'required_schema_ownership'");
+    expect(sqlBlocks).toContain("'required_table_ownership'");
+    expect(sqlBlocks).toContain("'required_function_ownership'");
+
+    // --- Part B: Deterministic in-memory TypeScript simulation (not live PostgreSQL execution)
+    //             of aclexplode/acldefault PUBLIC ACLs, role attributes, exact-signature ownership,
+    //             and extra relations in oracle_ledger ---
+    const PUBLIC_OID = 0; // PostgreSQL pseudo-role PUBLIC in aclitem[]
+    const ORACLE_APP_OID = 10;
+    const ORACLE_MIGRATOR_OID = 20;
+    const OTHER_ROLE_OID = 99;
+
+    interface SimulatedAclEntry {
+      grantee: number; // 0 = PUBLIC
+      privilege_type: string;
+    }
+
+    interface SimulatedRoleRow {
+      oid: number;
+      rolname: string;
+      rolsuper: boolean;
+      rolinherit: boolean;
+      rolcreatedb: boolean;
+      rolcreaterole: boolean;
+      rolbypassrls: boolean;
+      rolreplication: boolean;
+      rolcanlogin: boolean;
+    }
+
+    interface SimulatedSchemaRow {
+      nspname: string;
+      nspowner: number;
+      nspacl: SimulatedAclEntry[] | null; // null => acldefault('n', nspowner)
+    }
+
+    interface SimulatedRelationRow {
+      nspname: string;
+      relname: string;
+      relkind: 'r' | 'p' | 'v' | 'm' | 'f' | 'S';
+      relowner: number;
+      relacl: SimulatedAclEntry[] | null; // null => acldefault('r' | 'S', relowner)
+    }
+
+    interface SimulatedFunctionRow {
+      signature: string;
+      nspname: string;
+      proname: string;
+      proowner: number;
+      proacl: SimulatedAclEntry[] | null; // null => acldefault('f', proowner) which grants EXECUTE to PUBLIC (0)!
+    }
+
+    // Simulates PostgreSQL's pg_catalog.acldefault(type, ownerOid)
+    function simulateAclDefault(
+      objType: 'r' | 'S' | 'n' | 'f',
+      ownerOid: number,
+    ): SimulatedAclEntry[] {
+      if (objType === 'f') {
+        // In PostgreSQL, default function ACL grants EXECUTE to owner AND to PUBLIC (grantee = 0)
+        return [
+          { grantee: ownerOid, privilege_type: 'EXECUTE' },
+          { grantee: PUBLIC_OID, privilege_type: 'EXECUTE' },
+        ];
+      }
+      if (objType === 'n') {
+        return [
+          { grantee: ownerOid, privilege_type: 'USAGE' },
+          { grantee: ownerOid, privilege_type: 'CREATE' },
+        ];
+      }
+      if (objType === 'S') {
+        return [
+          { grantee: ownerOid, privilege_type: 'USAGE' },
+          { grantee: ownerOid, privilege_type: 'SELECT' },
+          { grantee: ownerOid, privilege_type: 'UPDATE' },
+        ];
+      }
+      return [
+        { grantee: ownerOid, privilege_type: 'SELECT' },
+        { grantee: ownerOid, privilege_type: 'INSERT' },
+        { grantee: ownerOid, privilege_type: 'UPDATE' },
+        { grantee: ownerOid, privilege_type: 'DELETE' },
+        { grantee: ownerOid, privilege_type: 'TRUNCATE' },
+        { grantee: ownerOid, privilege_type: 'REFERENCES' },
+        { grantee: ownerOid, privilege_type: 'TRIGGER' },
+      ];
+    }
+
+    function explodeEffectiveAcl(
+      acl: SimulatedAclEntry[] | null,
+      objType: 'r' | 'S' | 'n' | 'f',
+      ownerOid: number,
+    ): SimulatedAclEntry[] {
+      return acl !== null ? acl : simulateAclDefault(objType, ownerOid);
+    }
+
+    interface SimulatedV19Catalog {
+      roles: SimulatedRoleRow[];
+      schemas: SimulatedSchemaRow[];
+      relations: SimulatedRelationRow[];
+      functions: SimulatedFunctionRow[];
+    }
+
+    const REQUIRED_TABLES = [
+      'oracle_ledger.official_predictions',
+      'oracle_ledger.prediction_events',
+      'oracle_ledger.publication_idempotency_keys',
+    ];
+    const APPROVED_SIGNATURES = new Set(expectedFunctionSignatures.slice(0, 3));
+    const FORBIDDEN_REL_PRIVS = [
+      'INSERT',
+      'UPDATE',
+      'DELETE',
+      'TRUNCATE',
+      'TRIGGER',
+      'REFERENCES',
+    ];
+
+    function runV19CatalogAudit(cat: SimulatedV19Catalog): string[] {
+      const violations: string[] = [];
+      const roleByName = new Map(cat.roles.map((r) => [r.rolname, r]));
+
+      // 2a. Required roles exist
+      for (const reqRole of ['oracle_app', 'oracle_migrator']) {
+        if (!roleByName.has(reqRole)) {
+          violations.push(`missing_required_role:${reqRole}`);
+        }
+      }
+
+      // 2b. oracle_app role attributes
+      const appRole = roleByName.get('oracle_app');
+      if (
+        appRole &&
+        (appRole.rolsuper ||
+          appRole.rolinherit ||
+          appRole.rolcreatedb ||
+          appRole.rolcreaterole ||
+          appRole.rolbypassrls ||
+          appRole.rolreplication ||
+          !appRole.rolcanlogin)
+      ) {
+        violations.push('role_attributes:oracle_app');
+      }
+
+      // 2c. oracle_migrator role attributes (must include rolinherit = false / NOINHERIT)
+      const migRole = roleByName.get('oracle_migrator');
+      if (
+        migRole &&
+        (migRole.rolsuper ||
+          migRole.rolinherit ||
+          migRole.rolcreatedb ||
+          migRole.rolcreaterole ||
+          migRole.rolcanlogin)
+      ) {
+        violations.push('role_attributes:oracle_migrator');
+      }
+
+      const hasRelPrivForApp = (rel: SimulatedRelationRow, priv: string): boolean => {
+        if (rel.relowner === ORACLE_APP_OID) return true;
+        const entries = explodeEffectiveAcl(
+          rel.relacl,
+          rel.relkind === 'S' ? 'S' : 'r',
+          rel.relowner,
+        );
+        return entries.some(
+          (e) =>
+            (e.grantee === ORACLE_APP_OID || e.grantee === PUBLIC_OID) &&
+            e.privilege_type === priv,
+        );
+      };
+
+      // 3a & 3b. Every relation in oracle_ledger checked for forbidden oracle_app privileges
+      for (const rel of cat.relations.filter((r) => r.nspname === 'oracle_ledger')) {
+        const qName = `${rel.nspname}.${rel.relname}`;
+        if (rel.relkind === 'S') {
+          for (const sp of ['USAGE', 'SELECT', 'UPDATE']) {
+            if (hasRelPrivForApp(rel, sp)) {
+              violations.push(`oracle_app_forbidden_sequence_priv:${qName}:${sp}`);
+            }
+          }
+        } else {
+          for (const fp of FORBIDDEN_REL_PRIVS) {
+            if (hasRelPrivForApp(rel, fp)) {
+              violations.push(`oracle_app_forbidden_table_priv:${qName}:${fp}`);
+            }
+          }
+        }
+      }
+
+      // 4. Required ledger tables have SELECT for oracle_app
+      for (const reqTable of REQUIRED_TABLES) {
+        const [nsp, relname] = reqTable.split('.');
+        const found = cat.relations.find(
+          (r) => r.nspname === nsp && r.relname === relname && r.relkind === 'r',
+        );
+        if (!found || !hasRelPrivForApp(found, 'SELECT')) {
+          violations.push(`oracle_app_missing_select_priv:${reqTable}`);
+        }
+      }
+
+      // 5. PUBLIC (grantee = 0) ACL check on all relations in oracle_ledger
+      for (const rel of cat.relations.filter((r) => r.nspname === 'oracle_ledger')) {
+        const qName = `${rel.nspname}.${rel.relname}`;
+        const entries = explodeEffectiveAcl(
+          rel.relacl,
+          rel.relkind === 'S' ? 'S' : 'r',
+          rel.relowner,
+        );
+        for (const e of entries) {
+          if (
+            e.grantee === PUBLIC_OID &&
+            [
+              'SELECT',
+              'INSERT',
+              'UPDATE',
+              'DELETE',
+              'TRUNCATE',
+              'TRIGGER',
+              'REFERENCES',
+              'USAGE',
+            ].includes(e.privilege_type)
+          ) {
+            violations.push(`public_forbidden_table_acl:${qName}:${e.privilege_type}`);
+          }
+        }
+      }
+
+      // 6a & 6b. Schema privileges for oracle_app and PUBLIC (grantee = 0)
+      for (const sName of ['oracle_ledger', 'public']) {
+        const s = cat.schemas.find((sc) => sc.nspname === sName);
+        if (!s) continue;
+        const entries = explodeEffectiveAcl(s.nspacl, 'n', s.nspowner);
+        const appHas = (priv: string) =>
+          s.nspowner === ORACLE_APP_OID ||
+          entries.some(
+            (e) =>
+              (e.grantee === ORACLE_APP_OID || e.grantee === PUBLIC_OID) &&
+              e.privilege_type === priv,
+          );
+        if (appHas('CREATE')) {
+          violations.push(`schema_privilege:${sName}:CREATE`);
+        }
+        if (sName === 'oracle_ledger' && !appHas('USAGE')) {
+          violations.push('schema_privilege:oracle_ledger:missing_USAGE');
+        }
+        for (const e of entries) {
+          if (
+            e.grantee === PUBLIC_OID &&
+            ((sName === 'oracle_ledger' && ['CREATE', 'USAGE'].includes(e.privilege_type)) ||
+              (sName === 'public' && e.privilege_type === 'CREATE'))
+          ) {
+            violations.push(`public_schema_acl:${sName}:${e.privilege_type}`);
+          }
+        }
+      }
+
+      // 7a. oracle_migrator owns schema oracle_ledger
+      const ledgerSchema = cat.schemas.find((s) => s.nspname === 'oracle_ledger');
+      if (!ledgerSchema || ledgerSchema.nspowner !== ORACLE_MIGRATOR_OID) {
+        violations.push('required_schema_ownership:oracle_ledger');
+      }
+
+      // 7b. oracle_migrator owns all 3 required ledger tables
+      for (const reqTable of REQUIRED_TABLES) {
+        const [nsp, relname] = reqTable.split('.');
+        const found = cat.relations.find(
+          (r) => r.nspname === nsp && r.relname === relname && r.relkind === 'r',
+        );
+        if (!found || found.relowner !== ORACLE_MIGRATOR_OID) {
+          violations.push(`required_table_ownership:${reqTable}`);
+        }
+      }
+
+      // 7c. oracle_migrator owns all 7 expected functions by exact signature
+      for (const expectedSig of expectedFunctionSignatures) {
+        const fn = cat.functions.find((f) => f.signature === expectedSig);
+        if (!fn || fn.proowner !== ORACLE_MIGRATOR_OID) {
+          violations.push(`required_function_ownership:${expectedSig}`);
+        }
+      }
+
+      // 7d. oracle_app owns zero schemas, relations, or functions
+      for (const s of cat.schemas.filter((sc) => sc.nspowner === ORACLE_APP_OID)) {
+        violations.push(`oracle_app_owns_schema:${s.nspname}`);
+      }
+      for (const r of cat.relations.filter((rel) => rel.relowner === ORACLE_APP_OID)) {
+        violations.push(`oracle_app_owns_relation:${r.nspname}.${r.relname}`);
+      }
+      for (const f of cat.functions.filter((fn) => fn.proowner === ORACLE_APP_OID)) {
+        violations.push(`oracle_app_owns_function:${f.signature}`);
+      }
+
+      // 8, 9, 10. Function EXECUTE checks for oracle_app and PUBLIC (via aclexplode + acldefault('f', proowner))
+      const hasFnExecForApp = (fn: SimulatedFunctionRow): boolean => {
+        if (fn.proowner === ORACLE_APP_OID) return true;
+        const entries = explodeEffectiveAcl(fn.proacl, 'f', fn.proowner);
+        return entries.some(
+          (e) =>
+            (e.grantee === ORACLE_APP_OID || e.grantee === PUBLIC_OID) &&
+            e.privilege_type === 'EXECUTE',
+        );
+      };
+
+      for (const approvedSig of APPROVED_SIGNATURES) {
+        const fn = cat.functions.find((f) => f.signature === approvedSig);
+        if (!fn || !hasFnExecForApp(fn)) {
+          violations.push(`oracle_app_missing_approved_execute:${approvedSig}`);
+        }
+      }
+
+      for (const fn of cat.functions.filter((f) => f.nspname === 'oracle_ledger')) {
+        if (!APPROVED_SIGNATURES.has(fn.signature) && hasFnExecForApp(fn)) {
+          violations.push(`oracle_app_unapproved_function_execute:${fn.signature}`);
+        }
+        const entries = explodeEffectiveAcl(fn.proacl, 'f', fn.proowner);
+        if (entries.some((e) => e.grantee === PUBLIC_OID && e.privilege_type === 'EXECUTE')) {
+          violations.push(`public_function_acl:${fn.signature}`);
+        }
+      }
+
+      return violations;
+    }
+
+    const buildCompliantV19Catalog = (): SimulatedV19Catalog => ({
+      roles: [
+        {
+          oid: ORACLE_APP_OID,
+          rolname: 'oracle_app',
+          rolsuper: false,
+          rolinherit: false,
+          rolcreatedb: false,
+          rolcreaterole: false,
+          rolbypassrls: false,
+          rolreplication: false,
+          rolcanlogin: true,
+        },
+        {
+          oid: ORACLE_MIGRATOR_OID,
+          rolname: 'oracle_migrator',
+          rolsuper: false,
+          rolinherit: false,
+          rolcreatedb: false,
+          rolcreaterole: false,
+          rolbypassrls: false,
+          rolreplication: false,
+          rolcanlogin: false,
+        },
+      ],
+      schemas: [
+        {
+          nspname: 'oracle_ledger',
+          nspowner: ORACLE_MIGRATOR_OID,
+          nspacl: [
+            { grantee: ORACLE_MIGRATOR_OID, privilege_type: 'CREATE' },
+            { grantee: ORACLE_MIGRATOR_OID, privilege_type: 'USAGE' },
+            { grantee: ORACLE_APP_OID, privilege_type: 'USAGE' },
+          ],
+        },
+        {
+          nspname: 'public',
+          nspowner: OTHER_ROLE_OID,
+          nspacl: [{ grantee: OTHER_ROLE_OID, privilege_type: 'CREATE' }],
+        },
+      ],
+      relations: REQUIRED_TABLES.map((q) => {
+        const [nspname, relname] = q.split('.') as [string, string];
+        return {
+          nspname,
+          relname,
+          relkind: 'r',
+          relowner: ORACLE_MIGRATOR_OID,
+          relacl: [{ grantee: ORACLE_APP_OID, privilege_type: 'SELECT' }],
+        };
+      }),
+      functions: expectedFunctionSignatures.map((sig) => {
+        const proname = sig.slice('oracle_ledger.'.length, sig.indexOf('('));
+        const isApproved = APPROVED_SIGNATURES.has(sig);
+        return {
+          signature: sig,
+          nspname: 'oracle_ledger',
+          proname,
+          proowner: ORACLE_MIGRATOR_OID,
+          proacl: isApproved
+            ? [
+                { grantee: ORACLE_MIGRATOR_OID, privilege_type: 'EXECUTE' },
+                { grantee: ORACLE_APP_OID, privilege_type: 'EXECUTE' },
+              ]
+            : [{ grantee: ORACLE_MIGRATOR_OID, privilege_type: 'EXECUTE' }],
+        };
+      }),
+    });
+
+    // Case 1: Compliant catalog state returns zero violations
+    expect(runV19CatalogAudit(buildCompliantV19Catalog())).toEqual([]);
+
+    // Case 2: Default NULL function ACL (proacl === null) grants EXECUTE to PUBLIC via acldefault('f', owner)
+    // and is detected for both PUBLIC and oracle_app
+    const defaultFnAclCat = buildCompliantV19Catalog();
+    const triggerFn = defaultFnAclCat.functions.find(
+      (f) => f.proname === 'enforce_append_only_ledger_row',
+    )!;
+    triggerFn.proacl = null; // Unrevoked default PostgreSQL function ACL
+    expect(runV19CatalogAudit(defaultFnAclCat)).toEqual([
+      'oracle_app_unapproved_function_execute:oracle_ledger.enforce_append_only_ledger_row()',
+      'public_function_acl:oracle_ledger.enforce_append_only_ledger_row()',
+    ]);
+
+    // Case 3: PUBLIC table and schema ACL grants (grantee = 0) are detected
+    const publicAclCat = buildCompliantV19Catalog();
+    publicAclCat.relations[0]!.relacl!.push({
+      grantee: PUBLIC_OID,
+      privilege_type: 'SELECT',
+    });
+    publicAclCat.schemas[0]!.nspacl!.push({
+      grantee: PUBLIC_OID,
+      privilege_type: 'USAGE',
+    });
+    publicAclCat.schemas[1]!.nspacl!.push({
+      grantee: PUBLIC_OID,
+      privilege_type: 'CREATE',
+    });
+    expect(runV19CatalogAudit(publicAclCat)).toEqual([
+      'public_forbidden_table_acl:oracle_ledger.official_predictions:SELECT',
+      'public_schema_acl:oracle_ledger:USAGE',
+      'schema_privilege:public:CREATE',
+      'public_schema_acl:public:CREATE',
+    ]);
+
+    // Case 4: oracle_migrator with INHERIT (rolinherit = true) is rejected, whereas NOINHERIT passes
+    const inheritMigratorCat = buildCompliantV19Catalog();
+    inheritMigratorCat.roles.find((r) => r.rolname === 'oracle_migrator')!.rolinherit = true;
+    expect(runV19CatalogAudit(inheritMigratorCat)).toEqual(['role_attributes:oracle_migrator']);
+
+    // Case 5: Missing or wrong ownership of schema, each required table, and each required function by exact signature
+    const wrongOwnerCat = buildCompliantV19Catalog();
+    wrongOwnerCat.schemas[0]!.nspowner = OTHER_ROLE_OID;
+    wrongOwnerCat.relations[1]!.relowner = OTHER_ROLE_OID;
+    wrongOwnerCat.functions[2]!.proowner = OTHER_ROLE_OID;
+    expect(runV19CatalogAudit(wrongOwnerCat)).toEqual([
+      'required_schema_ownership:oracle_ledger',
+      'required_table_ownership:oracle_ledger.prediction_events',
+      'required_function_ownership:oracle_ledger.append_terminal_prediction_event(text,text,timestamp with time zone,timestamp with time zone,jsonb,character,character)',
+    ]);
+
+    // Also verify that if a function signature is altered (even if proname is unchanged), exact-signature ownership and execute checks catch it
+    const alteredSigCat = buildCompliantV19Catalog();
+    alteredSigCat.functions[0]!.signature = 'oracle_ledger.commit_official_publication(text)';
+    expect(runV19CatalogAudit(alteredSigCat)).toEqual([
+      'required_function_ownership:oracle_ledger.commit_official_publication(text,character,text,character,jsonb,character,timestamp with time zone,timestamp with time zone,jsonb,character)',
+      'oracle_app_missing_approved_execute:oracle_ledger.commit_official_publication(text,character,text,character,jsonb,character,timestamp with time zone,timestamp with time zone,jsonb,character)',
+      'oracle_app_unapproved_function_execute:oracle_ledger.commit_official_publication(text)',
+    ]);
+
+    // Case 6: An additional relation in oracle_ledger with a forbidden privilege is detected
+    const extraRelationCat = buildCompliantV19Catalog();
+    extraRelationCat.relations.push({
+      nspname: 'oracle_ledger',
+      relname: 'auxiliary_staging_table',
+      relkind: 'r',
+      relowner: ORACLE_MIGRATOR_OID,
+      relacl: [{ grantee: ORACLE_APP_OID, privilege_type: 'INSERT' }],
+    });
+    expect(runV19CatalogAudit(extraRelationCat)).toEqual([
+      'oracle_app_forbidden_table_priv:oracle_ledger.auxiliary_staging_table:INSERT',
     ]);
   });
 });
