@@ -7,7 +7,7 @@
 
 import { realpathSync } from 'node:fs';
 import type { Server } from 'node:http';
-import { resolve } from 'node:path';
+import { basename, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import pg from 'pg';
 import { createOracleApiServer } from './api.ts';
@@ -22,10 +22,12 @@ export {
   defaultNeonBranchResolver,
   executeSafeMigrationRun,
   formatSafeMigrationReport,
+  isMigrateMainModule,
   loadAuditSql,
   loadMigrationSql,
   loadRepoNeonContext,
   probeDatabaseIdentity,
+  provisionOracleAppPasswordSafely,
   redactMigrationSecrets,
   runLedgerMigrations,
   runLedgerSecurityAudit,
@@ -417,12 +419,15 @@ export function isMainModule(
   if (!argv1) {
     return false;
   }
+  const resolvedArgv = resolve(argv1);
+  if (/^migrate\.[cm]?[jt]s$/i.test(basename(resolvedArgv))) {
+    return false;
+  }
+  const metaPath = fileURLToPath(metaUrl);
   try {
-    return (
-      realpathSync(fileURLToPath(metaUrl)) === realpathSync(resolve(argv1))
-    );
+    return realpathSync(metaPath) === realpathSync(resolvedArgv);
   } catch {
-    return fileURLToPath(metaUrl) === resolve(argv1);
+    return metaPath === resolvedArgv;
   }
 }
 

@@ -11,7 +11,7 @@ import { spawn } from 'node:child_process';
 import { EventEmitter } from 'node:events';
 import { readFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import pg from 'pg';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import {
@@ -43,7 +43,10 @@ import {
   RuntimeRoleSecurityError,
   executeSafeMigrationRun,
   formatSafeMigrationReport,
+  isMainModule,
+  isMigrateMainModule,
   probeDatabaseIdentity,
+  provisionOracleAppPasswordSafely,
   redactSecrets,
   runLedgerMigrations,
   runLedgerSecurityAudit,
@@ -1983,5 +1986,227 @@ describe('Real PostgreSQL 16+ Integration Suite — Official Publication Protoco
     } finally {
       await isolatedCluster.stop();
     }
+  });
+
+  it('16. starts the compiled production bundle (build/server/index.js via npm start) with DATABASE_URL and without MIGRATION_DATABASE_URL, never invokes migration functions on HTTP startup, keeps db:migrate requiring MIGRATION_DATABASE_URL, and rejects non-oracle_app roles', async () => {
+    const serverDir = dirname(fileURLToPath(import.meta.url));
+    const repoRoot = resolve(serverDir, '../..');
+    const builtBundlePath = resolve(repoRoot, 'build/server/index.js');
+    const migrateScriptPath = resolve(serverDir, 'migrate.ts');
+    const indexScriptPath = resolve(serverDir, 'index.ts');
+
+    // 1. Unit verification of entrypoint guards across source and compiled SSR bundle paths
+    expect(
+      isMigrateMainModule(
+        pathToFileURL(builtBundlePath).href,
+        builtBundlePath,
+      ),
+    ).toBe(false);
+    expect(
+      isMigrateMainModule(
+        pathToFileURL(indexScriptPath).href,
+        indexScriptPath,
+      ),
+    ).toBe(false);
+    expect(
+      isMigrateMainModule(
+        pathToFileURL(migrateScriptPath).href,
+        migrateScriptPath,
+      ),
+    ).toBe(true);
+
+    expect(
+      isMainModule(pathToFileURL(builtBundlePath).href, builtBundlePath),
+    ).toBe(true);
+    expect(
+      isMainModule(pathToFileURL(indexScriptPath).href, indexScriptPath),
+    ).toBe(true);
+    expect(
+      isMainModule(pathToFileURL(migrateScriptPath).href, migrateScriptPath),
+    ).toBe(false);
+
+    // 2. Compile the real SSR server bundle (npm run build:server -> build/server/index.js)
+    const buildExitCode = await new Promise<number | null>((resolveExit) => {
+      const builder = spawn('npm', ['run', 'build:server'], {
+        cwd: repoRoot,
+        stdio: 'ignore',
+      });
+      builder.once('exit', (code) => resolveExit(code));
+    });
+    expect(buildExitCode).toBe(0);
+
+    // 3. Confirm that starting the HTTP server in-process never touches MIGRATION_DATABASE_URL
+    //    and never executes any migration SQL or pg_temp.oracle_provision_app_role
+    const queriesDuringHttpStart: string[] = [];
+    const origPoolQuery = pg.Pool.prototype.query;
+    pg.Pool.prototype.query = function spyPoolQuery(
+      this: pg.Pool,
+      ...args: unknown[]
+    ) {
+      const first = args[0];
+      const text =
+        typeof first === 'string'
+          ? first
+          : first &&
+              typeof first === 'object' &&
+              'text' in first &&
+              typeof (first as { text?: unknown }).text === 'string'
+            ? (first as { text: string }).text
+            : '';
+      queriesDuringHttpStart.push(text);
+      return (origPoolQuery as (...a: unknown[]) => unknown).apply(this, args);
+    } as typeof pg.Pool.prototype.query;
+
+    const savedMigrationEnv = process.env.MIGRATION_DATABASE_URL;
+    delete process.env.MIGRATION_DATABASE_URL;
+    try {
+      const inProcServer = await startOracleServer({
+        databaseUrl: cluster.appConnectionString,
+        port: 0,
+        host: '127.0.0.1',
+      });
+      try {
+        const res = await fetch(
+          `http://127.0.0.1:${inProcServer.port}/v1/predictions`,
+        );
+        expect(res.status).toBe(200);
+      } finally {
+        await inProcServer.close();
+      }
+
+      for (const sql of queriesDuringHttpStart) {
+        expect(sql).not.toContain('oracle_provision_app_role');
+        expect(sql).not.toContain('CREATE SCHEMA');
+        expect(sql).not.toContain('CREATE ROLE');
+        expect(sql).not.toContain('ALTER ROLE');
+      }
+      expect(typeof provisionOracleAppPasswordSafely).toBe('function');
+      expect(typeof executeSafeMigrationRun).toBe('function');
+    } finally {
+      pg.Pool.prototype.query = origPoolQuery;
+      if (savedMigrationEnv !== undefined) {
+        process.env.MIGRATION_DATABASE_URL = savedMigrationEnv;
+      }
+    }
+
+    // 4. Spawn the compiled production bundle (node build/server/index.js — exact `npm start` command)
+    //    with DATABASE_URL set and WITHOUT MIGRATION_DATABASE_URL
+    const childEnv: NodeJS.ProcessEnv = {
+      ...process.env,
+      DATABASE_URL: cluster.appConnectionString,
+      HOST: '127.0.0.1',
+      PORT: '0',
+    };
+    delete childEnv.MIGRATION_DATABASE_URL;
+    delete childEnv.ORACLE_APP_PASSWORD;
+
+    const prodStdout: string[] = [];
+    const prodStderr: string[] = [];
+    const prodChild = spawn(process.execPath, [builtBundlePath], {
+      cwd: repoRoot,
+      env: childEnv,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+
+    const prodListeningOut = await new Promise<string>((resolveOut, rejectOut) => {
+      const timer = setTimeout(() => {
+        prodChild.kill('SIGKILL');
+        rejectOut(
+          new Error(
+            `Timed out waiting for compiled build/server/index.js to listen. stdout=${prodStdout.join('')} stderr=${prodStderr.join('')}`,
+          ),
+        );
+      }, 10_000);
+
+      prodChild.stdout.on('data', (chunk: Buffer) => {
+        prodStdout.push(chunk.toString('utf8'));
+        const combined = prodStdout.join('');
+        if (combined.includes('Read API server listening on http://')) {
+          clearTimeout(timer);
+          resolveOut(combined);
+        }
+      });
+      prodChild.stderr.on('data', (chunk: Buffer) => {
+        prodStderr.push(chunk.toString('utf8'));
+      });
+      prodChild.once('exit', (code) => {
+        clearTimeout(timer);
+        rejectOut(
+          new Error(
+            `Compiled build/server/index.js exited prematurely with code ${String(code)}. stderr=${prodStderr.join('')}`,
+          ),
+        );
+      });
+    });
+
+    const prodPortMatch = prodListeningOut.match(/http:\/\/127\.0\.0\.1:(\d+)/);
+    expect(prodPortMatch).not.toBeNull();
+    const prodPort = Number(prodPortMatch![1]);
+
+    const prodHttpRes = await fetch(
+      `http://127.0.0.1:${prodPort}/v1/predictions`,
+    );
+    expect(prodHttpRes.status).toBe(200);
+
+    const prodExitCode = await new Promise<number | null>((resolveExit) => {
+      prodChild.once('exit', (code) => resolveExit(code));
+      prodChild.kill('SIGTERM');
+    });
+    expect(prodExitCode).toBe(0);
+    expect(prodStderr.join('')).toBe('');
+    expect(prodStdout.join('')).not.toContain('[the-oracle:migrate]');
+    expect(prodStderr.join('')).not.toContain('[the-oracle:migrate]');
+
+    // 5. Confirm compiled build/server/index.js STILL rejects non-oracle_app roles at startup
+    const badRoleEnv: NodeJS.ProcessEnv = {
+      ...process.env,
+      DATABASE_URL: cluster.adminConnectionString,
+      HOST: '127.0.0.1',
+      PORT: '0',
+    };
+    delete badRoleEnv.MIGRATION_DATABASE_URL;
+
+    const badRoleStderr: string[] = [];
+    const badRoleChild = spawn(process.execPath, [builtBundlePath], {
+      cwd: repoRoot,
+      env: badRoleEnv,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    badRoleChild.stderr.on('data', (chunk: Buffer) => {
+      badRoleStderr.push(chunk.toString('utf8'));
+    });
+    const badRoleExit = await new Promise<number | null>((resolveExit) => {
+      badRoleChild.once('exit', (code) => resolveExit(code));
+    });
+    expect(badRoleExit).toBe(1);
+    expect(badRoleStderr.join('')).toContain(
+      "Refusing to start Oracle server: DATABASE_URL role violates least-privilege runtime requirements (connected as current_user='postgres' / session_user='postgres' instead of restricted runtime role 'oracle_app'",
+    );
+    expect(badRoleStderr.join('')).not.toContain('[the-oracle:migrate]');
+
+    // 6. Confirm `node src/server/migrate.ts` (npm run db:migrate) STILL requires MIGRATION_DATABASE_URL
+    //    even when DATABASE_URL is present
+    const migrateEnvNoUrl: NodeJS.ProcessEnv = {
+      ...process.env,
+      DATABASE_URL: cluster.appConnectionString,
+    };
+    delete migrateEnvNoUrl.MIGRATION_DATABASE_URL;
+
+    const migrateStderr: string[] = [];
+    const migrateChild = spawn(process.execPath, [migrateScriptPath], {
+      cwd: repoRoot,
+      env: migrateEnvNoUrl,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    migrateChild.stderr.on('data', (chunk: Buffer) => {
+      migrateStderr.push(chunk.toString('utf8'));
+    });
+    const migrateExit = await new Promise<number | null>((resolveExit) => {
+      migrateChild.once('exit', (code) => resolveExit(code));
+    });
+    expect(migrateExit).toBe(1);
+    expect(migrateStderr.join('')).toContain(
+      '[the-oracle:migrate] Refusing to execute database migration: MIGRATION_DATABASE_URL environment variable is required',
+    );
   });
 });

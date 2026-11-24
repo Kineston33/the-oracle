@@ -16,7 +16,7 @@
 
 import { execFile } from 'node:child_process';
 import { existsSync, readFileSync, realpathSync } from 'node:fs';
-import { dirname, resolve } from 'node:path';
+import { basename, dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
 import pg, { type ClientBase, type Pool } from 'pg';
@@ -199,7 +199,7 @@ interface EffectiveLoggingPostureRow {
  *   5. Passes the password exclusively as a `$1` bind parameter to a `SELECT` call
  *      (`SELECT pg_temp.oracle_provision_app_role($1::text)`), never in SQL text.
  */
-async function provisionOracleAppPasswordSafely(
+export async function provisionOracleAppPasswordSafely(
   client: ClientBase,
   oracleAppPassword: string,
 ): Promise<void> {
@@ -1516,19 +1516,25 @@ export async function runMigrationCli(
   }
 }
 
-function isMigrateMainModule(
+export function isMigrateMainModule(
   metaUrl: string,
   argv1: string | undefined = process.argv[1],
 ): boolean {
   if (!argv1) {
     return false;
   }
+  const resolvedArgv = resolve(argv1);
+  if (!/^migrate\.[cm]?[jt]s$/i.test(basename(resolvedArgv))) {
+    return false;
+  }
+  const metaPath = fileURLToPath(metaUrl);
+  if (!/^migrate\.[cm]?[jt]s$/i.test(basename(metaPath))) {
+    return false;
+  }
   try {
-    return (
-      realpathSync(fileURLToPath(metaUrl)) === realpathSync(resolve(argv1))
-    );
+    return realpathSync(metaPath) === realpathSync(resolvedArgv);
   } catch {
-    return fileURLToPath(metaUrl) === resolve(argv1);
+    return metaPath === resolvedArgv;
   }
 }
 
