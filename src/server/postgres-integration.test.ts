@@ -7,6 +7,10 @@
  * fakes are used.
  */
 
+import { spawn } from 'node:child_process';
+import { EventEmitter } from 'node:events';
+import { dirname, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import pg from 'pg';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import {
@@ -35,8 +39,10 @@ import {
 import {
   PostgresPublicationRegistry,
   RuntimeRoleSecurityError,
+  redactSecrets,
   runLedgerMigrations,
   runLedgerSecurityAudit,
+  runOracleServerCli,
   startOracleServer,
   verifyRuntimeDatabaseRole,
 } from './index.ts';
@@ -1110,7 +1116,7 @@ describe('Real PostgreSQL 16+ Integration Suite — Official Publication Protoco
     }
   });
 
-  it('12. enforces startup role security validation (rejecting superuser, administrative, or table-DML-privileged DATABASE_URL connections without leaking credentials)', async () => {
+  it('12. enforces startup role security validation (including CURRENT_USER = oracle_app with SESSION_USER <> oracle_app) and graceful SIGTERM/SIGINT shutdown in the CLI entrypoint', async () => {
     // 1. Attempting to start the server with the superuser/admin DATABASE_URL is rejected with RuntimeRoleSecurityError
     let adminErr: unknown;
     try {
@@ -1131,7 +1137,52 @@ describe('Real PostgreSQL 16+ Integration Suite — Official Publication Protoco
     // Ensure connection string is never leaked in the error message
     expect(secErr.message).not.toContain(cluster.adminConnectionString);
 
-    // 2. Granting CREATEDB to oracle_app causes startup validation to reject the connection
+    // 2. Specific check: CURRENT_USER = 'oracle_app' while SESSION_USER <> 'oracle_app' (via SET ROLE oracle_app on a superuser session)
+    // Even though CURRENT_USER is 'oracle_app' (which has no superuser/DML attributes), SESSION_USER is still 'postgres'
+    // (allowing RESET ROLE privilege escalation), so verifyRuntimeDatabaseRole and startOracleServer MUST reject it.
+    const roleSwitchClient = await adminPool.connect();
+    try {
+      await roleSwitchClient.query('SET ROLE oracle_app');
+      const whoRes = await roleSwitchClient.query<{
+        current_user: string;
+        session_user: string;
+      }>(
+        'SELECT CURRENT_USER::text AS current_user, SESSION_USER::text AS session_user',
+      );
+      expect(whoRes.rows[0]).toEqual({
+        current_user: 'oracle_app',
+        session_user: 'postgres',
+      });
+
+      let mismatchedSessionErr: unknown;
+      try {
+        await verifyRuntimeDatabaseRole(roleSwitchClient);
+      } catch (err) {
+        mismatchedSessionErr = err;
+      }
+      expect(mismatchedSessionErr).toBeInstanceOf(RuntimeRoleSecurityError);
+      const mismatchedSecErr = mismatchedSessionErr as RuntimeRoleSecurityError;
+      expect(mismatchedSecErr.violations).toEqual([
+        "connected as current_user='oracle_app' / session_user='postgres' instead of restricted runtime role 'oracle_app'",
+      ]);
+    } finally {
+      await roleSwitchClient.query('RESET ROLE').catch(() => {});
+      roleSwitchClient.release();
+    }
+
+    // Verify startOracleServer also rejects a DATABASE_URL that sets role=oracle_app on a superuser session
+    const disguisedAdminUrl = `${cluster.adminConnectionString}?options=-c%20role%3Doracle_app`;
+    await expect(
+      startOracleServer({
+        databaseUrl: disguisedAdminUrl,
+        port: 0,
+        host: '127.0.0.1',
+      }),
+    ).rejects.toThrow(
+      /connected as current_user='oracle_app' \/ session_user='postgres' instead of restricted runtime role 'oracle_app'/,
+    );
+
+    // 3. Granting CREATEDB to oracle_app causes startup validation to reject the connection
     await adminPool.query('ALTER ROLE oracle_app CREATEDB');
     try {
       await expect(
@@ -1145,7 +1196,7 @@ describe('Real PostgreSQL 16+ Integration Suite — Official Publication Protoco
       await adminPool.query('ALTER ROLE oracle_app NOCREATEDB');
     }
 
-    // 3. Granting direct INSERT on official_predictions to oracle_app causes startup validation to reject the connection
+    // 4. Granting direct INSERT on official_predictions to oracle_app causes startup validation to reject the connection
     await adminPool.query(
       'GRANT INSERT ON TABLE oracle_ledger.official_predictions TO oracle_app',
     );
@@ -1165,8 +1216,140 @@ describe('Real PostgreSQL 16+ Integration Suite — Official Publication Protoco
       );
     }
 
-    // 4. Once least-privilege state is restored, verifyRuntimeDatabaseRole passes cleanly
+    // 5. Once least-privilege state is restored, verifyRuntimeDatabaseRole passes cleanly
     await expect(verifyRuntimeDatabaseRole(appPool)).resolves.toBeUndefined();
+
+    // 6. CLI runner rejects invalid roles with exit(1) and redacts any credentials/URIs from logs
+    const failInfos: string[] = [];
+    const failErrors: string[] = [];
+    const failExitCodes: number[] = [];
+    const failedCli = await runOracleServerCli({
+      databaseUrl: cluster.adminConnectionString,
+      port: 0,
+      host: '127.0.0.1',
+      logger: {
+        info: (m) => failInfos.push(m),
+        error: (m) => failErrors.push(m),
+      },
+      exit: (code) => failExitCodes.push(code),
+    });
+    expect(failedCli).toBeNull();
+    expect(failExitCodes).toEqual([1]);
+    expect(failErrors).toHaveLength(1);
+    expect(failErrors[0]).not.toContain(cluster.adminConnectionString);
+    expect(
+      redactSecrets(
+        'Error connecting to postgresql://oracle_app:supersecret@db.example.com:5432/oracle?sslmode=require password=supersecret',
+      ),
+    ).toBe('Error connecting to postgresql://[REDACTED] password=[REDACTED]');
+
+    // 7. CLI runner starts with oracle_app, serves HTTP requests, and closes server + pool cleanly on SIGTERM and SIGINT
+    for (const signal of ['SIGTERM', 'SIGINT'] as const) {
+      const infoLogs: string[] = [];
+      const errorLogs: string[] = [];
+      const exitCodes: number[] = [];
+      const fakeProcess = new EventEmitter();
+
+      const cli = await runOracleServerCli({
+        databaseUrl: cluster.appConnectionString,
+        port: 0,
+        host: '127.0.0.1',
+        logger: {
+          info: (m) => infoLogs.push(m),
+          error: (m) => errorLogs.push(m),
+        },
+        exit: (code) => exitCodes.push(code),
+        signalTarget: fakeProcess as unknown as Pick<
+          NodeJS.Process,
+          'once' | 'removeListener'
+        >,
+      });
+
+      expect(cli).not.toBeNull();
+      expect(errorLogs).toEqual([]);
+      const boundPort = cli!.running.port;
+      expect(boundPort).toBeGreaterThan(0);
+
+      const res = await fetch(`http://127.0.0.1:${boundPort}/v1/predictions`);
+      expect(res.status).toBe(200);
+
+      // Emit signal and wait for shutdown to finish
+      fakeProcess.emit(signal);
+      await cli!.shutdown(signal);
+
+      expect(exitCodes).toEqual([0]);
+      expect(cli!.running.server.listening).toBe(false);
+      expect(cli!.running.pool.ended).toBe(true);
+      expect(infoLogs.join('\n')).not.toContain(cluster.appConnectionString);
+    }
+
+    // 8. Real OS child-process execution of src/server/index.ts verifies CLI entrypoint startup and SIGTERM shutdown
+    const entrypointPath = resolve(
+      dirname(fileURLToPath(import.meta.url)),
+      'index.ts',
+    );
+    const childStdout: string[] = [];
+    const childStderr: string[] = [];
+    const child = spawn(process.execPath, [entrypointPath], {
+      env: {
+        ...process.env,
+        DATABASE_URL: cluster.appConnectionString,
+        HOST: '127.0.0.1',
+        PORT: '0',
+      },
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+
+    const listeningLine = await new Promise<string>((resolveLine, rejectLine) => {
+      const timeout = setTimeout(() => {
+        child.kill('SIGKILL');
+        rejectLine(
+          new Error(
+            `Timed out waiting for server CLI to listen. stderr: ${childStderr.join('')}`,
+          ),
+        );
+      }, 10_000);
+
+      child.stdout.on('data', (chunk: Buffer) => {
+        const text = chunk.toString('utf8');
+        childStdout.push(text);
+        const combined = childStdout.join('');
+        if (combined.includes('Read API server listening on http://')) {
+          clearTimeout(timeout);
+          resolveLine(combined);
+        }
+      });
+      child.stderr.on('data', (chunk: Buffer) => {
+        childStderr.push(chunk.toString('utf8'));
+      });
+      child.once('exit', (code) => {
+        clearTimeout(timeout);
+        rejectLine(
+          new Error(
+            `Server CLI exited prematurely with code ${String(code)}. stderr: ${childStderr.join('')}`,
+          ),
+        );
+      });
+    });
+
+    const portMatch = listeningLine.match(/http:\/\/127\.0\.0\.1:(\d+)/);
+    expect(portMatch).not.toBeNull();
+    const childPort = Number(portMatch![1]);
+    expect(childPort).toBeGreaterThan(0);
+
+    const childRes = await fetch(`http://127.0.0.1:${childPort}/v1/predictions`);
+    expect(childRes.status).toBe(200);
+
+    const exitCode = await new Promise<number | null>((resolveExit) => {
+      child.once('exit', (code) => resolveExit(code));
+      child.kill('SIGTERM');
+    });
+    expect(exitCode).toBe(0);
+    expect(childStdout.join('')).toContain(
+      'Server and database pool closed cleanly.',
+    );
+    expect(childStdout.join('')).not.toContain(cluster.appConnectionString);
+    expect(childStderr.join('')).toBe('');
   });
 
   it('13. persists official predictions, append-only event chains, and idempotency keys across a full PostgreSQL server stop and restart', async () => {

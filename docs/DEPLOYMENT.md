@@ -99,10 +99,11 @@ Serving official predictions (`demo: false`) and the ledger read API
 `GET /v1/predictions/:id/events`) requires:
 
 1. **A Node.js runtime environment** (Node.js 22+ recommended) running the HTTP
-   service in `src/server/index.ts` (`startOracleServer()`).
+   service in `src/server/index.ts` (`startOracleServer()` /
+   `runOracleServerCli()`).
 2. **A PostgreSQL 16+ database** (`server_version_num >= 160000`) where:
    - Migration `src/server/migrations/0001_oracle_ledger_v1_10.sql` has been
-     applied via `runLedgerMigrations()` using a direct (non-pooled)
+     applied out-of-band via `runLedgerMigrations()` using a direct (non-pooled)
      administrative/migration connection.
    - The §2.5 live catalog security audit (`src/server/migrations/audit_v1_10.sql`
      via `runLedgerSecurityAudit()`) has verified `oracle_migrator` ownership
@@ -110,6 +111,54 @@ Serving official predictions (`demo: false`) and the ledger read API
      zero violations).
    - The Node.js server connects at runtime using `DATABASE_URL` configured for
      the least-privilege `oracle_app` role.
+
+### Installation, compilation, and startup commands
+
+```bash
+# 1. Install dependencies from the lockfile
+npm ci
+
+# 2. Validate archive, typecheck, build the frontend SPA (dist/) AND compile the
+#    standalone Node.js server bundle (build/server/index.js)
+npm run build
+
+#    (Or compile only the backend bundle into build/server/index.js)
+npm run build:server
+
+# 3. Start the production HTTP read API server (executes `node build/server/index.js`)
+#    Requires DATABASE_URL authenticated as the restricted `oracle_app` role.
+DATABASE_URL="postgresql://oracle_app:<password>@<host>/<dbname>?sslmode=require" \
+  HOST="0.0.0.0" \
+  PORT="3001" \
+  npm start
+```
+
+On Node.js 22+, `node src/server/index.ts` can also be invoked directly.
+
+### Runtime startup & shutdown guarantees (`src/server/index.ts`)
+
+When started via `npm start` (`node build/server/index.js`) or
+`startOracleServer()`:
+
+- **Uses `DATABASE_URL` (plus optional `HOST` and `PORT`)**: refuses to start if
+  `DATABASE_URL` is missing or empty.
+- **Executes `verifyRuntimeDatabaseRole()` before listening on any TCP port**:
+  queries `pg_catalog` and rejects the connection with
+  `RuntimeRoleSecurityError` if `CURRENT_USER <> 'oracle_app'`,
+  `SESSION_USER <> 'oracle_app'` (for example, a superuser session disguised via
+  `SET ROLE oracle_app`), or if the role holds any superuser, `INHERIT`,
+  `CREATEDB`, `CREATEROLE`, `BYPASSRLS`, `REPLICATION`, role-membership, object
+  ownership, schema `CREATE`, or direct table DML/DDL privilege.
+- **Never executes database migrations automatically at runtime**: DDL
+  migrations (`runLedgerMigrations()`) are strictly separated from the runtime
+  process; supplying administrative credentials in `DATABASE_URL` causes
+  immediate startup rejection.
+- **Graceful shutdown on `SIGTERM` and `SIGINT`**: closes the HTTP server to new
+  requests, drains in-flight connections, closes the PostgreSQL connection pool
+  (`pool.end()`), and exits with code `0`.
+- **No secret leakage in logs**: startup and shutdown logs redact any
+  `postgres://` / `postgresql://` URIs and `password=` tokens via
+  `redactSecrets()`.
 
 ---
 

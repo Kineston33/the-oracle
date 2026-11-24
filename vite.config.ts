@@ -3,12 +3,15 @@ import react from '@vitejs/plugin-react';
 import { fileURLToPath, URL } from 'node:url';
 
 // https://vite.dev/config/
-export default defineConfig({
+export default defineConfig(({ isSsrBuild }) => ({
   plugins: [react()],
   resolve: {
     alias: {
       '@': fileURLToPath(new URL('./src', import.meta.url)),
     },
+  },
+  build: {
+    copyPublicDir: !isSsrBuild,
   },
   server: {
     host: '0.0.0.0',
@@ -23,4 +26,4 @@ export default defineConfig({
     port: 4173,
     allowedHosts: true,
   },
-});
+}));

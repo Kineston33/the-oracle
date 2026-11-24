@@ -8,10 +8,10 @@
  * can never display a digest that does not match the record it describes.
  */
 
-import raw from './records.json';
-import type { ArchiveSummary, PredictionCategory, PredictionRecord } from './types';
-import type { PredictionStatus as PredictionLifecycleStatus } from './types';
-import { deriveLifecycle } from './lifecycle';
+import raw from './records.json' with { type: 'json' };
+import type { ArchiveSummary, PredictionCategory, PredictionRecord } from './types.ts';
+import type { PredictionStatus as PredictionLifecycleStatus } from './types.ts';
+import { deriveLifecycle } from './lifecycle.ts';
 
 export const predictionRecords = raw as PredictionRecord[];
 
@@ -149,4 +149,4 @@ export {
   canonicalKey,
   findCanonicalCollisions,
   type QuestionCollision,
-} from './validate';
+} from './validate.ts';

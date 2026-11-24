@@ -11,7 +11,9 @@
   },
   "scripts": {
     "dev": "vite",
-    "build": "npm run validate && tsc -b && vite build",
+    "build": "npm run validate && tsc -b && vite build && npm run build:server",
+    "build:server": "vite build --ssr src/server/index.ts --outDir build/server",
+    "start": "node build/server/index.js",
     "preview": "vite preview",
     "typecheck": "tsc -b && tsc -p tsconfig.audit.json --noEmit",
     "test": "vitest run",

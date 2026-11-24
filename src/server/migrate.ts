@@ -5,18 +5,25 @@
  * and executes them against a live PostgreSQL 16+ database.
  */
 
-import { readFileSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import type { ClientBase, Pool } from 'pg';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
-export const MIGRATION_0001_PATH = resolve(
-  __dirname,
+function resolveSqlAssetPath(relativePath: string): string {
+  const directCandidate = resolve(__dirname, relativePath);
+  if (existsSync(directCandidate)) {
+    return directCandidate;
+  }
+  return resolve(__dirname, '../../src/server', relativePath);
+}
+
+export const MIGRATION_0001_PATH = resolveSqlAssetPath(
   'migrations/0001_oracle_ledger_v1_10.sql',
 );
-export const AUDIT_V1_10_PATH = resolve(__dirname, 'migrations/audit_v1_10.sql');
+export const AUDIT_V1_10_PATH = resolveSqlAssetPath('migrations/audit_v1_10.sql');
 
 export function loadMigrationSql(): string {
   return readFileSync(MIGRATION_0001_PATH, 'utf8');

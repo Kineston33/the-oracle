@@ -5,7 +5,10 @@
  * source files or exposed to browser bundles.
  */
 
+import { realpathSync } from 'node:fs';
 import type { Server } from 'node:http';
+import { resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import pg from 'pg';
 import { createOracleApiServer } from './api.ts';
 import { PostgresPublicationRegistry } from './postgres-registry.ts';
@@ -229,8 +232,17 @@ export async function startOracleServer(
 
     const registry = new PostgresPublicationRegistry({ pool });
     const server = createOracleApiServer({ registry });
-    const host = options?.host ?? '0.0.0.0';
+    const host = options?.host ?? process.env.HOST ?? '0.0.0.0';
     const requestedPort = options?.port ?? Number(process.env.PORT ?? 3001);
+    if (
+      !Number.isInteger(requestedPort) ||
+      requestedPort < 0 ||
+      requestedPort > 65535
+    ) {
+      throw new Error(
+        `Invalid server port: expected an integer between 0 and 65535, got ${String(options?.port ?? process.env.PORT)}`,
+      );
+    }
 
     const boundPort = await new Promise<number>((resolvePort, rejectPort) => {
       server.once('error', rejectPort);
@@ -244,20 +256,155 @@ export async function startOracleServer(
       });
     });
 
+    let closePromise: Promise<void> | null = null;
+    const close = (): Promise<void> => {
+      if (!closePromise) {
+        closePromise = (async () => {
+          await new Promise<void>((res, rej) => {
+            server.close((err) => (err ? rej(err) : res()));
+          });
+          await pool.end();
+        })();
+      }
+      return closePromise;
+    };
+
     return {
       server,
       pool,
       registry,
       port: boundPort,
-      close: async () => {
-        await new Promise<void>((res, rej) => {
-          server.close((err) => (err ? rej(err) : res()));
-        });
-        await pool.end();
-      },
+      close,
     };
   } catch (err) {
     await pool.end().catch(() => {});
     throw err;
   }
+}
+
+/**
+ * Redact connection strings and password tokens from any log or error text so
+ * credentials can never leak to stdout/stderr.
+ */
+export function redactSecrets(input: string): string {
+  return input
+    .replace(/postgres(?:ql)?:\/\/[^\s'")]+/gi, 'postgresql://[REDACTED]')
+    .replace(/(password\s*=\s*)[^\s'")]*/gi, '$1[REDACTED]');
+}
+
+export interface RunOracleServerCliOptions extends StartOracleServerOptions {
+  logger?: {
+    info: (message: string) => void;
+    error: (message: string) => void;
+  };
+  exit?: (code: number) => void;
+  signalTarget?: Pick<NodeJS.Process, 'once' | 'removeListener'>;
+}
+
+export interface RunningOracleServerCli {
+  running: RunningOracleServer;
+  shutdown: (signal?: NodeJS.Signals) => Promise<void>;
+}
+
+/**
+ * Production CLI runner for the Node.js read API server.
+ *
+ * - Connects using `DATABASE_URL`
+ * - Enforces `verifyRuntimeDatabaseRole()` before listening (via `startOracleServer()`)
+ * - Never executes administrative migrations at runtime
+ * - Registers graceful `SIGTERM` and `SIGINT` handlers that close the HTTP server and pool
+ * - Redacts any connection string or credential from startup/shutdown logs
+ */
+export async function runOracleServerCli(
+  options?: RunOracleServerCliOptions,
+): Promise<RunningOracleServerCli | null> {
+  const logger = options?.logger ?? {
+    info: (msg: string) => console.log(msg),
+    error: (msg: string) => console.error(msg),
+  };
+  const exit = options?.exit ?? ((code: number) => process.exit(code));
+  const signalTarget = options?.signalTarget ?? process;
+  const host = options?.host ?? process.env.HOST ?? '0.0.0.0';
+
+  try {
+    const running = await startOracleServer(options);
+    logger.info(
+      `[the-oracle] Read API server listening on http://${host}:${running.port} (runtime role: oracle_app)`,
+    );
+
+    let shuttingDown: Promise<void> | null = null;
+
+    const onSigTerm = () => {
+      void shutdown('SIGTERM');
+    };
+    const onSigInt = () => {
+      void shutdown('SIGINT');
+    };
+
+    const removeSignalHandlers = () => {
+      signalTarget.removeListener('SIGTERM', onSigTerm);
+      signalTarget.removeListener('SIGINT', onSigInt);
+    };
+
+    const shutdown = (signal?: NodeJS.Signals): Promise<void> => {
+      if (!shuttingDown) {
+        shuttingDown = (async () => {
+          removeSignalHandlers();
+          if (signal) {
+            logger.info(
+              `[the-oracle] Received ${signal}, closing HTTP server and PostgreSQL pool...`,
+            );
+          }
+          try {
+            await running.close();
+            logger.info('[the-oracle] Server and database pool closed cleanly.');
+            exit(0);
+          } catch (closeErr) {
+            const rawMsg =
+              closeErr instanceof Error ? closeErr.message : String(closeErr);
+            logger.error(
+              `[the-oracle] Error while closing server: ${redactSecrets(rawMsg)}`,
+            );
+            exit(1);
+          }
+        })();
+      }
+      return shuttingDown;
+    };
+
+    signalTarget.once('SIGTERM', onSigTerm);
+    signalTarget.once('SIGINT', onSigInt);
+
+    return {
+      running,
+      shutdown,
+    };
+  } catch (err) {
+    const rawMsg = err instanceof Error ? err.message : String(err);
+    logger.error(
+      `[the-oracle] Failed to start server: ${redactSecrets(rawMsg)}`,
+    );
+    exit(1);
+    return null;
+  }
+}
+
+export function isMainModule(
+  metaUrl: string,
+  argv1: string | undefined = process.argv[1],
+): boolean {
+  if (!argv1) {
+    return false;
+  }
+  try {
+    return (
+      realpathSync(fileURLToPath(metaUrl)) === realpathSync(resolve(argv1))
+    );
+  } catch {
+    return fileURLToPath(metaUrl) === resolve(argv1);
+  }
+}
+
+if (isMainModule(import.meta.url)) {
+  void runOracleServerCli();
 }
