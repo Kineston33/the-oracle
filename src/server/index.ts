@@ -19,6 +19,7 @@ export {
   MIGRATION_0001_PATH,
   MigrationTargetSecurityError,
   PRODUCTION_CONFIRMATION_PHRASE,
+  PRODUCTION_MIGRATION_ROLE,
   ROLE_MEMBERSHIP_AUDIT_SQL,
   defaultNeonBranchResolver,
   executeSafeMigrationRun,

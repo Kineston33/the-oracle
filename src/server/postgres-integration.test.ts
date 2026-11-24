@@ -40,8 +40,10 @@ import {
 import {
   MigrationTargetSecurityError,
   PRODUCTION_CONFIRMATION_PHRASE,
+  PRODUCTION_MIGRATION_ROLE,
   PostgresPublicationRegistry,
   RuntimeRoleSecurityError,
+  defaultNeonBranchResolver,
   executeSafeMigrationRun,
   formatSafeMigrationReport,
   isMainModule,
@@ -2451,7 +2453,7 @@ describe('Real PostgreSQL 16+ Integration Suite — Official Publication Protoco
         branchResolver: async () => null, // Simulate API failure even though prodProbe.neonBranchId === 'br-prod-001'
       }),
     ).rejects.toThrow(
-      /authoritative Neon API verification failed or was unavailable .* \(GUC-only fallback is forbidden for production\)/,
+      /authoritative Neon API verification failed or was unavailable .* \(GUC-only and CLI fallbacks are forbidden for production\)/,
     );
 
     await expect(
@@ -2472,7 +2474,7 @@ describe('Real PostgreSQL 16+ Integration Suite — Official Publication Protoco
           source: 'neon-cli',
         }),
       }),
-    ).rejects.toThrow(/GUC-only fallback is forbidden for production/);
+    ).rejects.toThrow(/GUC-only and CLI fallbacks are forbidden for production/);
 
     // 7. Production rejected if endpoint does not map to expected branch or branch is not default/primary
     await expect(
@@ -2516,20 +2518,77 @@ describe('Real PostgreSQL 16+ Integration Suite — Official Publication Protoco
       }),
     ).rejects.toThrow(/is neither the default nor primary production branch/);
 
-    // 8. Production rejected if pooled connection is used or connected role is oracle_app / oracle_migrator
+    // 8. Production rejected if pooled connection is used or connected role is not exactly neondb_owner
+    expect(PRODUCTION_MIGRATION_ROLE).toBe('neondb_owner');
     expect(() =>
       validateMigrationConnectionUrl(
         'postgresql://neondb_owner:secret@ep-prod-endpoint-111-pooler.us-east-2.aws.neon.tech/neondb?sslmode=require',
       ),
     ).toThrow(/uses a pooled endpoint \(-pooler\)/);
 
+    // 8a. oracle_app and oracle_migrator remain rejected
+    for (const forbiddenRole of ['oracle_app', 'oracle_migrator'] as const) {
+      await expect(
+        verifyMigrationTargetIdentity({
+          connectionInfo: directProdConnInfo,
+          probe: {
+            ...prodProbe,
+            currentUser: forbiddenRole,
+            sessionUser: forbiddenRole,
+          },
+          expectedProjectId: 'wispy-cell-45340306',
+          expectedBranchName: 'production',
+          expectedBranchId: 'br-prod-001',
+          productionBranchId: 'br-prod-001',
+          neonApiKey: 'napi_test_key',
+          productionAuthorization: {
+            allowProductionMigration: true,
+            confirmProductionPhrase: 'APPLY_PRODUCTION_MIGRATION',
+          },
+          branchResolver: async () => validProdResolved,
+        }),
+      ).rejects.toThrow(/never as oracle_app or oracle_migrator/);
+    }
+
+    // 8b. Any other administrative role (e.g. postgres, custom_admin, neon_superuser, or SET ROLE mismatch) is rejected
+    for (const nonOwnerProbe of [
+      { currentUser: 'postgres', sessionUser: 'postgres' },
+      { currentUser: 'custom_admin', sessionUser: 'custom_admin' },
+      { currentUser: 'neon_superuser', sessionUser: 'neon_superuser' },
+      { currentUser: 'neondb_owner', sessionUser: 'postgres' },
+      { currentUser: 'postgres', sessionUser: 'neondb_owner' },
+    ]) {
+      await expect(
+        verifyMigrationTargetIdentity({
+          connectionInfo: directProdConnInfo,
+          probe: {
+            ...prodProbe,
+            ...nonOwnerProbe,
+          },
+          expectedProjectId: 'wispy-cell-45340306',
+          expectedBranchName: 'production',
+          expectedBranchId: 'br-prod-001',
+          productionBranchId: 'br-prod-001',
+          neonApiKey: 'napi_test_key',
+          productionAuthorization: {
+            allowProductionMigration: true,
+            confirmProductionPhrase: 'APPLY_PRODUCTION_MIGRATION',
+          },
+          branchResolver: async () => validProdResolved,
+        }),
+      ).rejects.toThrow(
+        /Production migration requires connected role current_user='neondb_owner' and session_user='neondb_owner'/,
+      );
+    }
+
+    // 8c. Connection URI user other than neondb_owner is also rejected
+    const nonOwnerConnInfo = validateMigrationConnectionUrl(
+      'postgresql://postgres:secret@ep-prod-endpoint-111.us-east-2.aws.neon.tech/neondb?sslmode=require',
+    );
     await expect(
       verifyMigrationTargetIdentity({
-        connectionInfo: directProdConnInfo,
-        probe: {
-          ...prodProbe,
-          currentUser: 'oracle_app',
-        },
+        connectionInfo: nonOwnerConnInfo,
+        probe: prodProbe,
         expectedProjectId: 'wispy-cell-45340306',
         expectedBranchName: 'production',
         expectedBranchId: 'br-prod-001',
@@ -2541,9 +2600,77 @@ describe('Real PostgreSQL 16+ Integration Suite — Official Publication Protoco
         },
         branchResolver: async () => validProdResolved,
       }),
-    ).rejects.toThrow(/never as oracle_app or oracle_migrator/);
+    ).rejects.toThrow(
+      /Production migration requires MIGRATION_DATABASE_URL user to be 'neondb_owner', got 'postgres'/,
+    );
 
-    // 9. Production ACCEPTED only when ALL exact checks pass
+    // 8d. Live PostgreSQL 16 verification: executeSafeMigrationRun connected as administrative role 'postgres'
+    //     (not 'neondb_owner') aborts during verifyMigrationTargetIdentity BEFORE any DDL or ORACLE_APP_PASSWORD transmission
+    const untrasmittedCanaryPw = 'NeverSentAdminRoleCanary_2026!#Z';
+    const capturedQueriesOnReject: Array<{ sql: string; values: unknown[] }> = [];
+    const origClientQuery = pg.Client.prototype.query;
+    pg.Client.prototype.query = function patchedQuery(
+      this: pg.Client,
+      ...args: unknown[]
+    ) {
+      const first = args[0];
+      const second = args[1];
+      const sqlText =
+        typeof first === 'string'
+          ? first
+          : first &&
+              typeof first === 'object' &&
+              'text' in first &&
+              typeof (first as { text: unknown }).text === 'string'
+            ? (first as { text: string }).text
+            : '';
+      const paramValues = Array.isArray(second)
+        ? second
+        : first &&
+            typeof first === 'object' &&
+            'values' in first &&
+            Array.isArray((first as { values: unknown }).values)
+          ? (first as { values: unknown[] }).values
+          : [];
+      capturedQueriesOnReject.push({ sql: sqlText, values: paramValues });
+      return (origClientQuery as (...a: unknown[]) => unknown).apply(
+        this,
+        args,
+      );
+    } as typeof pg.Client.prototype.query;
+
+    try {
+      await expect(
+        executeSafeMigrationRun({
+          migrationDatabaseUrl: cluster.adminConnectionString,
+          oracleAppPassword: untrasmittedCanaryPw,
+          expectedProjectId: 'wispy-cell-45340306',
+          expectedBranchName: 'production',
+          expectedBranchId: 'br-prod-001',
+          productionBranchId: 'br-prod-001',
+          neonApiKey: 'napi_test_key',
+          productionAuthorization: {
+            allowProductionMigration: true,
+            confirmProductionPhrase: 'APPLY_PRODUCTION_MIGRATION',
+          },
+          branchResolver: async () => validProdResolved,
+        }),
+      ).rejects.toThrow(
+        /Production migration requires connected role current_user='neondb_owner' and session_user='neondb_owner', got current_user='postgres' \/ session_user='postgres'/,
+      );
+    } finally {
+      pg.Client.prototype.query = origClientQuery;
+    }
+
+    // Prove only the read-only identity probe ran — zero BEGIN/DDL statements and zero password parameters were sent
+    expect(capturedQueriesOnReject.length).toBe(1);
+    for (const q of capturedQueriesOnReject) {
+      expect(q.sql).not.toMatch(/\bBEGIN\b|\bCREATE\b|\bALTER\b/i);
+      expect(q.sql).not.toContain(untrasmittedCanaryPw);
+      expect(JSON.stringify(q.values)).not.toContain(untrasmittedCanaryPw);
+    }
+
+    // 9. Production ACCEPTED only when ALL exact checks pass (including current_user='neondb_owner' and session_user='neondb_owner')
     const authorizedProdTarget = await verifyMigrationTargetIdentity({
       connectionInfo: directProdConnInfo,
       probe: prodProbe,
@@ -2566,5 +2693,560 @@ describe('Real PostgreSQL 16+ Integration Suite — Official Publication Protoco
       endpointId: 'ep-prod-endpoint-111',
       isProduction: true,
     });
+  });
+
+  it('18. exercises defaultNeonBranchResolver() and verifyMigrationTargetIdentity() against mocked Neon API HTTP responses (success, auth failures, HTTP errors, missing endpoint/branch, hostname mismatch, project/branch mismatch, malformed responses, and CLI/GUC fallback rejection)', async () => {
+    const baseProbe = await probeDatabaseIdentity(adminPool);
+    const directProdConnInfo = validateMigrationConnectionUrl(
+      'postgresql://neondb_owner:secret@ep-prod-endpoint-111.us-east-2.aws.neon.tech/neondb?sslmode=require',
+    );
+    const prodProbe = {
+      ...baseProbe,
+      currentUser: 'neondb_owner',
+      sessionUser: 'neondb_owner',
+      neonProjectId: 'wispy-cell-45340306',
+      neonBranchId: 'br-prod-001',
+    };
+
+    const validEndpointsPayload = {
+      endpoints: [
+        {
+          id: 'ep-prod-endpoint-111',
+          host: 'ep-prod-endpoint-111.us-east-2.aws.neon.tech',
+          branch_id: 'br-prod-001',
+          project_id: 'wispy-cell-45340306',
+        },
+      ],
+    };
+    const validBranchesPayload = {
+      branches: [
+        {
+          id: 'br-prod-001',
+          name: 'production',
+          project_id: 'wispy-cell-45340306',
+          default: true,
+          primary: true,
+          protected: true,
+          parent_id: null,
+        },
+      ],
+    };
+
+    const originalFetch = globalThis.fetch;
+    const savedApiKey = process.env.NEON_API_KEY;
+    process.env.NEON_API_KEY = 'napi_mock_unit_test_key';
+
+    const mockNeonFetch = (
+      handler: (url: string, init?: RequestInit) => Promise<Response> | Response,
+    ) => {
+      globalThis.fetch = (async (
+        input: string | URL | Request,
+        init?: RequestInit,
+      ) => {
+        const url =
+          typeof input === 'string'
+            ? input
+            : input instanceof URL
+              ? input.toString()
+              : input.url;
+        return handler(url, init);
+      }) as typeof fetch;
+    };
+
+    try {
+      // 1. Successful endpoint-to-branch resolution using the actual defaultNeonBranchResolver and Neon API
+      const requestedUrls: string[] = [];
+      const requestedAuthHeaders: string[] = [];
+      mockNeonFetch((url, init) => {
+        requestedUrls.push(url);
+        const headers = new Headers(init?.headers);
+        requestedAuthHeaders.push(headers.get('Authorization') ?? '');
+        if (url.endsWith('/projects/wispy-cell-45340306/endpoints')) {
+          return new Response(JSON.stringify(validEndpointsPayload), {
+            status: 200,
+            headers: { 'Content-Type': 'application/json' },
+          });
+        }
+        if (url.endsWith('/projects/wispy-cell-45340306/branches')) {
+          return new Response(JSON.stringify(validBranchesPayload), {
+            status: 200,
+            headers: { 'Content-Type': 'application/json' },
+          });
+        }
+        return new Response('Not Found', { status: 404 });
+      });
+
+      const resolvedDirect = await defaultNeonBranchResolver({
+        projectId: 'wispy-cell-45340306',
+        endpointId: 'ep-prod-endpoint-111',
+        host: 'ep-prod-endpoint-111.us-east-2.aws.neon.tech',
+        serverBranchId: 'br-prod-001',
+      });
+      expect(resolvedDirect).toEqual({
+        projectId: 'wispy-cell-45340306',
+        branchId: 'br-prod-001',
+        branchName: 'production',
+        endpointId: 'ep-prod-endpoint-111',
+        endpointHost: 'ep-prod-endpoint-111.us-east-2.aws.neon.tech',
+        isDefault: true,
+        isPrimary: true,
+        isProtected: true,
+        parentId: null,
+        source: 'neon-api',
+      });
+      expect(requestedUrls).toEqual([
+        'https://console.neon.tech/api/v2/projects/wispy-cell-45340306/endpoints',
+        'https://console.neon.tech/api/v2/projects/wispy-cell-45340306/branches',
+      ]);
+      expect(requestedAuthHeaders).toEqual([
+        'Bearer napi_mock_unit_test_key',
+        'Bearer napi_mock_unit_test_key',
+      ]);
+
+      // Also verify verifyMigrationTargetIdentity succeeds when using the default resolver (no custom branchResolver injected)
+      const verifiedViaDefaultResolver = await verifyMigrationTargetIdentity({
+        connectionInfo: directProdConnInfo,
+        probe: prodProbe,
+        expectedProjectId: 'wispy-cell-45340306',
+        expectedBranchName: 'production',
+        expectedBranchId: 'br-prod-001',
+        productionBranchId: 'br-prod-001',
+        productionAuthorization: {
+          allowProductionMigration: true,
+          confirmProductionPhrase: 'APPLY_PRODUCTION_MIGRATION',
+        },
+      });
+      expect(verifiedViaDefaultResolver).toEqual({
+        verificationMethod: 'neon-control-plane',
+        projectId: 'wispy-cell-45340306',
+        branchId: 'br-prod-001',
+        branchName: 'production',
+        endpointId: 'ep-prod-endpoint-111',
+        isProduction: true,
+      });
+
+      // 2. API authentication failure (401 Unauthorized and 403 Forbidden)
+      for (const authStatus of [401, 403]) {
+        mockNeonFetch(
+          () =>
+            new Response(JSON.stringify({ message: 'Unauthorized' }), {
+              status: authStatus,
+            }),
+        );
+        const authFailResult = await defaultNeonBranchResolver({
+          projectId: 'wispy-cell-45340306',
+          endpointId: 'ep-prod-endpoint-111',
+          host: 'ep-prod-endpoint-111.us-east-2.aws.neon.tech',
+          serverBranchId: 'br-prod-001',
+        });
+        expect(authFailResult).toBeNull();
+
+        await expect(
+          verifyMigrationTargetIdentity({
+            connectionInfo: directProdConnInfo,
+            probe: prodProbe,
+            expectedProjectId: 'wispy-cell-45340306',
+            expectedBranchName: 'production',
+            expectedBranchId: 'br-prod-001',
+            productionBranchId: 'br-prod-001',
+            productionAuthorization: {
+              allowProductionMigration: true,
+              confirmProductionPhrase: 'APPLY_PRODUCTION_MIGRATION',
+            },
+          }),
+        ).rejects.toThrow(
+          /authoritative Neon API verification failed or was unavailable/,
+        );
+      }
+
+      // 3. HTTP errors (500, 502, partial 404 on branches, and network rejection)
+      mockNeonFetch(
+        () => new Response('Internal Server Error', { status: 500 }),
+      );
+      expect(
+        await defaultNeonBranchResolver({
+          projectId: 'wispy-cell-45340306',
+          endpointId: 'ep-prod-endpoint-111',
+          host: 'ep-prod-endpoint-111.us-east-2.aws.neon.tech',
+          serverBranchId: 'br-prod-001',
+        }),
+      ).toBeNull();
+
+      mockNeonFetch((url) => {
+        if (url.endsWith('/endpoints')) {
+          return new Response(JSON.stringify(validEndpointsPayload), {
+            status: 200,
+          });
+        }
+        return new Response('Bad Gateway', { status: 502 });
+      });
+      expect(
+        await defaultNeonBranchResolver({
+          projectId: 'wispy-cell-45340306',
+          endpointId: 'ep-prod-endpoint-111',
+          host: 'ep-prod-endpoint-111.us-east-2.aws.neon.tech',
+          serverBranchId: 'br-prod-001',
+        }),
+      ).toBeNull();
+
+      mockNeonFetch(() => {
+        throw new TypeError('fetch failed: network unreachable');
+      });
+      expect(
+        await defaultNeonBranchResolver({
+          projectId: 'wispy-cell-45340306',
+          endpointId: 'ep-prod-endpoint-111',
+          host: 'ep-prod-endpoint-111.us-east-2.aws.neon.tech',
+          serverBranchId: 'br-prod-001',
+        }),
+      ).toBeNull();
+
+      // 4. Missing endpoint
+      mockNeonFetch((url) => {
+        if (url.endsWith('/endpoints')) {
+          return new Response(
+            JSON.stringify({
+              endpoints: [
+                {
+                  id: 'ep-unrelated-999',
+                  host: 'ep-unrelated-999.us-east-2.aws.neon.tech',
+                  branch_id: 'br-prod-001',
+                },
+              ],
+            }),
+            { status: 200 },
+          );
+        }
+        return new Response(JSON.stringify(validBranchesPayload), {
+          status: 200,
+        });
+      });
+      expect(
+        await defaultNeonBranchResolver({
+          projectId: 'wispy-cell-45340306',
+          endpointId: 'ep-prod-endpoint-111',
+          host: 'ep-prod-endpoint-111.us-east-2.aws.neon.tech',
+          serverBranchId: 'br-prod-001',
+        }),
+      ).toBeNull();
+
+      await expect(
+        verifyMigrationTargetIdentity({
+          connectionInfo: directProdConnInfo,
+          probe: prodProbe,
+          expectedProjectId: 'wispy-cell-45340306',
+          expectedBranchName: 'production',
+          expectedBranchId: 'br-prod-001',
+          productionBranchId: 'br-prod-001',
+          productionAuthorization: {
+            allowProductionMigration: true,
+            confirmProductionPhrase: 'APPLY_PRODUCTION_MIGRATION',
+          },
+        }),
+      ).rejects.toThrow(
+        /authoritative Neon API verification failed or was unavailable/,
+      );
+
+      // 5. Missing branch
+      mockNeonFetch((url) => {
+        if (url.endsWith('/endpoints')) {
+          return new Response(JSON.stringify(validEndpointsPayload), {
+            status: 200,
+          });
+        }
+        return new Response(
+          JSON.stringify({
+            branches: [
+              {
+                id: 'br-other-branch-999',
+                name: 'preview/pr-99',
+                default: false,
+                primary: false,
+              },
+            ],
+          }),
+          { status: 200 },
+        );
+      });
+      expect(
+        await defaultNeonBranchResolver({
+          projectId: 'wispy-cell-45340306',
+          endpointId: 'ep-prod-endpoint-111',
+          host: 'ep-prod-endpoint-111.us-east-2.aws.neon.tech',
+          serverBranchId: 'br-prod-001',
+        }),
+      ).toBeNull();
+
+      // 6. Endpoint ID match with a mismatched hostname (and vice versa)
+      mockNeonFetch((url) => {
+        if (url.endsWith('/endpoints')) {
+          return new Response(
+            JSON.stringify({
+              endpoints: [
+                {
+                  id: 'ep-prod-endpoint-111',
+                  host: 'ep-mismatched-host-999.us-east-2.aws.neon.tech',
+                  branch_id: 'br-prod-001',
+                },
+              ],
+            }),
+            { status: 200 },
+          );
+        }
+        return new Response(JSON.stringify(validBranchesPayload), {
+          status: 200,
+        });
+      });
+      expect(
+        await defaultNeonBranchResolver({
+          projectId: 'wispy-cell-45340306',
+          endpointId: 'ep-prod-endpoint-111',
+          host: 'ep-prod-endpoint-111.us-east-2.aws.neon.tech',
+          serverBranchId: 'br-prod-001',
+        }),
+      ).toBeNull();
+
+      await expect(
+        verifyMigrationTargetIdentity({
+          connectionInfo: directProdConnInfo,
+          probe: prodProbe,
+          expectedProjectId: 'wispy-cell-45340306',
+          expectedBranchName: 'production',
+          expectedBranchId: 'br-prod-001',
+          productionBranchId: 'br-prod-001',
+          productionAuthorization: {
+            allowProductionMigration: true,
+            confirmProductionPhrase: 'APPLY_PRODUCTION_MIGRATION',
+          },
+        }),
+      ).rejects.toThrow(
+        /authoritative Neon API verification failed or was unavailable/,
+      );
+
+      // 7. Incorrect project or branch identity in API response
+      // 7a. Endpoint belongs to a different project_id
+      mockNeonFetch((url) => {
+        if (url.endsWith('/endpoints')) {
+          return new Response(
+            JSON.stringify({
+              endpoints: [
+                {
+                  id: 'ep-prod-endpoint-111',
+                  host: 'ep-prod-endpoint-111.us-east-2.aws.neon.tech',
+                  branch_id: 'br-prod-001',
+                  project_id: 'wrong-project-999',
+                },
+              ],
+            }),
+            { status: 200 },
+          );
+        }
+        return new Response(JSON.stringify(validBranchesPayload), {
+          status: 200,
+        });
+      });
+      expect(
+        await defaultNeonBranchResolver({
+          projectId: 'wispy-cell-45340306',
+          endpointId: 'ep-prod-endpoint-111',
+          host: 'ep-prod-endpoint-111.us-east-2.aws.neon.tech',
+          serverBranchId: 'br-prod-001',
+        }),
+      ).toBeNull();
+
+      // 7b. Branch belongs to a different project_id
+      mockNeonFetch((url) => {
+        if (url.endsWith('/endpoints')) {
+          return new Response(JSON.stringify(validEndpointsPayload), {
+            status: 200,
+          });
+        }
+        return new Response(
+          JSON.stringify({
+            branches: [
+              {
+                id: 'br-prod-001',
+                name: 'production',
+                project_id: 'wrong-project-999',
+                default: true,
+                primary: true,
+              },
+            ],
+          }),
+          { status: 200 },
+        );
+      });
+      expect(
+        await defaultNeonBranchResolver({
+          projectId: 'wispy-cell-45340306',
+          endpointId: 'ep-prod-endpoint-111',
+          host: 'ep-prod-endpoint-111.us-east-2.aws.neon.tech',
+          serverBranchId: 'br-prod-001',
+        }),
+      ).toBeNull();
+
+      // 7c. Branch ID resolved by API disagrees with serverBranchId (GUC neon.branch_id)
+      mockNeonFetch((url) => {
+        if (url.endsWith('/endpoints')) {
+          return new Response(
+            JSON.stringify({
+              endpoints: [
+                {
+                  id: 'ep-prod-endpoint-111',
+                  host: 'ep-prod-endpoint-111.us-east-2.aws.neon.tech',
+                  branch_id: 'br-unexpected-branch-999',
+                },
+              ],
+            }),
+            { status: 200 },
+          );
+        }
+        return new Response(
+          JSON.stringify({
+            branches: [
+              {
+                id: 'br-unexpected-branch-999',
+                name: 'production',
+                default: true,
+                primary: true,
+              },
+            ],
+          }),
+          { status: 200 },
+        );
+      });
+      expect(
+        await defaultNeonBranchResolver({
+          projectId: 'wispy-cell-45340306',
+          endpointId: 'ep-prod-endpoint-111',
+          host: 'ep-prod-endpoint-111.us-east-2.aws.neon.tech',
+          serverBranchId: 'br-prod-001',
+        }),
+      ).toBeNull();
+
+      // And even when serverBranchId GUC is null, verifyMigrationTargetIdentity rejects the wrong branch ID resolved via defaultNeonBranchResolver
+      await expect(
+        verifyMigrationTargetIdentity({
+          connectionInfo: directProdConnInfo,
+          probe: {
+            ...prodProbe,
+            neonBranchId: null,
+          },
+          expectedProjectId: 'wispy-cell-45340306',
+          expectedBranchName: 'production',
+          expectedBranchId: 'br-prod-001',
+          productionBranchId: 'br-prod-001',
+          productionAuthorization: {
+            allowProductionMigration: true,
+            confirmProductionPhrase: 'APPLY_PRODUCTION_MIGRATION',
+          },
+        }),
+      ).rejects.toThrow(
+        /does not match expected production branch ID 'br-prod-001'/,
+      );
+
+      // 8. Incomplete or malformed API responses
+      const malformedPayloads: Array<{
+        endpointsBody: string;
+        branchesBody: string;
+      }> = [
+        { endpointsBody: 'not-valid-json{{{', branchesBody: '{}' },
+        { endpointsBody: 'null', branchesBody: 'null' },
+        { endpointsBody: '{}', branchesBody: '{}' },
+        {
+          endpointsBody: JSON.stringify({ endpoints: 'not-an-array' }),
+          branchesBody: JSON.stringify(validBranchesPayload),
+        },
+        {
+          endpointsBody: JSON.stringify({
+            endpoints: [{ id: 'ep-prod-endpoint-111' }], // missing host & branch_id
+          }),
+          branchesBody: JSON.stringify(validBranchesPayload),
+        },
+        {
+          endpointsBody: JSON.stringify(validEndpointsPayload),
+          branchesBody: JSON.stringify({
+            branches: [{ id: 'br-prod-001', name: '' }], // empty branch name
+          }),
+        },
+      ];
+
+      for (const malformed of malformedPayloads) {
+        mockNeonFetch((url) => {
+          if (url.endsWith('/endpoints')) {
+            return new Response(malformed.endpointsBody, { status: 200 });
+          }
+          return new Response(malformed.branchesBody, { status: 200 });
+        });
+        expect(
+          await defaultNeonBranchResolver({
+            projectId: 'wispy-cell-45340306',
+            endpointId: 'ep-prod-endpoint-111',
+            host: 'ep-prod-endpoint-111.us-east-2.aws.neon.tech',
+            serverBranchId: 'br-prod-001',
+          }),
+        ).toBeNull();
+      }
+
+      // 9. Production authorization path never accepts CLI or GUC-only fallback after API verification fails
+      let cliFallbackInvocations = 0;
+      mockNeonFetch(
+        () => new Response('Service Unavailable', { status: 503 }),
+      );
+
+      // Confirm that defaultNeonBranchResolver with allowCliFallback: false (as used in production path)
+      // never calls cliFallbackRunner after API failure
+      const prodResolverResult = await defaultNeonBranchResolver({
+        projectId: 'wispy-cell-45340306',
+        endpointId: 'ep-prod-endpoint-111',
+        host: 'ep-prod-endpoint-111.us-east-2.aws.neon.tech',
+        serverBranchId: 'br-prod-001',
+        allowCliFallback: false,
+        cliFallbackRunner: async () => {
+          cliFallbackInvocations += 1;
+          return {
+            projectId: 'wispy-cell-45340306',
+            branchId: 'br-prod-001',
+            branchName: 'production',
+            endpointId: 'ep-prod-endpoint-111',
+            endpointHost: 'ep-prod-endpoint-111.us-east-2.aws.neon.tech',
+            isDefault: true,
+            isPrimary: true,
+            isProtected: true,
+            parentId: null,
+            source: 'neon-cli',
+          };
+        },
+      });
+      expect(prodResolverResult).toBeNull();
+      expect(cliFallbackInvocations).toBe(0);
+
+      // And when verifyMigrationTargetIdentity runs on the production path with the real defaultNeonBranchResolver
+      // while Neon API fails (503) and prodProbe.neonBranchId === 'br-prod-001' (matching expectedBranchId),
+      // it rejects and never falls back to GUC-only verification
+      await expect(
+        verifyMigrationTargetIdentity({
+          connectionInfo: directProdConnInfo,
+          probe: prodProbe,
+          expectedProjectId: 'wispy-cell-45340306',
+          expectedBranchName: 'production',
+          expectedBranchId: 'br-prod-001',
+          productionBranchId: 'br-prod-001',
+          productionAuthorization: {
+            allowProductionMigration: true,
+            confirmProductionPhrase: 'APPLY_PRODUCTION_MIGRATION',
+          },
+        }),
+      ).rejects.toThrow(
+        /Production migration aborted: authoritative Neon API verification failed or was unavailable for endpoint 'ep-prod-endpoint-111' \(GUC-only and CLI fallbacks are forbidden for production\)/,
+      );
+    } finally {
+      globalThis.fetch = originalFetch;
+      if (savedApiKey === undefined) {
+        delete process.env.NEON_API_KEY;
+      } else {
+        process.env.NEON_API_KEY = savedApiKey;
+      }
+    }
   });
 });

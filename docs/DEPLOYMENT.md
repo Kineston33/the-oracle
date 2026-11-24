@@ -366,9 +366,11 @@ statement if **any** of the following checks fails:
    - The branch is marked `default: true` or `primary: true` in Neon.
    The GUC-only fallback (`neon-server-guc`) and local CLI fallback are
    strictly forbidden on the production path.
-7. **Administrative migration role only**: Rejects `oracle_app` and
-   `oracle_migrator` both in the connection URI and in the live session
-   (`CURRENT_USER` / `SESSION_USER`).
+7. **Exact production migration role (`neondb_owner`)**: Requires both
+   `CURRENT_USER` and `SESSION_USER` (and the connection URI user) to be
+   exactly `neondb_owner`, rejecting `oracle_app`, `oracle_migrator`, and any
+   other administrative role before executing DDL or transmitting
+   `ORACLE_APP_PASSWORD`.
 8. **Password-safe role provisioning, transactional DDL, and §2.5 audit**:
    Verifies safe server logging settings before transmitting
    `ORACLE_APP_PASSWORD` as a `$1` bind parameter, applies

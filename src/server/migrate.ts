@@ -764,17 +764,22 @@ export type NeonBranchResolver = (params: {
   endpointId: string | null;
   host: string;
   serverBranchId: string | null;
+  neonApiKey?: string;
+  allowCliFallback?: boolean;
+  cliFallbackRunner?: () => Promise<NeonResolvedBranchMetadata | null>;
 }) => Promise<NeonResolvedBranchMetadata | null>;
 
 interface NeonApiEndpoint {
   id: string;
   host: string;
   branch_id: string;
+  project_id?: string;
 }
 
 interface NeonApiBranch {
   id: string;
   name: string;
+  project_id?: string;
   default?: boolean;
   primary?: boolean;
   protected?: boolean;
@@ -791,17 +796,31 @@ export const defaultNeonBranchResolver: NeonBranchResolver = async ({
   projectId,
   endpointId,
   host,
+  serverBranchId,
+  neonApiKey,
+  allowCliFallback,
+  cliFallbackRunner,
 }) => {
-  if (!endpointId) {
+  const normalizedProjectId =
+    typeof projectId === 'string' ? projectId.trim() : '';
+  const normalizedEndpointId =
+    typeof endpointId === 'string' ? endpointId.trim() : '';
+  const normalizedHost = typeof host === 'string' ? host.trim() : '';
+  const normalizedServerBranchId =
+    typeof serverBranchId === 'string' && serverBranchId.trim().length > 0
+      ? serverBranchId.trim()
+      : null;
+
+  if (!normalizedProjectId || !normalizedEndpointId || !normalizedHost) {
     return null;
   }
 
-  const apiKey = process.env.NEON_API_KEY?.trim();
+  const apiKey = (neonApiKey ?? process.env.NEON_API_KEY)?.trim() ?? '';
   if (apiKey) {
     try {
       const [endpointsRes, branchesRes] = await Promise.all([
         fetch(
-          `https://console.neon.tech/api/v2/projects/${encodeURIComponent(projectId)}/endpoints`,
+          `https://console.neon.tech/api/v2/projects/${encodeURIComponent(normalizedProjectId)}/endpoints`,
           {
             headers: {
               Authorization: `Bearer ${apiKey}`,
@@ -810,7 +829,7 @@ export const defaultNeonBranchResolver: NeonBranchResolver = async ({
           },
         ),
         fetch(
-          `https://console.neon.tech/api/v2/projects/${encodeURIComponent(projectId)}/branches`,
+          `https://console.neon.tech/api/v2/projects/${encodeURIComponent(normalizedProjectId)}/branches`,
           {
             headers: {
               Authorization: `Bearer ${apiKey}`,
@@ -821,40 +840,119 @@ export const defaultNeonBranchResolver: NeonBranchResolver = async ({
       ]);
 
       if (endpointsRes.ok && branchesRes.ok) {
-        const endpointsBody = (await endpointsRes.json()) as {
-          endpoints?: NeonApiEndpoint[];
-        };
-        const branchesBody = (await branchesRes.json()) as {
-          branches?: NeonApiBranch[];
-        };
-        const endpoint = endpointsBody.endpoints?.find(
-          (e) =>
-            e.id.toLowerCase() === endpointId.toLowerCase() ||
-            e.host.toLowerCase() === host.toLowerCase(),
-        );
-        if (endpoint) {
-          const branch = branchesBody.branches?.find(
-            (b) => b.id === endpoint.branch_id,
+        const endpointsBody = (await endpointsRes.json()) as unknown;
+        const branchesBody = (await branchesRes.json()) as unknown;
+
+        if (
+          endpointsBody &&
+          typeof endpointsBody === 'object' &&
+          Array.isArray(
+            (endpointsBody as { endpoints?: unknown }).endpoints,
+          ) &&
+          branchesBody &&
+          typeof branchesBody === 'object' &&
+          Array.isArray((branchesBody as { branches?: unknown }).branches)
+        ) {
+          const rawEndpoints = (
+            endpointsBody as { endpoints: unknown[] }
+          ).endpoints;
+          const rawBranches = (
+            branchesBody as { branches: unknown[] }
+          ).branches;
+
+          const validEndpoints = rawEndpoints.filter(
+            (e): e is NeonApiEndpoint =>
+              Boolean(e) &&
+              typeof e === 'object' &&
+              typeof (e as NeonApiEndpoint).id === 'string' &&
+              (e as NeonApiEndpoint).id.trim().length > 0 &&
+              typeof (e as NeonApiEndpoint).host === 'string' &&
+              (e as NeonApiEndpoint).host.trim().length > 0 &&
+              typeof (e as NeonApiEndpoint).branch_id === 'string' &&
+              (e as NeonApiEndpoint).branch_id.trim().length > 0,
           );
-          if (branch) {
-            return {
-              projectId,
-              branchId: branch.id,
-              branchName: branch.name,
-              endpointId: endpoint.id,
-              endpointHost: endpoint.host,
-              isDefault: Boolean(branch.default),
-              isPrimary: Boolean(branch.primary),
-              isProtected: Boolean(branch.protected),
-              parentId: branch.parent_id ?? null,
-              source: 'neon-api',
-            };
+
+          const endpoint = validEndpoints.find(
+            (e) =>
+              e.id.trim().toLowerCase() ===
+                normalizedEndpointId.toLowerCase() ||
+              e.host.trim().toLowerCase() === normalizedHost.toLowerCase(),
+          );
+
+          if (
+            endpoint &&
+            endpoint.id.trim().toLowerCase() ===
+              normalizedEndpointId.toLowerCase() &&
+            endpoint.host.trim().toLowerCase() ===
+              normalizedHost.toLowerCase() &&
+            (endpoint.project_id === undefined ||
+              endpoint.project_id === null ||
+              (typeof endpoint.project_id === 'string' &&
+                endpoint.project_id.trim() === normalizedProjectId))
+          ) {
+            const validBranches = rawBranches.filter(
+              (b): b is NeonApiBranch =>
+                Boolean(b) &&
+                typeof b === 'object' &&
+                typeof (b as NeonApiBranch).id === 'string' &&
+                (b as NeonApiBranch).id.trim().length > 0 &&
+                typeof (b as NeonApiBranch).name === 'string' &&
+                (b as NeonApiBranch).name.trim().length > 0,
+            );
+
+            const branch = validBranches.find(
+              (b) => b.id.trim() === endpoint.branch_id.trim(),
+            );
+
+            if (
+              branch &&
+              (branch.project_id === undefined ||
+                branch.project_id === null ||
+                (typeof branch.project_id === 'string' &&
+                  branch.project_id.trim() === normalizedProjectId)) &&
+              (!normalizedServerBranchId ||
+                branch.id.trim() === normalizedServerBranchId)
+            ) {
+              return {
+                projectId: normalizedProjectId,
+                branchId: branch.id.trim(),
+                branchName: branch.name.trim(),
+                endpointId: endpoint.id.trim(),
+                endpointHost: endpoint.host.trim(),
+                isDefault: Boolean(branch.default),
+                isPrimary: Boolean(branch.primary),
+                isProtected: Boolean(branch.protected),
+                parentId:
+                  typeof branch.parent_id === 'string'
+                    ? branch.parent_id
+                    : null,
+                source: 'neon-api',
+              };
+            }
           }
         }
       }
     } catch {
-      // Fall through to Neon CLI if REST API call fails
+      // Do not silently trust unverified state if REST API call fails
     }
+
+    if (allowCliFallback === false) {
+      return null;
+    }
+
+    if (cliFallbackRunner) {
+      return cliFallbackRunner();
+    }
+
+    return null;
+  }
+
+  if (allowCliFallback === false) {
+    return null;
+  }
+
+  if (cliFallbackRunner) {
+    return cliFallbackRunner();
   }
 
   try {
@@ -865,9 +963,9 @@ export const defaultNeonBranchResolver: NeonBranchResolver = async ({
           'postgres',
           'computes',
           'get',
-          endpointId,
+          normalizedEndpointId,
           '--project-id',
-          projectId,
+          normalizedProjectId,
           '-o',
           'json',
         ],
@@ -875,7 +973,7 @@ export const defaultNeonBranchResolver: NeonBranchResolver = async ({
       ),
       execFileAsync(
         'neon',
-        ['branches', 'list', '--project-id', projectId, '-o', 'json'],
+        ['branches', 'list', '--project-id', normalizedProjectId, '-o', 'json'],
         { timeout: 15_000 },
       ),
     ]);
@@ -888,15 +986,34 @@ export const defaultNeonBranchResolver: NeonBranchResolver = async ({
       ? branchesRaw
       : (branchesRaw.branches ?? []);
 
-    if (compute && compute.branch_id) {
-      const branch = branches.find((b) => b.id === compute.branch_id);
-      if (branch) {
+    if (
+      compute &&
+      typeof compute.branch_id === 'string' &&
+      compute.branch_id.trim().length > 0 &&
+      (compute.id ?? normalizedEndpointId).trim().toLowerCase() ===
+        normalizedEndpointId.toLowerCase() &&
+      (compute.host ?? normalizedHost).trim().toLowerCase() ===
+        normalizedHost.toLowerCase()
+    ) {
+      const branch = branches.find(
+        (b) =>
+          b &&
+          typeof b.id === 'string' &&
+          b.id.trim() === compute.branch_id.trim() &&
+          typeof b.name === 'string' &&
+          b.name.trim().length > 0,
+      );
+      if (
+        branch &&
+        (!normalizedServerBranchId ||
+          branch.id.trim() === normalizedServerBranchId)
+      ) {
         return {
-          projectId,
-          branchId: branch.id,
-          branchName: branch.name,
-          endpointId: compute.id ?? endpointId,
-          endpointHost: compute.host ?? host,
+          projectId: normalizedProjectId,
+          branchId: branch.id.trim(),
+          branchName: branch.name.trim(),
+          endpointId: (compute.id ?? normalizedEndpointId).trim(),
+          endpointHost: (compute.host ?? normalizedHost).trim(),
           isDefault: Boolean(branch.default),
           isPrimary: Boolean(branch.primary),
           isProtected: Boolean(branch.protected),
@@ -946,6 +1063,8 @@ function isProtectedProductionBranchName(name: string): boolean {
 
 export const PRODUCTION_CONFIRMATION_PHRASE =
   'APPLY_PRODUCTION_MIGRATION' as const;
+
+export const PRODUCTION_MIGRATION_ROLE = 'neondb_owner' as const;
 
 export interface ProductionMigrationAuthorization {
   /**
@@ -1042,6 +1161,24 @@ export async function verifyMigrationTargetIdentity(
       );
     }
 
+    if (
+      probe.currentUser !== PRODUCTION_MIGRATION_ROLE ||
+      probe.sessionUser !== PRODUCTION_MIGRATION_ROLE
+    ) {
+      violations.push(
+        `Production migration requires connected role current_user='${PRODUCTION_MIGRATION_ROLE}' and session_user='${PRODUCTION_MIGRATION_ROLE}', got current_user='${probe.currentUser}' / session_user='${probe.sessionUser}'`,
+      );
+    }
+
+    if (
+      connectionInfo.user &&
+      connectionInfo.user !== PRODUCTION_MIGRATION_ROLE
+    ) {
+      violations.push(
+        `Production migration requires MIGRATION_DATABASE_URL user to be '${PRODUCTION_MIGRATION_ROLE}', got '${connectionInfo.user}'`,
+      );
+    }
+
     const expectedBranchName = options.expectedBranchName?.trim() ?? '';
     if (expectedBranchName !== 'production') {
       violations.push(
@@ -1134,12 +1271,14 @@ export async function verifyMigrationTargetIdentity(
       endpointId: connectionInfo.neonEndpointId,
       host: connectionInfo.host,
       serverBranchId: probe.neonBranchId,
+      neonApiKey: apiKey,
+      allowCliFallback: false,
     });
 
     // Fallback GUC-only or CLI-only resolution is strictly forbidden for production
-    if (!resolved || resolved.source === 'neon-cli') {
+    if (!resolved || resolved.source !== 'neon-api') {
       throw new MigrationTargetSecurityError([
-        `Production migration aborted: authoritative Neon API verification failed or was unavailable for endpoint '${String(connectionInfo.neonEndpointId)}' (GUC-only fallback is forbidden for production)`,
+        `Production migration aborted: authoritative Neon API verification failed or was unavailable for endpoint '${String(connectionInfo.neonEndpointId)}' (GUC-only and CLI fallbacks are forbidden for production)`,
       ]);
     }
 
