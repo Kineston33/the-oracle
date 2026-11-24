@@ -34,9 +34,11 @@ import {
 } from './embedded-pg.ts';
 import {
   PostgresPublicationRegistry,
+  RuntimeRoleSecurityError,
   runLedgerMigrations,
   runLedgerSecurityAudit,
   startOracleServer,
+  verifyRuntimeDatabaseRole,
 } from './index.ts';
 
 function buildBaseIdentity(overrides?: Partial<PropositionIdentity>): PropositionIdentity {
@@ -670,6 +672,40 @@ describe('Real PostgreSQL 16+ Integration Suite — Official Publication Protoco
       ).rejects.toMatchObject({ code: '25001' });
       await appClient.query('ROLLBACK');
 
+      // Calling append_terminal_prediction_event under REPEATABLE READ fails with SQLSTATE 25001
+      await appClient.query('BEGIN ISOLATION LEVEL REPEATABLE READ');
+      await expect(
+        appClient.query(
+          `SELECT oracle_ledger.append_terminal_prediction_event(
+             'ORC-2026-0101',
+             'resolved',
+             '2028-01-15T10:00:00.000Z'::timestamptz,
+             '2028-01-15T10:00:05.000Z'::timestamptz,
+             ('{"seq":"e1","kind":"resolved","prevDigest":"' || repeat('a', 64) || '"}')::jsonb,
+             repeat('b', 64),
+             repeat('a', 64)
+           )`,
+        ),
+      ).rejects.toMatchObject({ code: '25001' });
+      await appClient.query('ROLLBACK');
+
+      // Calling append_terminal_prediction_event under SERIALIZABLE fails with SQLSTATE 25001
+      await appClient.query('BEGIN ISOLATION LEVEL SERIALIZABLE');
+      await expect(
+        appClient.query(
+          `SELECT oracle_ledger.append_terminal_prediction_event(
+             'ORC-2026-0101',
+             'resolved',
+             '2028-01-15T10:00:00.000Z'::timestamptz,
+             '2028-01-15T10:00:05.000Z'::timestamptz,
+             ('{"seq":"e1","kind":"resolved","prevDigest":"' || repeat('a', 64) || '"}')::jsonb,
+             repeat('b', 64),
+             repeat('a', 64)
+           )`,
+        ),
+      ).rejects.toMatchObject({ code: '25001' });
+      await appClient.query('ROLLBACK');
+
       // Calling record_rejected_or_conflict_idempotency with a forged 'created' outcome fails with 23514
       await appClient.query('BEGIN ISOLATION LEVEL READ COMMITTED');
       await expect(
@@ -718,15 +754,29 @@ describe('Real PostgreSQL 16+ Integration Suite — Official Publication Protoco
     }
   });
 
-  it('9. appends a terminal resolution event (e1) while preserving sealed payload immutability and rejecting duplicate or unlinked terminal events', async () => {
+  it('9. appends a terminal resolution event (e1) while preserving sealed payload immutability and rejecting duplicate, unlinked, or malformed-envelope terminal events', async () => {
     const beforeResolution = await registry.getPredictionById('ORC-2026-0101');
     expect(beforeResolution).not.toBeNull();
     const originalPayloadHash = await sha256Hex(
       canonicalize(sealedPayload(beforeResolution!)),
     );
     expect(originalPayloadHash).toBe(beforeResolution!.integrity.digest);
+    const e0Digest = beforeResolution!.events[0]!.digest;
 
-    // Attempt to append an event with a mismatched prev_digest directly via the SECURITY DEFINER function -> rejected with 23514
+    // Verify live function definition in pg_proc uses FOR UPDATE (not FOR KEY SHARE) and enforces READ COMMITTED
+    const fnDefRes = await adminPool.query<{ fn_def: string }>(`
+      SELECT pg_catalog.pg_get_functiondef(
+        pg_catalog.to_regprocedure(
+          'oracle_ledger.append_terminal_prediction_event(text,text,timestamp with time zone,timestamp with time zone,jsonb,character,character)'
+        )
+      ) AS fn_def
+    `);
+    const fnDef = fnDefRes.rows[0]?.fn_def ?? '';
+    expect(fnDef).toContain('FOR UPDATE');
+    expect(fnDef).not.toContain('FOR KEY SHARE');
+    expect(fnDef).toContain("v_isolation_level IS DISTINCT FROM 'read committed'");
+
+    // 1. Reject envelope where (p_envelope ->> 'seq') <> 'e1' with SQLSTATE 23514
     await expect(
       appPool.query(
         `SELECT oracle_ledger.append_terminal_prediction_event(
@@ -734,10 +784,76 @@ describe('Real PostgreSQL 16+ Integration Suite — Official Publication Protoco
            'resolved',
            '2028-01-15T10:00:00.000Z'::timestamptz,
            '2028-01-15T10:00:05.000Z'::timestamptz,
-           '{"kind":"resolved"}'::jsonb,
+           $1::jsonb,
            repeat('1', 64),
-           repeat('9', 64)
+           $2
          )`,
+        [
+          JSON.stringify({ seq: 'e0', kind: 'resolved', prevDigest: e0Digest }),
+          e0Digest,
+        ],
+      ),
+    ).rejects.toMatchObject({ code: '23514' });
+
+    // 2. Reject envelope where (p_envelope ->> 'kind') <> p_kind with SQLSTATE 23514
+    await expect(
+      appPool.query(
+        `SELECT oracle_ledger.append_terminal_prediction_event(
+           'ORC-2026-0101',
+           'resolved',
+           '2028-01-15T10:00:00.000Z'::timestamptz,
+           '2028-01-15T10:00:05.000Z'::timestamptz,
+           $1::jsonb,
+           repeat('1', 64),
+           $2
+         )`,
+        [
+          JSON.stringify({ seq: 'e1', kind: 'annulled', prevDigest: e0Digest }),
+          e0Digest,
+        ],
+      ),
+    ).rejects.toMatchObject({ code: '23514' });
+
+    // 3. Reject envelope where (p_envelope ->> 'prevDigest') <> p_prev_digest with SQLSTATE 23514
+    await expect(
+      appPool.query(
+        `SELECT oracle_ledger.append_terminal_prediction_event(
+           'ORC-2026-0101',
+           'resolved',
+           '2028-01-15T10:00:00.000Z'::timestamptz,
+           '2028-01-15T10:00:05.000Z'::timestamptz,
+           $1::jsonb,
+           repeat('1', 64),
+           $2
+         )`,
+        [
+          JSON.stringify({
+            seq: 'e1',
+            kind: 'resolved',
+            prevDigest: '9'.repeat(64),
+          }),
+          e0Digest,
+        ],
+      ),
+    ).rejects.toMatchObject({ code: '23514' });
+
+    // 4. Reject call where p_prev_digest does not match stored e0.digest with SQLSTATE 23514
+    const fakePrev = '9'.repeat(64);
+    await expect(
+      appPool.query(
+        `SELECT oracle_ledger.append_terminal_prediction_event(
+           'ORC-2026-0101',
+           'resolved',
+           '2028-01-15T10:00:00.000Z'::timestamptz,
+           '2028-01-15T10:00:05.000Z'::timestamptz,
+           $1::jsonb,
+           repeat('1', 64),
+           $2
+         )`,
+        [
+          JSON.stringify({ seq: 'e1', kind: 'resolved', prevDigest: fakePrev }),
+          fakePrev,
+        ],
       ),
     ).rejects.toMatchObject({ code: '23514' });
 
@@ -751,7 +867,7 @@ describe('Real PostgreSQL 16+ Integration Suite — Official Publication Protoco
         outcome: 'yes',
         basis: 'INDEC reported December 2027 12-month CPI inflation at 21.4% (< 25.0%).',
         note: '12-month variation: 21.4%.',
-        evidenceIds: ['ev-1-1'],
+        evidenceIds: ['ev-pub-1-1'],
       },
     });
 
@@ -790,7 +906,6 @@ describe('Real PostgreSQL 16+ Integration Suite — Official Publication Protoco
       }),
     ).rejects.toThrow(/This record was resolved\. A resolution is final/);
 
-    const e0Digest = resolvedRecord.events[0]!.digest;
     await expect(
       appPool.query(
         `SELECT oracle_ledger.append_terminal_prediction_event(
@@ -798,16 +913,111 @@ describe('Real PostgreSQL 16+ Integration Suite — Official Publication Protoco
            'annulled',
            '2028-01-16T10:00:00.000Z'::timestamptz,
            '2028-01-16T10:00:05.000Z'::timestamptz,
-           '{"kind":"annulled"}'::jsonb,
+           $1::jsonb,
            repeat('2', 64),
-           $1
+           $2
          )`,
-        [e0Digest],
+        [
+          JSON.stringify({ seq: 'e1', kind: 'annulled', prevDigest: e0Digest }),
+          e0Digest,
+        ],
       ),
     ).rejects.toMatchObject({ code: '23505' });
   });
 
-  it('10. serves the read-only HTTP API (GET /v1/predictions, GET /v1/predictions/:id, GET /v1/predictions/:id/events) and blocks public write endpoints', async () => {
+  it('10. returns the complete [e0, e1] event chain on existing-identity submissions after resolution while keeping the sealed payload immutable and idempotent replay consistent', async () => {
+    // ORC-2026-0101 was published in Test 3 and resolved with e1 in Test 9.
+    // Submit a new publication request for the same canonical identity with a fresh idempotencyKey.
+    const postResDraft = buildDraftCandidate('pub-post-resolution', undefined, {
+      proposedQuestion:
+        'Will INDEC report Argentina annual CPI inflation strictly below 25.0% for 2027?',
+      probability: 0.55,
+    });
+    const postResQualified = qualifyCandidate(postResDraft);
+    const postResCandDigest = await candidateContentDigest(postResQualified);
+
+    const postResRequest: PublicationRequest = {
+      candidateId: postResQualified.candidateId,
+      idempotencyKey: 'idem-post-resolution-existing',
+      identity: postResQualified.proposedIdentity,
+      candidateDigest: postResCandDigest,
+      requestedAt: nextTimestamp(),
+    };
+
+    const existingOutcome = await publishCandidate(
+      postResQualified,
+      postResRequest,
+      {
+        registry,
+        now: nextTimestamp,
+        newPredictionId: nextPredictionId,
+      },
+    );
+
+    expect(existingOutcome.kind).toBe('existing');
+    if (existingOutcome.kind !== 'existing') {
+      throw new Error('Expected existing outcome after resolution');
+    }
+
+    expect(existingOutcome.predictionId).toBe('ORC-2026-0101');
+    expect(existingOutcome.record).toBeDefined();
+    const returnedRecord = existingOutcome.record!;
+
+    // 1. The existing response reflects the full [e0, e1] event chain (not a stale [e0]-only chain)
+    expect(returnedRecord.events.map((e) => `${e.seq}:${e.kind}`)).toEqual([
+      'e0:published',
+      'e1:resolved',
+    ]);
+    const derived = deriveLifecycle(returnedRecord);
+    expect(derived.status).toBe('resolved');
+    expect(derived.resolution?.outcome).toBe('yes');
+
+    // 2. The original sealed payload and its SHA-256 digest remain completely intact and valid
+    expect(returnedRecord.probability).toBe(0.62);
+    const recomputedSealedHash = await sha256Hex(
+      canonicalize(sealedPayload(returnedRecord)),
+    );
+    expect(recomputedSealedHash).toBe(returnedRecord.integrity.digest);
+    expect(await validateOfficialRecord(returnedRecord)).toEqual([]);
+
+    // Verify the underlying official_predictions.sealed_payload column in PostgreSQL was never mutated
+    const rawTableRes = await appPool.query<{
+      sealed_events_len: number;
+      payload_digest: string;
+    }>(
+      `SELECT pg_catalog.jsonb_array_length(sealed_payload -> 'events') AS sealed_events_len,
+              pg_catalog.btrim(payload_digest) AS payload_digest
+         FROM oracle_ledger.official_predictions
+        WHERE prediction_id = 'ORC-2026-0101'`,
+    );
+    expect(rawTableRes.rows[0]?.sealed_events_len).toBe(1);
+    expect(rawTableRes.rows[0]?.payload_digest).toBe(
+      returnedRecord.integrity.digest,
+    );
+
+    // 3. Replaying idem-post-resolution-existing returns 'replayed' with the [e0, e1] chain preserved
+    const replayedPostRes = await publishCandidate(
+      postResQualified,
+      postResRequest,
+      {
+        registry,
+        now: nextTimestamp,
+        newPredictionId: nextPredictionId,
+      },
+    );
+    expect(replayedPostRes.kind).toBe('replayed');
+    if (replayedPostRes.kind !== 'replayed') {
+      throw new Error('Expected replayed outcome');
+    }
+    expect(replayedPostRes.original.kind).toBe('existing');
+    if (replayedPostRes.original.kind === 'existing') {
+      expect(
+        replayedPostRes.original.record?.events.map((e) => `${e.seq}:${e.kind}`),
+      ).toEqual(['e0:published', 'e1:resolved']);
+    }
+  });
+
+  it('11. serves the read-only HTTP API (GET /v1/predictions, GET /v1/predictions/:id, GET /v1/predictions/:id/events) and blocks public write endpoints', async () => {
     const running = await startOracleServer({
       databaseUrl: cluster.appConnectionString,
       port: 0,
@@ -900,7 +1110,66 @@ describe('Real PostgreSQL 16+ Integration Suite — Official Publication Protoco
     }
   });
 
-  it('11. persists official predictions, append-only event chains, and idempotency keys across a full PostgreSQL server stop and restart', async () => {
+  it('12. enforces startup role security validation (rejecting superuser, administrative, or table-DML-privileged DATABASE_URL connections without leaking credentials)', async () => {
+    // 1. Attempting to start the server with the superuser/admin DATABASE_URL is rejected with RuntimeRoleSecurityError
+    let adminErr: unknown;
+    try {
+      await startOracleServer({
+        databaseUrl: cluster.adminConnectionString,
+        port: 0,
+        host: '127.0.0.1',
+      });
+    } catch (err) {
+      adminErr = err;
+    }
+    expect(adminErr).toBeInstanceOf(RuntimeRoleSecurityError);
+    const secErr = adminErr as RuntimeRoleSecurityError;
+    expect(secErr.violations).toContain(
+      "connected as current_user='postgres' / session_user='postgres' instead of restricted runtime role 'oracle_app'",
+    );
+    expect(secErr.violations).toContain("role 'postgres' has SUPERUSER attribute");
+    // Ensure connection string is never leaked in the error message
+    expect(secErr.message).not.toContain(cluster.adminConnectionString);
+
+    // 2. Granting CREATEDB to oracle_app causes startup validation to reject the connection
+    await adminPool.query('ALTER ROLE oracle_app CREATEDB');
+    try {
+      await expect(
+        startOracleServer({
+          databaseUrl: cluster.appConnectionString,
+          port: 0,
+          host: '127.0.0.1',
+        }),
+      ).rejects.toThrow(/role 'oracle_app' has CREATEDB attribute/);
+    } finally {
+      await adminPool.query('ALTER ROLE oracle_app NOCREATEDB');
+    }
+
+    // 3. Granting direct INSERT on official_predictions to oracle_app causes startup validation to reject the connection
+    await adminPool.query(
+      'GRANT INSERT ON TABLE oracle_ledger.official_predictions TO oracle_app',
+    );
+    try {
+      await expect(
+        startOracleServer({
+          databaseUrl: cluster.appConnectionString,
+          port: 0,
+          host: '127.0.0.1',
+        }),
+      ).rejects.toThrow(
+        /role 'oracle_app' has forbidden direct DML\/DDL privileges on oracle_ledger tables/,
+      );
+    } finally {
+      await adminPool.query(
+        'REVOKE INSERT ON TABLE oracle_ledger.official_predictions FROM oracle_app',
+      );
+    }
+
+    // 4. Once least-privilege state is restored, verifyRuntimeDatabaseRole passes cleanly
+    await expect(verifyRuntimeDatabaseRole(appPool)).resolves.toBeUndefined();
+  });
+
+  it('13. persists official predictions, append-only event chains, and idempotency keys across a full PostgreSQL server stop and restart', async () => {
     // Close active client pools before stopping the PostgreSQL OS process
     await appPool.end();
     await adminPool.end();
@@ -955,7 +1224,7 @@ describe('Real PostgreSQL 16+ Integration Suite — Official Publication Protoco
     );
     expect(replayAfterRestart.kind).toBe('replayed');
 
-    // Also verify buildSealedPredictionRecord + claimIdentity delegates through commitPublication cleanly
+    // Verify buildSealedPredictionRecord + claimIdentity delegates through commitPublication cleanly
     const claimDraft = buildDraftCandidate('claim-test', {
       subject: { namespace: 'entity', id: 'chile-central-bank' },
       geographicScope: { namespace: 'country', id: 'cl' },
@@ -989,55 +1258,50 @@ describe('Real PostgreSQL 16+ Integration Suite — Official Publication Protoco
       status: 'already-claimed',
       predictionId: 'ORC-2026-0301',
     });
-  });
 
-  it('12. verifies external TEST_DATABASE_ADMIN_URL (GitHub Actions PostgreSQL 16 service container) when configured', async () => {
+    // If an external PostgreSQL 16 service container is configured in CI (TEST_DATABASE_ADMIN_URL),
+    // also run migrations, security audit, and end-to-end publication against that container.
     const externalAdminUrl = process.env.TEST_DATABASE_ADMIN_URL;
-    if (!externalAdminUrl) {
-      // When running locally without an external service container, the embedded PostgreSQL 16.16
-      // cluster in tests 1-11 already executed all real PostgreSQL 16 checks.
-      expect(cluster.port).toBeGreaterThan(0);
-      return;
-    }
+    if (externalAdminUrl) {
+      const extPool = new pg.Pool({ connectionString: externalAdminUrl, max: 5 });
+      try {
+        await runLedgerMigrations(extPool);
+        const extAudit = await runLedgerSecurityAudit(extPool);
+        expect(extAudit.serverVersionNum).toBeGreaterThanOrEqual(160000);
+        expect(extAudit.roleMembershipRows).toEqual([]);
+        expect(extAudit.privilegeViolationRows).toEqual([]);
+        expect(extAudit.compliant).toBe(true);
 
-    const extPool = new pg.Pool({ connectionString: externalAdminUrl, max: 5 });
-    try {
-      await runLedgerMigrations(extPool);
-      const extAudit = await runLedgerSecurityAudit(extPool);
-      expect(extAudit.serverVersionNum).toBeGreaterThanOrEqual(160000);
-      expect(extAudit.roleMembershipRows).toEqual([]);
-      expect(extAudit.privilegeViolationRows).toEqual([]);
-      expect(extAudit.compliant).toBe(true);
-
-      const extRegistry = new PostgresPublicationRegistry({
-        pool: extPool,
-        now: nextTimestamp,
-        sessionAuthorizationRole: 'oracle_app',
-      });
-      const draft = buildDraftCandidate('ext-ci-1', {
-        subject: { namespace: 'entity', id: 'uruguay-central-bank' },
-        geographicScope: { namespace: 'country', id: 'uy' },
-      });
-      const qualified = qualifyCandidate(draft);
-      const candDigest = await candidateContentDigest(qualified);
-      const outcome = await publishCandidate(
-        qualified,
-        {
-          candidateId: qualified.candidateId,
-          idempotencyKey: 'idem-ext-ci-1',
-          identity: qualified.proposedIdentity,
-          candidateDigest: candDigest,
-          requestedAt: nextTimestamp(),
-        },
-        {
-          registry: extRegistry,
+        const extRegistry = new PostgresPublicationRegistry({
+          pool: extPool,
           now: nextTimestamp,
-          newPredictionId: () => 'ORC-2026-0401',
-        },
-      );
-      expect(outcome.kind).toBe('created');
-    } finally {
-      await extPool.end();
+          sessionAuthorizationRole: 'oracle_app',
+        });
+        const extDraft = buildDraftCandidate('ext-ci-1', {
+          subject: { namespace: 'entity', id: 'uruguay-central-bank' },
+          geographicScope: { namespace: 'country', id: 'uy' },
+        });
+        const extQualified = qualifyCandidate(extDraft);
+        const extCandDigest = await candidateContentDigest(extQualified);
+        const extOutcome = await publishCandidate(
+          extQualified,
+          {
+            candidateId: extQualified.candidateId,
+            idempotencyKey: 'idem-ext-ci-1',
+            identity: extQualified.proposedIdentity,
+            candidateDigest: extCandDigest,
+            requestedAt: nextTimestamp(),
+          },
+          {
+            registry: extRegistry,
+            now: nextTimestamp,
+            newPredictionId: () => 'ORC-2026-0401',
+          },
+        );
+        expect(extOutcome.kind).toBe('created');
+      } finally {
+        await extPool.end();
+      }
     }
   });
 });

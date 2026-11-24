@@ -14,21 +14,17 @@ PostgreSQL 16+ database and HTTP service.
 > with PostgreSQL versions older than 16 is not claimed and is explicitly rejected by the
 > preflight version guard in §2.5.
 
-> **Status in this repository**: No HTTP server and no PostgreSQL database are shipped or
-> running in this repository/sandbox. Real PostgreSQL execution remains unverified in this
-> environment because no live PostgreSQL server is available. `InMemoryRegistry`
-> (`src/data/publication.ts`) enforces the `PublicationRegistry` contract within a single
-> JavaScript event loop for unit tests (`commitPublication` executes its idempotency check,
-> identity claim, sealed record storage, and idempotency binding in one synchronous critical
-> section with no `await` points); it does **not** survive process restarts or coordinate
-> across multiple OS processes or nodes. Single-threaded `InMemoryRegistry` tests verify the
-> domain state machine and contract invariants, and the PostgreSQL DDL, trigger,
-> `SECURITY DEFINER` function, privilege, catalog ACL, and transaction statements below are
-> verified by static SQL contract inspection and deterministic in-memory simulations rather
-> than executed against a live PostgreSQL instance. A production backend must implement the
-> relational constraints, PL/pgSQL triggers, `SECURITY DEFINER` write functions, role
-> separation, deployment audit queries, and `READ COMMITTED` ACID transaction specified below
-> on PostgreSQL 16 or newer.
+> **Status in this repository**: The PostgreSQL 16+ DDL migration
+> (`src/server/migrations/0001_oracle_ledger_v1_10.sql`), live §2.5 catalog security audit
+> (`src/server/migrations/audit_v1_10.sql`, `src/server/migrate.ts`), persistent
+> `PostgresPublicationRegistry` adapter (`src/server/postgres-registry.ts`), and Node.js HTTP
+> read API (`src/server/api.ts`, `src/server/index.ts`) are implemented in `src/server/` and
+> verified against real PostgreSQL 16 instances (`postgres 16.16` locally in
+> `src/server/postgres-integration.test.ts` and `postgres:16` in GitHub Actions CI). However,
+> **the Node.js backend server is not yet deployed to a live production host, and Neon is not
+> yet connected to a live backend runtime**. `InMemoryRegistry` (`src/data/publication.ts`)
+> remains available for single-process unit tests (`src/data/publication.test.ts`), alongside
+> static SQL contract inspection and deterministic simulations.
 
 ---
 
@@ -702,6 +698,43 @@ BEGIN
         USING ERRCODE = '23514';
     END IF;
 
+    -- Reconstruct the current ordered event chain [e0] or [e0, e1] from prediction_events
+    -- without mutating the immutable sealed_payload column in official_predictions.
+    SELECT pg_catalog.jsonb_agg(
+             pg_catalog.jsonb_build_object(
+               'seq', pe.seq,
+               'kind', pe.kind,
+               'occurredAt', pe.envelope -> 'occurredAt',
+               'recordedAt', pe.envelope -> 'recordedAt',
+               'origin', pe.envelope -> 'origin',
+               'algorithm', pe.envelope -> 'algorithm',
+               'schemaVersion', COALESCE(
+                 (pg_catalog.substring(pe.envelope ->> 'schema', '^oracle\.event/([0-9]+)$'))::integer,
+                 2
+               ),
+               'scope', pe.envelope -> 'scope',
+               'body', pe.envelope -> 'body',
+               'digest', pg_catalog.btrim(pe.digest),
+               'prevDigest', CASE
+                 WHEN pe.prev_digest IS NULL THEN NULL
+                 ELSE pg_catalog.btrim(pe.prev_digest)
+               END
+             )
+             ORDER BY pe.seq ASC
+           )
+      INTO v_winner_events
+      FROM oracle_ledger.prediction_events AS pe
+     WHERE pe.prediction_id = v_winner_id;
+
+    IF v_winner_events IS NOT NULL AND pg_catalog.jsonb_array_length(v_winner_events) > 0 THEN
+      v_winner_payload := pg_catalog.jsonb_set(
+        v_winner_payload,
+        '{events}',
+        v_winner_events,
+        true
+      );
+    END IF;
+
     v_status := 'existing';
     v_outcome := pg_catalog.jsonb_build_object(
       'kind', 'existing',
@@ -846,11 +879,20 @@ SECURITY DEFINER
 SET search_path = pg_catalog, pg_temp
 AS $$
 DECLARE
+  v_isolation_level      TEXT;
   v_locked_prediction_id TEXT;
   v_e0_digest            CHAR(64);
   v_e0_occurred_at       TIMESTAMPTZ;
   v_has_terminal_event   BOOLEAN;
 BEGIN
+  v_isolation_level := pg_catalog.current_setting('transaction_isolation');
+  IF v_isolation_level IS DISTINCT FROM 'read committed' THEN
+    RAISE EXCEPTION
+      'append_terminal_prediction_event requires transaction_isolation = read committed, got: %',
+      v_isolation_level
+      USING ERRCODE = '25001';
+  END IF;
+
   IF p_prediction_id IS NULL OR pg_catalog.length(pg_catalog.btrim(p_prediction_id)) = 0 THEN
     RAISE EXCEPTION 'p_prediction_id must be non-empty'
       USING ERRCODE = '22023';
@@ -882,12 +924,23 @@ BEGIN
       USING ERRCODE = '22023';
   END IF;
 
-  -- Serialize terminal event appends per prediction without firing UPDATE triggers
+  IF (p_envelope ->> 'seq') IS DISTINCT FROM 'e1'
+     OR (p_envelope ->> 'kind') IS DISTINCT FROM p_kind
+     OR (p_envelope ->> 'prevDigest') IS DISTINCT FROM p_prev_digest
+  THEN
+    RAISE EXCEPTION
+      'p_envelope must match seq = e1, kind = %, and prevDigest = %',
+      p_kind,
+      p_prev_digest
+      USING ERRCODE = '23514';
+  END IF;
+
+  -- Serialize terminal event appends per prediction
   SELECT op.prediction_id
     INTO v_locked_prediction_id
     FROM oracle_ledger.official_predictions AS op
    WHERE op.prediction_id = p_prediction_id
-     FOR KEY SHARE;
+     FOR UPDATE;
 
   IF NOT FOUND THEN
     RAISE EXCEPTION 'official_predictions row % does not exist',
@@ -1145,7 +1198,7 @@ configured with concrete role names and secrets during deployment:
 2. **Application runtime role (`oracle_app` — read-only table access + `EXECUTE` on approved functions only)**:
    - Created with `NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOBYPASSRLS LOGIN`.
    - Is **never** granted membership in `oracle_migrator` or any other privileged role
-     (`REVOKE oracle_migrator FROM oracle_app, PUBLIC;`).
+     (`REVOKE oracle_migrator FROM oracle_app;`).
    - Does **not** own any schema, table, function, or trigger, and therefore cannot execute
      `ALTER TABLE`, `DROP TABLE`, `DROP TRIGGER`, `ALTER TABLE ... DISABLE TRIGGER`,
      `CREATE OR REPLACE FUNCTION`, `GRANT`, or `REVOKE`.
@@ -1169,7 +1222,7 @@ CREATE ROLE oracle_migrator NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOLOGI
 CREATE ROLE oracle_app NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOBYPASSRLS LOGIN;
 
 -- Ensure oracle_app is never a member of oracle_migrator
-REVOKE oracle_migrator FROM oracle_app, PUBLIC;
+REVOKE oracle_migrator FROM oracle_app;
 
 -- Lock down schema-level privileges
 ALTER SCHEMA oracle_ledger OWNER TO oracle_migrator;
@@ -1233,8 +1286,8 @@ TO oracle_app;
 
 #### PostgreSQL 16+ version guard, indirect role-membership audit (`pg_catalog.pg_auth_members`), `PUBLIC` catalog ACL inspection (`aclexplode` / `acldefault`), object-ownership audit, and effective privilege audit
 
-Executing `REVOKE oracle_migrator FROM oracle_app, PUBLIC;` only removes direct membership of
-`oracle_app` (and `PUBLIC`) in `oracle_migrator`. It does **not** by itself remove arbitrary
+Executing `REVOKE oracle_migrator FROM oracle_app;` only removes direct membership of
+`oracle_app` in `oracle_migrator`. It does **not** by itself remove arbitrary
 pre-existing role memberships or prove that `oracle_app` has no indirect or transitive path to
 ownership, DDL, migration, or table-write capabilities; furthermore, inspecting static `GRANT`
 statements in a migration script does not prove what privileges are actually effective in a

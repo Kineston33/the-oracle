@@ -157,6 +157,28 @@ function reconstructPredictionRecord(
   });
 }
 
+function freezePredictionRecord(record: PredictionRecord): PredictionRecord {
+  const frozenEvents = Array.isArray(record.events)
+    ? Object.freeze(record.events.map((ev) => Object.freeze({ ...ev })))
+    : Object.freeze([]);
+  return Object.freeze({
+    ...record,
+    demo: false,
+    events: frozenEvents as unknown as RecordEvent[],
+    integrity: Object.freeze({ ...record.integrity }),
+  });
+}
+
+function normalizeStoredOutcome(outcome: PublicationOutcome): PublicationOutcome {
+  if ((outcome.kind === 'created' || outcome.kind === 'existing') && outcome.record) {
+    return {
+      ...outcome,
+      record: freezePredictionRecord(outcome.record),
+    };
+  }
+  return outcome;
+}
+
 export class PostgresPublicationRegistry implements PublicationRegistry {
   private readonly pool: Pool;
   private readonly now: () => string;
@@ -212,7 +234,7 @@ export class PostgresPublicationRegistry implements PublicationRegistry {
         return {
           status: 'match',
           requestDigest: existingDigest,
-          outcome: storedOutcome,
+          outcome: normalizeStoredOutcome(storedOutcome),
         };
       }
 
@@ -332,6 +354,30 @@ export class PostgresPublicationRegistry implements PublicationRegistry {
         const payload = res.rows[0]?.result;
         if (!payload) {
           throw new Error('commit_official_publication returned an empty result');
+        }
+        if (payload.status === 'created') {
+          return {
+            status: 'created',
+            outcome: normalizeStoredOutcome(payload.outcome) as Extract<
+              PublicationOutcome,
+              { kind: 'created' }
+            >,
+          };
+        }
+        if (payload.status === 'existing') {
+          return {
+            status: 'existing',
+            outcome: normalizeStoredOutcome(payload.outcome) as Extract<
+              PublicationOutcome,
+              { kind: 'existing' }
+            >,
+          };
+        }
+        if (payload.status === 'replayed') {
+          return {
+            status: 'replayed',
+            original: normalizeStoredOutcome(payload.original),
+          };
         }
         return payload;
       } catch (err) {

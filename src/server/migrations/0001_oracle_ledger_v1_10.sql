@@ -335,6 +335,7 @@ DECLARE
   v_claimed_prediction_id   TEXT;
   v_winner_id               TEXT;
   v_winner_payload          JSONB;
+  v_winner_events           JSONB;
   v_outcome                 JSONB;
   v_status                  TEXT;
 BEGIN
@@ -490,6 +491,43 @@ BEGIN
         USING ERRCODE = '23514';
     END IF;
 
+    -- Reconstruct the current ordered event chain [e0] or [e0, e1] from prediction_events
+    -- without mutating the immutable sealed_payload column in official_predictions.
+    SELECT pg_catalog.jsonb_agg(
+             pg_catalog.jsonb_build_object(
+               'seq', pe.seq,
+               'kind', pe.kind,
+               'occurredAt', pe.envelope -> 'occurredAt',
+               'recordedAt', pe.envelope -> 'recordedAt',
+               'origin', pe.envelope -> 'origin',
+               'algorithm', pe.envelope -> 'algorithm',
+               'schemaVersion', COALESCE(
+                 (pg_catalog.substring(pe.envelope ->> 'schema', '^oracle\.event/([0-9]+)$'))::integer,
+                 2
+               ),
+               'scope', pe.envelope -> 'scope',
+               'body', pe.envelope -> 'body',
+               'digest', pg_catalog.btrim(pe.digest),
+               'prevDigest', CASE
+                 WHEN pe.prev_digest IS NULL THEN NULL
+                 ELSE pg_catalog.btrim(pe.prev_digest)
+               END
+             )
+             ORDER BY pe.seq ASC
+           )
+      INTO v_winner_events
+      FROM oracle_ledger.prediction_events AS pe
+     WHERE pe.prediction_id = v_winner_id;
+
+    IF v_winner_events IS NOT NULL AND pg_catalog.jsonb_array_length(v_winner_events) > 0 THEN
+      v_winner_payload := pg_catalog.jsonb_set(
+        v_winner_payload,
+        '{events}',
+        v_winner_events,
+        true
+      );
+    END IF;
+
     v_status := 'existing';
     v_outcome := pg_catalog.jsonb_build_object(
       'kind', 'existing',
@@ -627,11 +665,20 @@ SECURITY DEFINER
 SET search_path = pg_catalog, pg_temp
 AS $$
 DECLARE
+  v_isolation_level      TEXT;
   v_locked_prediction_id TEXT;
   v_e0_digest            CHAR(64);
   v_e0_occurred_at       TIMESTAMPTZ;
   v_has_terminal_event   BOOLEAN;
 BEGIN
+  v_isolation_level := pg_catalog.current_setting('transaction_isolation');
+  IF v_isolation_level IS DISTINCT FROM 'read committed' THEN
+    RAISE EXCEPTION
+      'append_terminal_prediction_event requires transaction_isolation = read committed, got: %',
+      v_isolation_level
+      USING ERRCODE = '25001';
+  END IF;
+
   IF p_prediction_id IS NULL OR pg_catalog.length(pg_catalog.btrim(p_prediction_id)) = 0 THEN
     RAISE EXCEPTION 'p_prediction_id must be non-empty'
       USING ERRCODE = '22023';
@@ -661,11 +708,22 @@ BEGIN
       USING ERRCODE = '22023';
   END IF;
 
+  IF (p_envelope ->> 'seq') IS DISTINCT FROM 'e1'
+     OR (p_envelope ->> 'kind') IS DISTINCT FROM p_kind
+     OR (p_envelope ->> 'prevDigest') IS DISTINCT FROM p_prev_digest
+  THEN
+    RAISE EXCEPTION
+      'p_envelope must match seq = e1, kind = %, and prevDigest = %',
+      p_kind,
+      p_prev_digest
+      USING ERRCODE = '23514';
+  END IF;
+
   SELECT op.prediction_id
     INTO v_locked_prediction_id
     FROM oracle_ledger.official_predictions AS op
    WHERE op.prediction_id = p_prediction_id
-     FOR KEY SHARE;
+     FOR UPDATE;
 
   IF NOT FOUND THEN
     RAISE EXCEPTION 'official_predictions row % does not exist',
