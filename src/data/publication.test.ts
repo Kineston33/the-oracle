@@ -2842,6 +2842,299 @@ describe('protocol v1.3 PostgreSQL transaction contract and retry semantics', ()
       }),
     ).toThrow(/23505: prediction_id pred-0001 already has a terminal event \(e1\)/);
   });
+
+  it('enforces v1.7 READ COMMITTED isolation guard, recursive pg_auth_members role-membership audit, and digest format-vs-SHA256 distinction (static SQL inspection + in-memory TypeScript simulation, not real PostgreSQL execution)', () => {
+    const contractDoc = readFileSync(
+      resolve(process.cwd(), 'docs/PUBLICATION-API-CONTRACT.md'),
+      'utf8',
+    );
+    const sqlBlocks = Array.from(
+      contractDoc.matchAll(/```sql\r?\n([\s\S]*?)```/g),
+      (m) => m[1],
+    ).join('\n');
+
+    // --- 1. Static SQL checks for active READ COMMITTED isolation enforcement ---
+    const commitFnMatch = sqlBlocks.match(
+      /CREATE\s+OR\s+REPLACE\s+FUNCTION\s+oracle_ledger\.commit_official_publication\s*\([\s\S]*?\$\$\s*;/i,
+    );
+    expect(commitFnMatch).not.toBeNull();
+    const commitFnBody = commitFnMatch![0];
+
+    // Must inspect pg_catalog.current_setting('transaction_isolation') and require 'read committed' with ERRCODE = '25001'
+    expect(commitFnBody).toContain(
+      "v_isolation_level := pg_catalog.current_setting('transaction_isolation');",
+    );
+    expect(commitFnBody).toContain(
+      "IF v_isolation_level IS DISTINCT FROM 'read committed' THEN\n    RAISE EXCEPTION\n      'commit_official_publication requires transaction_isolation = read committed, got: %',\n      v_isolation_level\n      USING ERRCODE = '25001';\n  END IF;",
+    );
+
+    // Must occur BEFORE any table access (INSERT, UPDATE, DELETE, or SELECT FROM oracle_ledger.*)
+    const isolationCheckIdx = commitFnBody.indexOf(
+      "v_isolation_level := pg_catalog.current_setting('transaction_isolation');",
+    );
+    const firstTableAccessIdx = commitFnBody.search(
+      /\b(INSERT\s+INTO|UPDATE\s+oracle_ledger|SELECT\s+[\s\S]*?FROM\s+oracle_ledger)\b/i,
+    );
+    expect(isolationCheckIdx).toBeGreaterThan(0);
+    expect(firstTableAccessIdx).toBeGreaterThan(isolationCheckIdx);
+
+    // Must NOT attempt to change transaction isolation from inside the function
+    expect(commitFnBody).not.toMatch(/SET\s+(TRANSACTION|SESSION\s+CHARACTERISTICS)/i);
+    expect(sqlBlocks).not.toMatch(/SET\s+TRANSACTION\s+ISOLATION\s+LEVEL/i);
+
+    // record_rejected_or_conflict_idempotency also enforces read committed with ERRCODE = '25001'
+    expect(sqlBlocks).toContain(
+      "IF v_isolation_level IS DISTINCT FROM 'read committed' THEN\n    RAISE EXCEPTION\n      'record_rejected_or_conflict_idempotency requires transaction_isolation = read committed, got: %',\n      v_isolation_level\n      USING ERRCODE = '25001';\n  END IF;",
+    );
+
+    // --- 2. Static SQL checks for recursive pg_catalog.pg_auth_members role-membership audit ---
+    expect(sqlBlocks).toContain('WITH RECURSIVE role_membership_graph AS (');
+    expect(sqlBlocks).toContain('FROM pg_catalog.pg_auth_members AS m');
+    expect(sqlBlocks).toContain('JOIN pg_catalog.pg_roles AS r_member');
+    expect(sqlBlocks).toContain("WHERE r_member.rolname = 'oracle_app'");
+    expect(sqlBlocks).toContain('m.admin_option');
+    expect(sqlBlocks).toContain('m.inherit_option');
+    expect(sqlBlocks).toContain('m.set_option');
+    expect(sqlBlocks).toContain('r_granted.rolsuper');
+    expect(sqlBlocks).toContain('r_granted.rolcreatedb');
+    expect(sqlBlocks).toContain('r_granted.rolcreaterole');
+    expect(sqlBlocks).toContain('r_granted.rolbypassrls');
+    expect(contractDoc).toMatch(
+      /Executing `REVOKE oracle_migrator FROM oracle_app, PUBLIC;` only removes direct membership[\s\S]*?does \*\*not\*\* by itself remove arbitrary\s+pre-existing role memberships/i,
+    );
+
+    // --- 3. Static checks for explicit digest format-validation vs. SHA-256 distinction ---
+    expect(contractDoc).toMatch(
+      /The PostgreSQL PL\/pgSQL functions validate \*\*digest format\*\* \(`\^\[0-9a-f\]\{64\}\$`[\s\S]*?\*\*not\*\*\s+independent cryptographic SHA-256 recomputation/i,
+    );
+    expect(sqlBlocks).toContain(
+      'Format validation only (64-char lowercase hex); cryptographic SHA-256 computation',
+    );
+    expect(sqlBlocks).not.toContain('must be 64-character lowercase hex SHA-256 strings');
+
+    // --- 4. In-memory TypeScript simulation (not real PostgreSQL execution) of:
+    //        (a) active transaction isolation guard (SQLSTATE 25001 before any mutation), and
+    //        (b) recursive pg_auth_members indirect role-membership audit ---
+    type IsolationLevel =
+      | 'read committed'
+      | 'repeatable read'
+      | 'serializable'
+      | 'read uncommitted';
+
+    class SimulatedIsolationGuardedLedger {
+      public idempotencyCount = 0;
+      public predictionCount = 0;
+      public eventCount = 0;
+
+      commitOfficialPublication(activeIsolation: IsolationLevel): string {
+        if (activeIsolation !== 'read committed') {
+          throw new Error(
+            `25001: commit_official_publication requires transaction_isolation = read committed, got: ${activeIsolation}`,
+          );
+        }
+        this.idempotencyCount += 1;
+        this.predictionCount += 1;
+        this.eventCount += 1;
+        return 'created';
+      }
+
+      recordRejectedOrConflictIdempotency(activeIsolation: IsolationLevel): string {
+        if (activeIsolation !== 'read committed') {
+          throw new Error(
+            `25001: record_rejected_or_conflict_idempotency requires transaction_isolation = read committed, got: ${activeIsolation}`,
+          );
+        }
+        this.idempotencyCount += 1;
+        return 'recorded';
+      }
+    }
+
+    const isoLedger = new SimulatedIsolationGuardedLedger();
+    for (const badIsolation of [
+      'repeatable read',
+      'serializable',
+      'read uncommitted',
+    ] as const) {
+      expect(() => isoLedger.commitOfficialPublication(badIsolation)).toThrow(
+        new RegExp(
+          `25001: commit_official_publication requires transaction_isolation = read committed, got: ${badIsolation}`,
+        ),
+      );
+      expect(() => isoLedger.recordRejectedOrConflictIdempotency(badIsolation)).toThrow(
+        new RegExp(
+          `25001: record_rejected_or_conflict_idempotency requires transaction_isolation = read committed, got: ${badIsolation}`,
+        ),
+      );
+      // Verify zero mutations occurred on rejected isolation levels
+      expect(isoLedger.idempotencyCount).toBe(0);
+      expect(isoLedger.predictionCount).toBe(0);
+      expect(isoLedger.eventCount).toBe(0);
+    }
+
+    expect(isoLedger.commitOfficialPublication('read committed')).toBe('created');
+    expect(isoLedger.idempotencyCount).toBe(1);
+    expect(isoLedger.predictionCount).toBe(1);
+    expect(isoLedger.eventCount).toBe(1);
+
+    // Simulation of recursive pg_catalog.pg_auth_members + pg_catalog.pg_roles audit
+    interface PgRole {
+      oid: number;
+      rolname: string;
+      rolsuper: boolean;
+      rolcreatedb: boolean;
+      rolcreaterole: boolean;
+      rolbypassrls: boolean;
+      rolreplication: boolean;
+    }
+
+    interface PgAuthMember {
+      member: number;
+      roleid: number;
+      admin_option: boolean;
+      inherit_option: boolean;
+      set_option: boolean;
+    }
+
+    function runRecursiveRoleAudit(
+      roles: PgRole[],
+      memberships: PgAuthMember[],
+      targetRolname = 'oracle_app',
+    ) {
+      const roleByOid = new Map(roles.map((r) => [r.oid, r]));
+      const baseRole = roles.find((r) => r.rolname === targetRolname);
+      if (!baseRole) return [];
+
+      interface GraphNode {
+        base_role_oid: number;
+        granted_role_oid: number;
+        admin_option: boolean;
+        inherit_option: boolean;
+        set_option: boolean;
+        depth: number;
+        oid_path: number[];
+      }
+
+      const results: GraphNode[] = [];
+      const queue: GraphNode[] = memberships
+        .filter((m) => m.member === baseRole.oid)
+        .map((m) => ({
+          base_role_oid: m.member,
+          granted_role_oid: m.roleid,
+          admin_option: m.admin_option,
+          inherit_option: m.inherit_option,
+          set_option: m.set_option,
+          depth: 1,
+          oid_path: [m.member, m.roleid],
+        }));
+
+      while (queue.length > 0) {
+        const current = queue.shift()!;
+        results.push(current);
+        for (const edge of memberships) {
+          if (
+            edge.member === current.granted_role_oid &&
+            !current.oid_path.includes(edge.roleid)
+          ) {
+            queue.push({
+              base_role_oid: current.base_role_oid,
+              granted_role_oid: edge.roleid,
+              admin_option: edge.admin_option,
+              inherit_option: edge.inherit_option,
+              set_option: edge.set_option,
+              depth: current.depth + 1,
+              oid_path: [...current.oid_path, edge.roleid],
+            });
+          }
+        }
+      }
+
+      return results.map((g) => {
+        const granted = roleByOid.get(g.granted_role_oid)!;
+        return {
+          runtime_role: baseRole.rolname,
+          reachable_role: granted.rolname,
+          depth: g.depth,
+          admin_option: g.admin_option,
+          inherit_option: g.inherit_option,
+          set_option: g.set_option,
+          rolsuper: granted.rolsuper,
+        };
+      });
+    }
+
+    const roles: PgRole[] = [
+      {
+        oid: 10,
+        rolname: 'oracle_app',
+        rolsuper: false,
+        rolcreatedb: false,
+        rolcreaterole: false,
+        rolbypassrls: false,
+        rolreplication: false,
+      },
+      {
+        oid: 20,
+        rolname: 'oracle_migrator',
+        rolsuper: false,
+        rolcreatedb: false,
+        rolcreaterole: false,
+        rolbypassrls: false,
+        rolreplication: false,
+      },
+      {
+        oid: 30,
+        rolname: 'ops_intermediate',
+        rolsuper: false,
+        rolcreatedb: false,
+        rolcreaterole: false,
+        rolbypassrls: false,
+        rolreplication: false,
+      },
+    ];
+
+    // Scenario A: Even if direct oracle_app -> oracle_migrator is absent, a transitive
+    // membership oracle_app -> ops_intermediate -> oracle_migrator is caught by the audit query
+    const transitiveMemberships: PgAuthMember[] = [
+      {
+        member: 10,
+        roleid: 30,
+        admin_option: false,
+        inherit_option: false,
+        set_option: true,
+      },
+      {
+        member: 30,
+        roleid: 20,
+        admin_option: false,
+        inherit_option: true,
+        set_option: true,
+      },
+    ];
+    const auditFailures = runRecursiveRoleAudit(roles, transitiveMemberships);
+    expect(auditFailures).toEqual([
+      {
+        runtime_role: 'oracle_app',
+        reachable_role: 'ops_intermediate',
+        depth: 1,
+        admin_option: false,
+        inherit_option: false,
+        set_option: true,
+        rolsuper: false,
+      },
+      {
+        runtime_role: 'oracle_app',
+        reachable_role: 'oracle_migrator',
+        depth: 2,
+        admin_option: false,
+        inherit_option: true,
+        set_option: true,
+        rolsuper: false,
+      },
+    ]);
+
+    // Scenario B: Compliant deployment where oracle_app has zero direct or transitive memberships
+    expect(runRecursiveRoleAudit(roles, [])).toEqual([]);
+  });
 });
 
 

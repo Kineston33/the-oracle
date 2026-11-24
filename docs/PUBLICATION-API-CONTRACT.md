@@ -1,10 +1,10 @@
-# THE ORACLE — Publication API & Storage Contract (v1.6)
+# THE ORACLE — Publication API & Storage Contract (v1.7)
 
-This document specifies the storage invariants, transaction boundaries, isolation-level
-requirements, `TRUNCATE` and privilege hardening, controlled `SECURITY DEFINER` database write
-boundary, and read/write separation required to back **Official Publication Protocol v1.6**
-(`src/data/publication-types.ts` and `src/data/publication.ts`) with a persistent PostgreSQL
-database and HTTP service.
+This document specifies the storage invariants, transaction boundaries, `READ COMMITTED`
+isolation-level enforcement, `TRUNCATE` and privilege hardening, controlled `SECURITY DEFINER`
+database write boundary, indirect role-membership auditing, and read/write separation required
+to back **Official Publication Protocol v1.7** (`src/data/publication-types.ts` and
+`src/data/publication.ts`) with a persistent PostgreSQL database and HTTP service.
 
 > **Status in this repository**: No HTTP server and no PostgreSQL database are shipped or
 > running in this repository/sandbox. `InMemoryRegistry` (`src/data/publication.ts`)
@@ -475,14 +475,36 @@ pass through three narrowly scoped `SECURITY DEFINER` PL/pgSQL functions owned b
 4. **Zero dynamic SQL (`EXECUTE`)**:
    None of the functions uses dynamic SQL (`EXECUTE <string>`); every statement is static,
    compile-time bound PL/pgSQL using typed parameters.
-5. **Up-front argument validation**:
+5. **Up-front argument validation (format and structural checks)**:
    Each function validates its parameters (non-null, non-empty strings, 64-character lowercase
-   hex SHA-256 digests, valid JSONB object shapes, timestamp ordering, and allowed `kind` /
-   `seq` values) before touching any table, raising SQLSTATE `22023` (`invalid_parameter_value`)
-   or `23514` (`check_violation`) on invalid input.
+   hex digest format `^[0-9a-f]{64}$`, valid JSONB object shapes, timestamp ordering, and
+   allowed `kind` / `seq` values) before touching any table, raising SQLSTATE `22023`
+   (`invalid_parameter_value`) or `23514` (`check_violation`) on invalid input.
+6. **Mandatory `READ COMMITTED` transaction isolation check before any table access (`ERRCODE = '25001'`)**:
+   Before reading or writing any table, `oracle_ledger.commit_official_publication` (and
+   `oracle_ledger.record_rejected_or_conflict_idempotency`) inspects
+   `pg_catalog.current_setting('transaction_isolation')` and requires it to equal
+   `'read committed'` exactly. If the active transaction was started under `'repeatable read'`,
+   `'serializable'`, or any other isolation level, the function immediately raises SQLSTATE
+   `25001` (`active_sql_transaction`) before performing any mutation. The function **never**
+   attempts to change transaction isolation from inside PL/pgSQL (`SET TRANSACTION ISOLATION LEVEL`
+   is not used); callers must invoke the function inside an explicit `READ COMMITTED`
+   transaction (`BEGIN ISOLATION LEVEL READ COMMITTED;`).
+7. **Digest format validation in SQL vs. cryptographic SHA-256 verification in the domain/client layer**:
+   The PostgreSQL PL/pgSQL functions validate **digest format** (`^[0-9a-f]{64}$` — 64-character
+   lowercase hexadecimal string) and **relational/referential equality** (such as
+   `p_prev_digest = e0.digest` and `request_digest` equality on idempotency replay), **not**
+   independent cryptographic SHA-256 recomputation over canonicalized JSON inside PostgreSQL
+   (no `pgcrypto` or external extension is used, and PostgreSQL's binary `JSONB` storage does
+   not preserve canonical JSON key ordering on its own). Actual canonical serialization and
+   SHA-256 cryptographic calculation/verification (`identityDigest`, `candidateContentDigest`,
+   `publicationRequestDigest`, `sealPredictionPayload`, `createPublishedEvent`,
+   `verifyRecordIntegrity`, `publishedLinkProblems`, `eventChainProblems`) are performed in the
+   TypeScript domain and archive/client verification layers.
 
 ```sql
 -- 1. Atomic publication entry point (Step 9 of publishCandidate)
+-- Callers MUST invoke this function inside a READ COMMITTED transaction.
 CREATE OR REPLACE FUNCTION oracle_ledger.commit_official_publication(
   p_idempotency_key TEXT,
   p_request_digest  CHAR(64),
@@ -501,6 +523,7 @@ SECURITY DEFINER
 SET search_path = pg_catalog, pg_temp
 AS $$
 DECLARE
+  v_isolation_level         TEXT;
   v_reserved_key            TEXT;
   v_existing_request_digest CHAR(64);
   v_existing_outcome        JSONB;
@@ -510,6 +533,17 @@ DECLARE
   v_outcome                 JSONB;
   v_status                  TEXT;
 BEGIN
+  -- Enforce active READ COMMITTED isolation before any table access or mutation.
+  -- Rejects repeatable read and serializable (which would freeze the transaction
+  -- snapshot and prevent post-conflict SELECTs from seeing concurrent commits).
+  v_isolation_level := pg_catalog.current_setting('transaction_isolation');
+  IF v_isolation_level IS DISTINCT FROM 'read committed' THEN
+    RAISE EXCEPTION
+      'commit_official_publication requires transaction_isolation = read committed, got: %',
+      v_isolation_level
+      USING ERRCODE = '25001';
+  END IF;
+
   IF p_idempotency_key IS NULL OR pg_catalog.length(pg_catalog.btrim(p_idempotency_key)) = 0 THEN
     RAISE EXCEPTION 'p_idempotency_key must be non-empty'
       USING ERRCODE = '22023';
@@ -520,12 +554,14 @@ BEGIN
       USING ERRCODE = '22023';
   END IF;
 
+  -- Format validation only (64-char lowercase hex); cryptographic SHA-256 computation
+  -- and verification over canonical JSON occur in the TypeScript domain/verification layer.
   IF p_request_digest IS NULL OR p_request_digest !~ '^[0-9a-f]{64}$'
      OR p_identity_digest IS NULL OR p_identity_digest !~ '^[0-9a-f]{64}$'
      OR p_payload_digest IS NULL OR p_payload_digest !~ '^[0-9a-f]{64}$'
      OR p_e0_digest IS NULL OR p_e0_digest !~ '^[0-9a-f]{64}$'
   THEN
-    RAISE EXCEPTION 'all digest arguments must be 64-character lowercase hex SHA-256 strings'
+    RAISE EXCEPTION 'all digest arguments must match 64-character lowercase hex format'
       USING ERRCODE = '22023';
   END IF;
 
@@ -679,6 +715,7 @@ END;
 $$;
 
 -- 2. Controlled idempotency recording for rejected or identity-conflict outcomes (Steps 6-7)
+-- Callers MUST invoke this function inside a READ COMMITTED transaction.
 CREATE OR REPLACE FUNCTION oracle_ledger.record_rejected_or_conflict_idempotency(
   p_idempotency_key TEXT,
   p_request_digest  CHAR(64),
@@ -691,17 +728,28 @@ SECURITY DEFINER
 SET search_path = pg_catalog, pg_temp
 AS $$
 DECLARE
+  v_isolation_level         TEXT;
   v_inserted_key            TEXT;
   v_existing_request_digest CHAR(64);
   v_existing_outcome        JSONB;
 BEGIN
+  v_isolation_level := pg_catalog.current_setting('transaction_isolation');
+  IF v_isolation_level IS DISTINCT FROM 'read committed' THEN
+    RAISE EXCEPTION
+      'record_rejected_or_conflict_idempotency requires transaction_isolation = read committed, got: %',
+      v_isolation_level
+      USING ERRCODE = '25001';
+  END IF;
+
   IF p_idempotency_key IS NULL OR pg_catalog.length(pg_catalog.btrim(p_idempotency_key)) = 0 THEN
     RAISE EXCEPTION 'p_idempotency_key must be non-empty'
       USING ERRCODE = '22023';
   END IF;
 
+  -- Format validation only (64-char lowercase hex); cryptographic SHA-256 computation
+  -- over canonical JSON occurs in the TypeScript domain layer.
   IF p_request_digest IS NULL OR p_request_digest !~ '^[0-9a-f]{64}$' THEN
-    RAISE EXCEPTION 'p_request_digest must be a 64-character lowercase hex SHA-256 string'
+    RAISE EXCEPTION 'p_request_digest must match 64-character lowercase hex format'
       USING ERRCODE = '22023';
   END IF;
 
@@ -815,10 +863,12 @@ BEGIN
       USING ERRCODE = '22023';
   END IF;
 
+  -- Format validation only (64-char lowercase hex); cryptographic SHA-256 computation
+  -- and verification over canonical JSON occur in the TypeScript domain/verification layer.
   IF p_digest IS NULL OR p_digest !~ '^[0-9a-f]{64}$'
      OR p_prev_digest IS NULL OR p_prev_digest !~ '^[0-9a-f]{64}$'
   THEN
-    RAISE EXCEPTION 'p_digest and p_prev_digest must be 64-character lowercase hex SHA-256 strings'
+    RAISE EXCEPTION 'p_digest and p_prev_digest must match 64-character lowercase hex format'
       USING ERRCODE = '22023';
   END IF;
 
@@ -925,8 +975,12 @@ $$;
 >   each subsequent `SELECT` statement inside `oracle_ledger.commit_official_publication`
 >   takes a fresh statement snapshot that sees all rows committed before that statement began.
 
-When steps 1–8 of `publishCandidate` succeed, step 9 invokes
-`oracle_ledger.commit_official_publication` inside one `READ COMMITTED` transaction:
+When steps 1–8 of `publishCandidate` succeed, step 9 must invoke
+`oracle_ledger.commit_official_publication` inside an explicit `READ COMMITTED` transaction.
+The function inspects `pg_catalog.current_setting('transaction_isolation')` before any table
+access and raises SQLSTATE `25001` (`active_sql_transaction`) if the active transaction
+isolation level is `'repeatable read'`, `'serializable'`, or anything other than
+`'read committed'`. It never attempts to change transaction isolation from inside the function:
 
 ```sql
 BEGIN ISOLATION LEVEL READ COMMITTED;
@@ -1167,22 +1221,112 @@ GRANT EXECUTE ON FUNCTION
 TO oracle_app;
 ```
 
-> **Honest boundary of database triggers, `SECURITY DEFINER` write functions, and role separation**:
+#### Auditing indirect role memberships and inherited privilege paths (`pg_catalog.pg_auth_members`)
+
+Executing `REVOKE oracle_migrator FROM oracle_app, PUBLIC;` only removes direct membership of
+`oracle_app` (and `PUBLIC`) in `oracle_migrator`. It does **not** by itself remove arbitrary
+pre-existing role memberships or prove that `oracle_app` has no indirect or transitive path to
+ownership, DDL, migration, or table-write capabilities (for example, through an intermediate
+group role granted `oracle_migrator`, through `SET ROLE` when `set_option` is enabled even on a
+`NOINHERIT` role, or through PostgreSQL predefined roles such as `pg_write_all_data`,
+`pg_read_all_data`, or `pg_database_owner`).
+
+Deployment verification must therefore inspect `pg_catalog.pg_auth_members` and
+`pg_catalog.pg_roles` recursively and verify **all four** conditions below before serving
+traffic:
+
+1. **Zero direct or transitive role memberships (`pg_catalog.pg_auth_members`)**:
+   The recursive catalog audit query below walks every direct and transitive role membership
+   reachable from `oracle_app` (including `inherit_option`, `set_option`, and `admin_option`,
+   as well as the privileged attributes of every reachable role) and **must return 0 rows**.
+2. **Unprivileged role attributes (`pg_catalog.pg_roles`)**:
+   `oracle_app` must have `rolsuper = false`, `rolinherit = false`, `rolcreaterole = false`,
+   `rolcreatedb = false`, `rolbypassrls = false`, and `rolreplication = false`.
+3. **Zero owned database objects**:
+   `oracle_app` must own **0** schemas (`pg_catalog.pg_namespace`), relations/tables
+   (`pg_catalog.pg_class`), or functions/procedures (`pg_catalog.pg_proc`).
+4. **Effective privilege verification**:
+   `oracle_app` must hold only `SELECT` on the three ledger tables and `EXECUTE` only on the
+   three approved `SECURITY DEFINER` write functions.
+
+```sql
+-- Deployment audit query: recursively inspect all direct and transitive role
+-- memberships and role attributes reachable from oracle_app.
+-- A compliant deployment MUST return 0 rows from this query.
+WITH RECURSIVE role_membership_graph AS (
+  SELECT
+    m.member AS base_role_oid,
+    m.roleid AS granted_role_oid,
+    m.admin_option,
+    m.inherit_option,
+    m.set_option,
+    1 AS depth,
+    ARRAY[m.member, m.roleid] AS oid_path
+  FROM pg_catalog.pg_auth_members AS m
+  JOIN pg_catalog.pg_roles AS r_member
+    ON r_member.oid = m.member
+  WHERE r_member.rolname = 'oracle_app'
+
+  UNION ALL
+
+  SELECT
+    g.base_role_oid,
+    m.roleid AS granted_role_oid,
+    m.admin_option,
+    m.inherit_option,
+    m.set_option,
+    g.depth + 1 AS depth,
+    g.oid_path || m.roleid
+  FROM role_membership_graph AS g
+  JOIN pg_catalog.pg_auth_members AS m
+    ON m.member = g.granted_role_oid
+  WHERE NOT (m.roleid = ANY (g.oid_path))
+)
+SELECT
+  r_base.rolname AS runtime_role,
+  r_granted.rolname AS reachable_role,
+  g.depth,
+  g.admin_option,
+  g.inherit_option,
+  g.set_option,
+  r_granted.rolsuper,
+  r_granted.rolcreatedb,
+  r_granted.rolcreaterole,
+  r_granted.rolbypassrls,
+  r_granted.rolreplication
+FROM role_membership_graph AS g
+JOIN pg_catalog.pg_roles AS r_base
+  ON r_base.oid = g.base_role_oid
+JOIN pg_catalog.pg_roles AS r_granted
+  ON r_granted.oid = g.granted_role_oid;
+```
+
+> **Honest boundary of database triggers, `SECURITY DEFINER` write functions, digest checks, and role separation**:
 >
 > 1. **What this boundary prevents**: Because `oracle_app` has no direct `INSERT`, `UPDATE`,
->    `DELETE`, or `TRUNCATE` privileges on any ledger table, the application runtime cannot
->    insert finalized idempotency rows directly, cannot insert predictions without a
->    matching `e0` event and finalized idempotency row, cannot insert `e0` events outside
->    publication or duplicate/unlinked `e1` events, and cannot mutate, delete, or truncate
->    existing ledger rows.
+>    `DELETE`, or `TRUNCATE` privileges on any ledger table and no direct or transitive role
+>    memberships, the application runtime cannot insert finalized idempotency rows directly,
+>    cannot insert predictions without a matching `e0` event and finalized idempotency row,
+>    cannot insert `e0` events outside publication or duplicate/unlinked `e1` events, cannot
+>    invoke publication under `REPEATABLE READ` or `SERIALIZABLE` isolation (`ERRCODE = '25001'`),
+>    and cannot mutate, delete, or truncate existing ledger rows.
 > 2. **What this boundary does not prevent**:
->    - It does **not** protect against a compromised PostgreSQL superuser or a caller who
->      obtains DDL control over the migration owner (`oracle_migrator`) and disables triggers,
->      alters functions, or rewrites tables directly.
->    - Because the HTTP application service constructs and signs/hashes candidate payloads
->      before calling `oracle_ledger.commit_official_publication`, a compromised application
->      runtime with `EXECUTE` on the three approved functions can still submit well-formed
->      new publications or resolve existing open predictions using structurally valid inputs
+>    - **Database superuser or migration-owner (`oracle_migrator`) compromise**: It does
+>      **not** protect against a compromised PostgreSQL superuser or a caller who obtains DDL
+>      control over the migration owner (`oracle_migrator`) and disables triggers, alters
+>      functions, or rewrites tables directly.
+>    - **Format-only digest validation in SQL vs. cryptographic SHA-256 in TypeScript**: The
+>      PL/pgSQL functions validate that digest arguments match the 64-character lowercase hex
+>      format (`^[0-9a-f]{64}$`) and enforce relational equality (`p_prev_digest = e0.digest`
+>      and `request_digest` matching), but do **not** independently recompute SHA-256 over the
+>      canonicalized `p_sealed_payload` or `p_e0_envelope` / `p_envelope` inside PostgreSQL.
+>      Cryptographic SHA-256 computation and verification occur in the TypeScript domain and
+>      client/archive verification layers.
+>    - **Compromised application submitting new structurally valid publications/resolutions**:
+>      Because the HTTP application service constructs and hashes candidate payloads before
+>      calling `oracle_ledger.commit_official_publication`, a compromised application runtime
+>      with `EXECUTE` on the three approved functions can still submit well-formed new
+>      publications or resolve existing open predictions using structurally valid inputs
 >      (though it cannot rewrite, delete, or truncate previously committed predictions,
 >      events, or idempotency keys, nor forge a `'created'` idempotency row without a
 >      committed prediction). Detecting privileged storage rewrites or equivocation requires
