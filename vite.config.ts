@@ -20,6 +20,12 @@ export default defineConfig(({ isSsrBuild }) => ({
     // The preview proxy serves the app from a dynamic *.e2b.app host,
     // so Vite must not reject requests whose Origin does not match.
     allowedHosts: true,
+    proxy: {
+      '/v1': {
+        target: `http://127.0.0.1:${process.env.PORT ?? 3001}`,
+        changeOrigin: true,
+      },
+    },
   },
   preview: {
     host: '0.0.0.0',

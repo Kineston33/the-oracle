@@ -1,3 +1,4 @@
+import { useEffect, useState } from 'react';
 import { Link, useParams } from 'react-router-dom';
 import {
   ArrowLeft,
@@ -12,6 +13,11 @@ import { adjacentRecords, CATEGORY_LABELS, findRecord } from '@/data/records';
 import { deriveLifecycle } from '@/data/lifecycle';
 import type { EvidenceKind, PredictionRecord } from '@/data/types';
 import {
+  fetchPredictionDetail,
+  fetchPredictionEventsVerification,
+  type PredictionEventsApiResponse,
+} from '@/lib/api-client';
+import {
   formatDate,
   formatDateLong,
   formatDateTime,
@@ -19,6 +25,7 @@ import {
   formatPercent,
   relativeDays,
 } from '@/lib/format';
+import { shortDigest } from '@/lib/integrity';
 import { Badge, DemoBadge, StatusBadge, STATUS_LABELS } from '@/components/ui/Badge';
 import { Callout } from '@/components/ui/Callout';
 import { ProbabilityDisplay } from '@/components/ui/ProbabilityDisplay';
@@ -65,9 +72,55 @@ function RecordNotFound({ id }: { id?: string }) {
 
 export function PredictionRecordPage() {
   const { id } = useParams<{ id: string }>();
-  const record = id ? findRecord(id) : undefined;
+  const localRecord = id ? findRecord(id) : undefined;
+  const [remoteRecord, setRemoteRecord] = useState<PredictionRecord | null>(null);
+  const [loadingRemote, setLoadingRemote] = useState<boolean>(() => Boolean(id && !localRecord));
 
-  if (!record) return <RecordNotFound id={id} />;
+  useEffect(() => {
+    let cancelled = false;
+    if (!id) {
+      setRemoteRecord(null);
+      setLoadingRemote(false);
+      return;
+    }
+    if (localRecord) {
+      fetchPredictionDetail(id, { includeDemo: true })
+        .then((res) => {
+          if (!cancelled && res?.source === 'ledger-api' && res.prediction) {
+            setRemoteRecord(res.prediction);
+          }
+        })
+        .catch(() => {
+          // Keep localRecord
+        });
+      return () => {
+        cancelled = true;
+      };
+    }
+    setLoadingRemote(true);
+    fetchPredictionDetail(id, { includeDemo: true })
+      .then((res) => {
+        if (cancelled) return;
+        if (res?.prediction) {
+          setRemoteRecord(res.prediction);
+        }
+        setLoadingRemote(false);
+      })
+      .catch(() => {
+        if (!cancelled) setLoadingRemote(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [id, localRecord]);
+
+  const record = remoteRecord ?? localRecord;
+  if (!record) {
+    if (loadingRemote) {
+      return null;
+    }
+    return <RecordNotFound id={id} />;
+  }
 
   return <RecordView record={record} />;
 }
@@ -76,6 +129,25 @@ function RecordView({ record }: { record: PredictionRecord }) {
   const { previous, next } = adjacentRecords(record.id);
   const { status, resolution } = deriveLifecycle(record);
   const isResolved = status === 'resolved' && resolution !== undefined;
+  const [serverEvents, setServerEvents] = useState<PredictionEventsApiResponse | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    fetchPredictionEventsVerification(record.id, { includeDemo: record.demo })
+      .then((res) => {
+        if (!cancelled && res) {
+          setServerEvents(res);
+        }
+      })
+      .catch(() => {
+        // Keep local record.events
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [record.id, record.demo]);
+
+  const eventsToDisplay = serverEvents?.events ?? record.events;
 
   return (
     <article className={styles.page} aria-labelledby="record-title">
@@ -375,19 +447,79 @@ function RecordView({ record }: { record: PredictionRecord }) {
                 <dt>Revision</dt>
                 <dd className="mono">{record.integrity.revision}</dd>
               </div>
-              <div>
-                <dt>Data classification</dt>
-                <dd>{record.demo ? 'Illustrative (demo)' : 'Official'}</dd>
-              </div>
+              {
+                <div>
+                  <dt>Data classification</dt>
+                  <dd>{record.demo ? 'Illustrative (demo)' : 'Official'}</dd>
+                </div>
+              }
+              {serverEvents ? (
+                <div>
+                  <dt>Ledger API verification</dt>
+                  <dd className="mono">
+                    {serverEvents.verification.valid ? 'valid=true' : 'valid=false'} ({eventsToDisplay.length} event{eventsToDisplay.length === 1 ? '' : 's'})
+                  </dd>
+                </div>
+              ) : null}
             </dl>
             <p className={styles.provenanceNote}>
-              Immutability here means append-only semantics in this repository plus a
-              verifiable digest. There is no server, database, or public ledger yet,
-              so a determined editor with repository access could rewrite history and
-              re-seal it. Public anchoring is the missing layer.
+              {record.demo
+                ? 'Immutability here means append-only semantics in this repository plus a verifiable digest. Public third-party timestamp anchoring is not yet enabled.'
+                : 'This official prediction is sealed in the append-only PostgreSQL 16 oracle_ledger schema. Its published payload and probability are immutable; terminal resolutions are recorded exclusively as separate hash-linked events.'}
             </p>
           </section>
         </div>
+
+        {/* --- Append-Only Event Chain History --- */}
+        <section className={styles.block} aria-labelledby="event-history-title">
+          <h2 id="event-history-title" className={styles.blockTitle}>
+            Append-only event log
+          </h2>
+          <p className={styles.blockIntro}>
+            Every state transition is recorded as an immutable event in the hash-linked
+            chain. Terminal resolutions and annulments append a new event referencing the
+            publication event digest without modifying the original forecast.
+          </p>
+          <ol className={styles.evidenceList}>
+            {eventsToDisplay.map((ev) => (
+              <li key={ev.seq} className={styles.evidence}>
+                <div className={styles.evidenceIndex} aria-hidden="true">
+                  {ev.seq}
+                </div>
+                <div className={styles.evidenceBody}>
+                  <div className={styles.evidenceTop}>
+                    <Badge tone={ev.kind === 'published' ? 'gold' : 'violet'} mono>
+                      {ev.kind}
+                    </Badge>
+                    <span className={`${styles.evidenceId} mono`}>{ev.seq}</span>
+                  </div>
+                  <p className={styles.evidenceMeta}>
+                    Occurred{' '}
+                    <time dateTime={isoAttribute(ev.occurredAt)}>
+                      {formatDateTime(ev.occurredAt)}
+                    </time>{' '}
+                    · Recorded{' '}
+                    <time dateTime={isoAttribute(ev.recordedAt)}>
+                      {formatDateTime(ev.recordedAt)}
+                    </time>{' '}
+                    · Origin: <code className="mono">{ev.origin}</code>
+                  </p>
+                  <p className={styles.evidenceNote}>
+                    Event digest: <code className="mono">{shortDigest(ev.digest, 16, 12)}</code>
+                    {ev.prevDigest ? (
+                      <>
+                        {' '}
+                        · Prev digest: <code className="mono">{shortDigest(ev.prevDigest, 16, 12)}</code>
+                      </>
+                    ) : (
+                      ' · Genesis event (prevDigest: null)'
+                    )}
+                  </p>
+                </div>
+              </li>
+            ))}
+          </ol>
+        </section>
 
         {/* --- Adjacent records --- */}
         <nav className={styles.pager} aria-label="Adjacent records">

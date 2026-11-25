@@ -9,13 +9,13 @@
  * output is designed to be inspectable by the person who typed the question.
  */
 
-import { predictionRecords } from '@/data/records';
+import { predictionRecords } from '../data/records.ts';
 import type {
   PredictionCategory,
   PredictionRecord,
   QuestionReading,
   SuggestedQuestion,
-} from '@/data/types';
+} from '../data/types.ts';
 
 const STOPWORDS = new Set([
   'a', 'an', 'the', 'and', 'or', 'but', 'if', 'then', 'than', 'that', 'this', 'these', 'those',

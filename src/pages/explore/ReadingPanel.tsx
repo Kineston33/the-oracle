@@ -1,4 +1,4 @@
-import { useMemo } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import { Link } from 'react-router-dom';
 import {
   ArrowUpRight,
@@ -7,11 +7,16 @@ import {
   CircleAlert,
   Compass,
   FileText,
+  Fingerprint,
   ScanLine,
+  ShieldAlert,
   TriangleAlert,
 } from 'lucide-react';
 import type { QuestionReading } from '@/data/types';
+import type { CanonicalQuestionResolution } from '@/data/question-resolver';
 import { CATEGORY_LABELS } from '@/data/records';
+import { fetchCanonicalQuestionResolution } from '@/lib/api-client';
+import { shortDigest } from '@/lib/integrity';
 import { draftCanonicalQuestion, considerationEntries } from '@/lib/question';
 import { formatPercent } from '@/lib/format';
 import { Badge, DemoBadge } from '@/components/ui/Badge';
@@ -41,6 +46,24 @@ export function ReadingPanel({ reading, onSave, saved, onReset }: ReadingPanelPr
     () => considerationEntries(reading.raw, reading.horizonYear),
     [reading],
   );
+  const [canonicalResolution, setCanonicalResolution] =
+    useState<CanonicalQuestionResolution | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    fetchCanonicalQuestionResolution(reading.raw)
+      .then((res) => {
+        if (!cancelled) {
+          setCanonicalResolution(res);
+        }
+      })
+      .catch(() => {
+        // Keep null if unavailable
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [reading.raw]);
 
   return (
     <section className={styles.panel} aria-labelledby="reading-heading">
@@ -135,6 +158,79 @@ export function ReadingPanel({ reading, onSave, saved, onReset }: ReadingPanelPr
           </p>
         </div>
       </section>
+
+      {/* --- Centralized Canonical Proposition Identity & Abstention Gate --- */}
+      {canonicalResolution ? (
+        <section className={styles.section} aria-labelledby="canonical-identity-title">
+          <div className={styles.sectionHead}>
+            <h3 id="canonical-identity-title" className={styles.sectionTitle}>
+              <Fingerprint size={14} aria-hidden="true" />
+              Canonical proposition identity &amp; abstention gate
+            </h3>
+            <span className={styles.sectionHint}>
+              {canonicalResolution.identityComplete
+                ? '7/7 components resolved'
+                : `${7 - canonicalResolution.unresolvedComponents.length}/7 components resolved`}
+            </span>
+          </div>
+
+          <div className={styles.draft}>
+            <p className={styles.draftNote}>
+              <strong>Identity digest (<code>oracle.identity/1</code>):</strong>{' '}
+              <code className="mono" title={canonicalResolution.identityDigest}>
+                {shortDigest(canonicalResolution.identityDigest, 18, 12)}
+              </code>{' '}
+              ·{' '}
+              <strong>Autonomous gate verdict:</strong>{' '}
+              <Badge
+                tone={
+                  canonicalResolution.autonomousDecision === 'deduplicated-official'
+                    ? 'violet'
+                    : canonicalResolution.autonomousDecision === 'eligible-for-publication'
+                      ? 'gold'
+                      : 'neutral'
+                }
+                mono
+              >
+                {canonicalResolution.autonomousDecision === 'deduplicated-official'
+                  ? 'DEDUPLICATED TO EXISTING OFFICIAL RECORD'
+                  : 'ABSTAIN — INSUFFICIENT SPECIFICATION / EVIDENCE'}
+              </Badge>
+            </p>
+
+            {canonicalResolution.existingOfficialRecord ? (
+              <Callout tone="integrity" title="Single official prediction already on the record">
+                Equivalent phrasings resolve to one canonical identity. Official record{' '}
+                <Link to={`/predictions/${canonicalResolution.existingOfficialRecord.id}`}>
+                  <code className="mono">{canonicalResolution.existingOfficialRecord.id}</code>
+                </Link>{' '}
+                already occupies this proposition slot.
+              </Callout>
+            ) : null}
+
+            {canonicalResolution.unresolvedComponents.length > 0 ? (
+              <p className={styles.draftNote}>
+                <ShieldAlert size={13} aria-hidden="true" />{' '}
+                <strong>Unresolved identity components:</strong>{' '}
+                <code className="mono">
+                  {canonicalResolution.unresolvedComponents.join(', ')}
+                </code>
+                . THE ORACLE abstains whenever any of the seven proposition components
+                cannot be bound without guessing.
+              </p>
+            ) : (
+              <p className={styles.draftNote}>
+                All seven proposition identity components (<code>subject</code>,{' '}
+                <code>event</code>, <code>condition</code>, <code>geographicScope</code>,{' '}
+                <code>horizon</code>, <code>resolutionDate</code>,{' '}
+                <code>decidingAuthority</code>) resolved deterministically. Publication still
+                abstains until a verified primary evidence bundle and calibrated
+                rationale are supplied on the server.
+              </p>
+            )}
+          </div>
+        </section>
+      ) : null}
 
       {/* --- Considerations --- */}
       <section className={styles.section} aria-labelledby="considerations-title">

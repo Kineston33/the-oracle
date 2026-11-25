@@ -9,7 +9,7 @@
 
 import { spawn } from 'node:child_process';
 import { EventEmitter } from 'node:events';
-import { readFileSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import pg from 'pg';
@@ -3247,6 +3247,259 @@ describe('Real PostgreSQL 16+ Integration Suite — Official Publication Protoco
       } else {
         process.env.NEON_API_KEY = savedApiKey;
       }
+    }
+  });
+
+  it('19. serves unified SPA + /v1 API, resolves canonical questions with abstention and deduplication, and supports token-authenticated official publication and append-only resolution events', async () => {
+    const pubToken = 'OracleTrustedPubToken_2026_HighEntropy_99!';
+    const distDir = resolve(process.cwd(), 'dist');
+
+    const running = await startOracleServer({
+      databaseUrl: cluster.appConnectionString,
+      port: 0,
+      host: '127.0.0.1',
+      publicationToken: pubToken,
+      staticDir: existsSync(resolve(distDir, 'index.html')) ? distDir : null,
+    });
+
+    const baseUrl = `http://127.0.0.1:${running.port}`;
+
+    try {
+      // 1. GET /v1/health
+      const healthRes = await fetch(`${baseUrl}/v1/health`);
+      expect(healthRes.status).toBe(200);
+      expect(healthRes.headers.get('access-control-allow-origin')).toBe('*');
+      const healthBody = (await healthRes.json()) as {
+        status: string;
+        service: string;
+        protocolVersion: string;
+        runtimeRole: string;
+      };
+      expect(healthBody.status).toBe('ok');
+      expect(healthBody.service).toBe('the-oracle');
+      expect(healthBody.protocolVersion).toBe('1.10');
+      expect(healthBody.runtimeRole).toBe('oracle_app');
+
+      // 2. Centralized canonical question resolution & abstention on vague or uncalibrated questions
+      const vagueRes = await fetch(
+        `${baseUrl}/v1/questions/resolve?q=${encodeURIComponent('Will AI change the economy soon?')}`,
+      );
+      expect(vagueRes.status).toBe(200);
+      const vagueBody = (await vagueRes.json()) as {
+        identityComplete: boolean;
+        autonomousDecision: string;
+        unresolvedComponents: string[];
+        abstentionReasons: string[];
+      };
+      expect(vagueBody.identityComplete).toBe(false);
+      expect(vagueBody.autonomousDecision).toBe('abstain');
+      expect(vagueBody.unresolvedComponents.length).toBeGreaterThan(0);
+
+      // Equivalent phrasings resolve to the exact same canonical identityDigest
+      const eq1Res = await fetch(
+        `${baseUrl}/v1/questions/resolve?q=${encodeURIComponent('Will global battery storage exceed 1,200 GW in 2028 according to the IEA?')}`,
+      );
+      const eq2Res = await fetch(`${baseUrl}/v1/questions/resolve`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          question:
+            'According to the International Energy Agency, will worldwide grid battery storage pass 1200 gigawatts by 2028?',
+        }),
+      });
+      expect(eq1Res.status).toBe(200);
+      expect(eq2Res.status).toBe(200);
+      const eq1Body = (await eq1Res.json()) as {
+        identityComplete: boolean;
+        identityDigest: string;
+        identity: unknown;
+      };
+      const eq2Body = (await eq2Res.json()) as {
+        identityComplete: boolean;
+        identityDigest: string;
+        identity: unknown;
+      };
+      expect(eq1Body.identityComplete).toBe(true);
+      expect(eq2Body.identityComplete).toBe(true);
+      expect(eq1Body.identityDigest).toBe(eq2Body.identityDigest);
+      expect(eq1Body.identity).toEqual(eq2Body.identity);
+
+      // 3. Unauthenticated or wrong-token write attempts still fail closed with 403 trusted_server_only
+      const unauthPub = await fetch(`${baseUrl}/v1/publications`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({}),
+      });
+      expect(unauthPub.status).toBe(403);
+
+      const wrongTokenPub = await fetch(`${baseUrl}/v1/publications`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: 'Bearer wrong-token-value-1234567890',
+        },
+        body: JSON.stringify({}),
+      });
+      expect(wrongTokenPub.status).toBe(403);
+
+      // 4. Authenticated POST /v1/publications abstains (422) when candidate is missing evidence or probability
+      const baseCandidate = buildDraftCandidate('api-e2e-1', {
+        condition: { namespace: 'threshold', id: 'below-18-percent-api-test' },
+      });
+      const incompleteCandidate = {
+        ...baseCandidate,
+        probability: null,
+        evidence: [],
+      };
+      const abstainedPub = await fetch(`${baseUrl}/v1/publications`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${pubToken}`,
+        },
+        body: JSON.stringify({
+          candidate: incompleteCandidate,
+          idempotencyKey: 'idem-abstain-api-001',
+          publishedAt: '2026-05-01T10:00:00.000Z',
+          recordedAt: '2026-05-01T10:00:01.000Z',
+        }),
+      });
+      expect(abstainedPub.status).toBe(422);
+      const abstainedBody = (await abstainedPub.json()) as {
+        status: string;
+        error: string;
+        abstentionReasons: string[];
+      };
+      expect(abstainedBody.status).toBe('abstained');
+      expect(abstainedBody.error).toBe('publication_abstained');
+      expect(abstainedBody.abstentionReasons.join(' ')).toMatch(
+        /probability-in-range|recorded-evidence/,
+      );
+
+      // 5. Authenticated POST /v1/publications commits a valid official prediction (201 Created)
+      const validPubRes = await fetch(`${baseUrl}/v1/publications`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${pubToken}`,
+        },
+        body: JSON.stringify({
+          candidate: baseCandidate,
+          idempotencyKey: 'idem-valid-api-001',
+          publishedAt: '2026-11-10T10:00:00.000Z',
+          recordedAt: '2026-11-10T10:00:01.000Z',
+        }),
+      });
+      expect(validPubRes.status).toBe(201);
+      const validPubBody = (await validPubRes.json()) as {
+        status: string;
+        outcome: {
+          kind: string;
+          predictionId: string;
+          identityDigest: string;
+          record: { id: string; demo: boolean; probability: number };
+        };
+      };
+      expect(validPubBody.status).toBe('created');
+      expect(validPubBody.outcome.record.demo).toBe(false);
+      const createdId = validPubBody.outcome.predictionId;
+      const originalProbability = validPubBody.outcome.record.probability;
+
+      // 6. Submitting another candidate with the same canonical proposition identity deduplicates to 'existing' (200 OK)
+      const duplicateCandidate = {
+        ...baseCandidate,
+        candidateId: 'cand-api-e2e-duplicate',
+      };
+      const dupPubRes = await fetch(`${baseUrl}/v1/publications`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${pubToken}`,
+        },
+        body: JSON.stringify({
+          candidate: duplicateCandidate,
+          idempotencyKey: 'idem-dup-api-002',
+          publishedAt: '2026-11-11T10:00:00.000Z',
+          recordedAt: '2026-11-11T10:00:01.000Z',
+        }),
+      });
+      expect(dupPubRes.status).toBe(200);
+      const dupPubBody = (await dupPubRes.json()) as {
+        status: string;
+        outcome: { kind: string; predictionId: string };
+      };
+      expect(dupPubBody.status).toBe('existing');
+      expect(dupPubBody.outcome.predictionId).toBe(createdId);
+
+      // 7. Authenticated POST /v1/predictions/:id/events appends a separate terminal resolution event
+      //    while keeping the published prediction and its original probability immutable
+      const resolveEventRes = await fetch(
+        `${baseUrl}/v1/predictions/${encodeURIComponent(createdId)}/events`,
+        {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${pubToken}`,
+          },
+          body: JSON.stringify({
+            eventId: `ev-${createdId.toLowerCase()}-002`,
+            type: 'resolved',
+            occurredAt: '2029-01-15T12:00:00.000Z',
+            recordedAt: '2029-01-15T12:00:05.000Z',
+            outcome: 'yes',
+            basis: 'IEA Electricity Market Report 2029 confirmed cumulative grid storage exceeded 1,800 GW.',
+            note: 'Verified against primary IEA table 4.2.',
+            sourceUrls: ['https://example.org/iea-2029-storage'],
+          }),
+        },
+      );
+      expect(resolveEventRes.status).toBe(201);
+      const resolveEventBody = (await resolveEventRes.json()) as {
+        predictionId: string;
+        event: { seq: string; kind: string };
+        prediction: { probability: number; demo: boolean };
+        lifecycle: { status: string; resolution?: { outcome: string } };
+      };
+      expect(resolveEventBody.event.seq).toBe('e1');
+      expect(resolveEventBody.event.kind).toBe('resolved');
+      expect(resolveEventBody.prediction.probability).toBe(originalProbability);
+      expect(resolveEventBody.lifecycle.status).toBe('resolved');
+      expect(resolveEventBody.lifecycle.resolution?.outcome).toBe('yes');
+
+      // Second terminal event on the same prediction is rejected with 409
+      const secondResolveRes = await fetch(
+        `${baseUrl}/v1/predictions/${encodeURIComponent(createdId)}/events`,
+        {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${pubToken}`,
+          },
+          body: JSON.stringify({
+            eventId: `ev-${createdId.toLowerCase()}-003`,
+            type: 'resolved',
+            occurredAt: '2029-02-01T12:00:00.000Z',
+            recordedAt: '2029-02-01T12:00:05.000Z',
+            outcome: 'no',
+            basis: 'Attempted second resolution.',
+            note: 'Should fail.',
+          }),
+        },
+      );
+      expect(secondResolveRes.status).toBe(409);
+
+      // 8. If dist/index.html is built, verify unified static SPA serving on /, /predictions, /explore
+      if (existsSync(resolve(distDir, 'index.html'))) {
+        for (const spaRoute of ['/', '/predictions', '/explore', '/trends', '/about']) {
+          const spaRes = await fetch(`${baseUrl}${spaRoute}`);
+          expect(spaRes.status).toBe(200);
+          expect(spaRes.headers.get('content-type')).toContain('text/html');
+          const html = await spaRes.text();
+          expect(html).toContain('<div id="root">');
+        }
+      }
+    } finally {
+      await running.close();
     }
   });
 });

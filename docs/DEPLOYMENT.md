@@ -15,11 +15,9 @@ requirements:
    `src/server/migrations/audit_v1_10.sql`) implementing Official Publication
    Protocol v1.10 (`docs/PUBLICATION-API-CONTRACT.md`).
 
-> **Current deployment status**: The backend in `src/server/` is implemented and
-> verified against local and CI PostgreSQL 16 instances, and GitHub Actions is
-> configured to manage temporary Neon branches for pull requests. **However, the
-> Node.js backend server is not deployed to a production host, and Neon is not
-> yet connected to a live backend runtime.**
+> **Current deployment status**:
+> - **Neon Production PostgreSQL 16**: Migration `0001_oracle_ledger_v1_10.sql` has been applied to the Neon `production` branch (`wispy-cell-45340306`), with `oracle_ledger` tables, append-only triggers, `SECURITY DEFINER` RPCs, and restricted `oracle_app` runtime permissions verified.
+> - **Render Web Service (`npm run build` → `npm start`)**: Deployed and live with `DATABASE_URL` connected as `oracle_app`. When `dist/index.html` is built (`npm run build`), the Node.js server in `src/server/index.ts` serves both the `/v1/*` JSON API and the public React SPA (`dist/`) with client-side route fallback from a single free Render service (`$0/month`).
 
 ---
 
@@ -229,8 +227,11 @@ placeholder formats only:
 | Scope | Variable / Secret | Required? | Purpose & placeholder format |
 |---|---|---|---|
 | Backend runtime (`src/server/index.ts`) | `DATABASE_URL` | Required when running backend | PostgreSQL 16+ connection string for the restricted `oracle_app` runtime role, e.g. `postgresql://oracle_app:<password>@<host>/<dbname>?sslmode=require` |
-| Backend runtime (`src/server/index.ts`) | `PORT` | Optional (default `3001`) | TCP port for the Node.js HTTP read API server |
-| Backend runtime (`src/server/index.ts`) | `HOST` | Optional (default `0.0.0.0`) | Bind address for the Node.js HTTP read API server |
+| Backend runtime (`src/server/index.ts`) | `PORT` | Optional (default `3001`) | TCP port for the Node.js HTTP read API & static SPA server |
+| Backend runtime (`src/server/index.ts`) | `HOST` | Optional (default `0.0.0.0`) | Bind address for the Node.js HTTP read API & static SPA server |
+| Backend runtime (`src/server/index.ts`) | `ORACLE_PUBLICATION_TOKEN` | Optional (fail-closed if unset) | High-entropy bearer secret (>= 16 chars) authorizing trusted server-side calls to `POST /v1/publications` and `POST /v1/predictions/:id/events` |
+| Backend runtime (`src/server/index.ts`) | `ORACLE_CORS_ORIGIN` | Optional (default `*`) | Allowed `Access-Control-Allow-Origin` header value for `/v1/*` API responses |
+| Frontend build (`src/lib/api-client.ts`) | `VITE_ORACLE_API_URL` | Optional (default same-origin `""`) | Base URL of the backend API when the static SPA is hosted on a separate origin from the Node.js server |
 | One-off migration / audit (`src/server/migrate.ts`) | `MIGRATION_DATABASE_URL` *(caller-supplied)* | Required when applying DDL | Direct (non-`-pooler`) PostgreSQL 16+ admin/migration connection string used to run `runLedgerMigrations()` and `runLedgerSecurityAudit()` |
 | One-off migration / audit (`src/server/migrate.ts`) | `ORACLE_APP_PASSWORD` *(caller-supplied)* | Required for `npm run db:migrate` | Strong password (>= 60 bits of entropy: 12+ chars with uppercase, lowercase, digits, and symbols) assigned to the `oracle_app` login role and verified via live TCP login |
 | GitHub Actions CI (`.github/workflows/postgres-ci.yml`) | `TEST_DATABASE_ADMIN_URL` | Set by CI workflow | Ephemeral connection string pointing to the per-run `postgres:16` Docker service container in GitHub Actions |

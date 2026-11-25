@@ -1,4 +1,4 @@
-import { useMemo, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import { useSearchParams } from 'react-router-dom';
 import { Database, SlidersHorizontal } from 'lucide-react';
 import {
@@ -10,7 +10,8 @@ import {
   sortByPublication,
   summarizeArchive,
 } from '@/data/records';
-import type { PredictionCategory } from '@/data/types';
+import type { PredictionCategory, PredictionRecord } from '@/data/types';
+import { fetchArchivePredictions } from '@/lib/api-client';
 import { formatInteger, formatPercent } from '@/lib/format';
 import { PageHeader } from '@/components/layout/PageHeader';
 import { SearchField } from '@/components/ui/Field';
@@ -44,20 +45,48 @@ export function Predictions() {
 
   const categoryParam = params.get('category');
   const statusParam = params.get('status');
+  const includeDemoParam = params.get('includeDemo');
   const [category, setCategory] = useState<PredictionCategory | 'all'>(
     isCategory(categoryParam) ? categoryParam : 'all',
   );
   const [status, setStatus] = useState<StatusFilter>(isStatus(statusParam) ? statusParam : 'all');
   const [query, setQuery] = useState(params.get('q') ?? '');
+  const [includeDemo, setIncludeDemo] = useState<boolean>(includeDemoParam !== 'false');
+  const [officialRecords, setOfficialRecords] = useState<PredictionRecord[]>([]);
+  const [ledgerConnected, setLedgerConnected] = useState<boolean>(false);
 
-  const summary = useMemo(() => summarizeArchive(predictionRecords), []);
+  useEffect(() => {
+    let cancelled = false;
+    fetchArchivePredictions({ includeDemo: false })
+      .then((res) => {
+        if (cancelled || res.source === 'local-fallback') return;
+        setOfficialRecords(res.predictions.filter((r) => !r.demo));
+        setLedgerConnected(true);
+      })
+      .catch(() => {
+        // Keep local fallback state
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  const poolRecords = useMemo(
+    () => (includeDemo ? [...officialRecords, ...predictionRecords] : officialRecords),
+    [includeDemo, officialRecords],
+  );
+
+  const summary = useMemo(() => summarizeArchive(poolRecords), [poolRecords]);
   const records = useMemo(
-    () => sortByPublication(filterRecords(predictionRecords, { category, status, query })),
-    [category, status, query],
+    () => sortByPublication(filterRecords(poolRecords, { category, status, query })),
+    [poolRecords, category, status, query],
   );
 
   const activeFilters =
-    (category !== 'all' ? 1 : 0) + (status !== 'all' ? 1 : 0) + (query.trim() ? 1 : 0);
+    (category !== 'all' ? 1 : 0) +
+    (status !== 'all' ? 1 : 0) +
+    (query.trim() ? 1 : 0) +
+    (!includeDemo ? 1 : 0);
 
   const syncParam = (key: string, value: string) => {
     const next = new URLSearchParams(params);
@@ -81,10 +110,19 @@ export function Predictions() {
     syncParam('q', value);
   };
 
+  const onIncludeDemoChange = (nextIncludeDemo: boolean) => {
+    setIncludeDemo(nextIncludeDemo);
+    const next = new URLSearchParams(params);
+    if (nextIncludeDemo) next.delete('includeDemo');
+    else next.set('includeDemo', 'false');
+    setParams(next, { replace: true });
+  };
+
   const reset = () => {
     setCategory('all');
     setStatus('all');
     setQuery('');
+    setIncludeDemo(true);
     setParams(new URLSearchParams(), { replace: true });
   };
 
@@ -176,6 +214,27 @@ export function Predictions() {
                   ))}
                 </select>
               </div>
+
+              <div className={styles.selectWrap}>
+                <label htmlFor="scope-filter" className={styles.selectLabel}>
+                  Ledger scope
+                </label>
+                <select
+                  id="scope-filter"
+                  className={styles.select}
+                  value={includeDemo ? 'all' : 'official'}
+                  onChange={(event) =>
+                    onIncludeDemoChange(event.target.value === 'all')
+                  }
+                >
+                  <option value="all">
+                    Official + Illustrative ({officialRecords.length} official · {predictionRecords.length} demo)
+                  </option>
+                  <option value="official">
+                    Official ledger only ({officialRecords.length} official)
+                  </option>
+                </select>
+              </div>
             </div>
 
             <fieldset className={styles.chips}>
@@ -193,10 +252,10 @@ export function Predictions() {
                   onClick={() => onCategory('all')}
                 >
                   All
-                  <span className={styles.chipCount}>{predictionRecords.length}</span>
+                  <span className={styles.chipCount}>{poolRecords.length}</span>
                 </button>
                 {CATEGORY_ORDER.map((item) => {
-                  const count = predictionRecords.filter((r) => r.category === item).length;
+                  const count = poolRecords.filter((r) => r.category === item).length;
                   if (count === 0) return null;
                   return (
                     <button
@@ -270,13 +329,15 @@ export function Predictions() {
             <p>
               <strong>How to read a record.</strong> The probability shown is the
               published figure and is never updated. Resolution status is tracked
-              separately, so a stale forecast stays visible next to its outcome. A
-              miss is not a bug.
+              separately as an append-only event, so a stale forecast stays visible
+              next to its outcome. A miss is not a bug.
             </p>
             <p>
-              <strong>What is not implemented.</strong> No server, no database, no
-              public transparency log, and no shared resolution mechanism. Records
-              live in this repository and are re-verified in your browser.
+              <strong>Official ledger vs. illustrative archive.</strong> Official
+              predictions (<code>demo: false</code>) are persisted in the append-only
+              PostgreSQL 16 <code>oracle_ledger</code> schema{ledgerConnected ? ' (live connection verified)' : ''} and
+              are strictly separated from the ten illustrative demo records (<code>demo: true</code>).
+              External third-party timestamp anchoring is not yet enabled.
             </p>
           </div>
         </div>

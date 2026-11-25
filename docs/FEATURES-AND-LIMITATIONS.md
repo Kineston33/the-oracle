@@ -116,41 +116,66 @@ accountable forecasting should not begin with an inflated account of itself.
 - Strict TypeScript and automated test suite across UI, integrity, canonical identity, and
   publication protocol rules; successful production build.
 
-### Official Publication Protocol v1.3 (domain layer)
+### Official Publication Protocol v1.10 & Phase 2A PostgreSQL 16+ Ledger (backend + connected UI)
 
-- **Three-tier separation and attested lifecycle (`src/data/publication-types.ts`, `src/data/publication.ts`)**:
-  explicit domain types separating `exploratory-query`, `CandidateProposition`, and official
-  `PredictionRecord` instances (`demo: false`), with `LIFECYCLE`, `TERMINAL_STAGES`
-  (`['rejected-candidate', 'resolved', 'annulled']`), and `PUBLISHABLE_STAGE`
-  (`'eligible-for-publication'`) exported as data, plus module-private `WeakMap` stage
-  attestations (`advanceCandidate`, `qualifyCandidate`, `isVerifiedEligibleCandidate`) so
-  manually forged `eligible-for-publication` candidates cannot publish.
-- **Structured proposition identity (`src/data/canonical-identity.ts`)**: seven-component
-  `PropositionIdentity` (`subject`, `event`, `condition`, `geographicScope`, `horizon`,
-  `resolutionDate`, `decidingAuthority`), Unicode-safe `normalizeTermValue`, explicit
-  `AliasTable` with self-inclusion and conflict checks, three-valued `compareIdentities`
-  (`distinct` → `uncertain` → `equivalent`, with no numeric similarity threshold), and
-  scheme-prefixed `identityDigest` (`oracle.identity/1\n`).
-- **Eleven-requirement candidate evaluation bound to `publishedAt` (`src/data/publication.ts`)**:
-  `evaluateCandidate(candidate, { publishedAt })` and `verdictIsComplete` checking all eleven
-  `EVALUATION_REQUIREMENTS` without silent defaults, including strict UTC calendar date
-  validation (`parseIsoDateTimeMs`, `isValidIsoDateTime`) that rejects impossible calendar
-  dates (`2026-02-29`, `2030-02-30`, `2030-04-31`), reversed horizons (`startsAt >= endsAt`),
-  expired horizons (`publishedAt >= horizon.endsAt`), resolution dates preceding
-  `horizon.endsAt` or disagreeing with `resolutionCriteria.resolveOn`, and post-publication
-  evidence (`evidence[i].publishedAt > publishedAt`).
-- **Honest clock contract, `candidateDigest` verification, official record validation, and nine-step publication gate (`publishCandidate`)**:
-  enforces candidate-to-request identity/ID binding (`candidate-mismatch`), cryptographic
-  `request.candidateDigest` verification against `candidateContentDigest(candidate, aliases)`
-  (`candidate-digest-mismatch`), stage check, injected clock validation (`invalid-clock` /
-  `InvalidClockError` requiring valid UTC `publishedAt` and `recordedAt` with
-  `recordedAt > publishedAt` and no `+1ms` fabrication), content-bound idempotency
-  (`publicationRequestDigest`, `replayed`, `idempotency-conflict`), identity self-check
-  (`identity-conflict`), evaluation gate at `publishedAt` (`rejected`), anti-forgery
-  lifecycle attestation (`wrong-stage` with `reason: 'forged-stage'`), and atomic
-  `commitPublication` producing a `demo: false` official `PredictionRecord` verified by
-  `validateOfficialRecord` / `validateOfficialArchive` while leaving `src/data/records.json`
-  and `src/data/validate.ts` untouched.
+- **PostgreSQL 16+ append-only ledger (`migrations/0001_oracle_ledger_v1_10.sql`, `src/server/postgres-registry.ts`)**:
+  - Dedicated `oracle_ledger` schema with `canonical_identities`, `official_predictions`,
+    `prediction_events`, and `publication_idempotency`.
+  - Strict two-role security model (`oracle_migrator` owner / `oracle_app` runtime):
+    `oracle_app` has `SELECT` on ledger tables and `EXECUTE` on two `SECURITY DEFINER`
+    stored procedures (`oracle_ledger.commit_publication` and `oracle_ledger.append_resolution_event`),
+    and zero direct `INSERT`/`UPDATE`/`DELETE`/`TRUNCATE` privileges.
+  - Database-enforced append-only immutability triggers (`forbid_ledger_mutation_trg` and
+    `forbid_ledger_truncate_trg`) that reject `UPDATE`, `DELETE`, and `TRUNCATE` even if
+    executed by the table owner.
+  - Live startup privilege and security audit (`runStartupSecurityAudit` / §2.5 Steps A–C)
+    before the HTTP server binds its listening socket.
+- **Unified HTTP API + React SPA server (`src/server/api.ts`, `src/server/index.ts`)**:
+  - Serves both the compiled React SPA (`dist/`, with SPA route fallback for `/`, `/explore`,
+    `/predictions`, `/predictions/:id`, `/trends`, `/about`) and the `/v1/*` JSON API from
+    a single Render Web Service ($0 additional hosting cost).
+  - `GET /v1/health` — service health check.
+  - `GET /v1/predictions` — lists official (`demo: false`) predictions from PostgreSQL by
+    default; includes illustrative (`demo: true`) records only when explicitly requested via
+    `?includeDemo=true`; supports `?identityDigest=<64-hex>` for canonical proposition lookup.
+  - `GET /v1/predictions/:id` — returns a single official prediction (`demo: false`) or an
+    illustrative record when `?includeDemo=true`.
+  - `GET /v1/predictions/:id/events` — returns the ordered append-only event chain (`e0`, `e1`)
+    together with live cryptographic verification (`verification.valid`, `verification.problems`).
+  - `GET /v1/questions/resolve?q=...` and `POST /v1/questions/resolve` — centralized canonical
+    question resolver (`resolveQuestionProposal` in `src/data/question-resolver.ts`) that bridges
+    free-text questions to structured 7-component `PropositionIdentity`, `DEFAULT_ALIAS_TABLE`,
+    `identityDigest`, 11-requirement abstention evaluation (`evaluateCandidate`), and
+    deduplication against both the PostgreSQL official ledger and the illustrative archive.
+  - Token-authenticated operator endpoints (`Authorization: Bearer <ORACLE_PUBLICATION_TOKEN>`,
+    verified via constant-time SHA-256 `timingSafeEqual`; fail-closed `403 trusted_server_only`
+    when `ORACLE_PUBLICATION_TOKEN` is unset or invalid):
+    - `POST /v1/publications` — evaluates a `CandidateProposition` against all 11 protocol
+      gates (abstaining with `422 Unprocessable Entity` on any ambiguity or missing evidence),
+      attaches lifecycle attestations, and commits atomically (or deduplicates) via
+      `publishCandidate` and `PostgresPublicationRegistry`.
+    - `POST /v1/predictions/:id/events` — appends a hash-linked terminal `resolved` or
+      `annulled` event (`e1`) via `oracle_ledger.append_resolution_event` while preserving
+      the immutable `sealed_payload` and original `probability`.
+- **Connected public interface (`src/lib/api-client.ts`, `src/pages/Predictions.tsx`, `src/pages/PredictionRecordPage.tsx`, `src/pages/explore/ReadingPanel.tsx`)**:
+  - Archive view (`Predictions.tsx`) queries `/v1/predictions` and provides a **Ledger scope**
+    toggle separating `Official ledger only` (`includeDemo=false`) from `Official + Illustrative`
+    (`includeDemo=true`), while displaying live official vs illustrative counts.
+  - Record detail page (`PredictionRecordPage.tsx`) loads official records from `/v1/predictions/:id`,
+    distinguishes `Official sealed record` (`demo: false`) from `Illustrative record` (`demo: true`),
+    and renders the **Append-only event chain (`e0` → `e1`)** verified by `/v1/predictions/:id/events`.
+  - Explore reading panel (`ReadingPanel.tsx`) displays the **Canonical proposition identity &
+    abstention gate** card (`identityDigest` when all 7 components resolve, resolved vs
+    unresolved components, and explicit abstention reasons when ambiguity or missing evidence
+    prevents publication).
+- **Safe migration & production protocol (`src/server/migrate.ts`, `src/server/provision-app-role.ts`)**:
+  - Enforces Official Production Migration Protocol v1.0 (requiring `MIGRATION_DATABASE_URL`
+    with `neondb_owner`, unpooled Neon host, Neon API branch identity verification, and
+    multi-factor CLI confirmation for production) and zero-SQL-interpolation role provisioning.
+- **Official Publication Protocol v1.3–v1.10 domain layer (`src/data/publication-types.ts`, `src/data/canonical-identity.ts`, `src/data/publication.ts`)**:
+  - Three-tier separation (`exploratory-query`, `CandidateProposition`, official `PredictionRecord`
+    with `demo: false`), `WeakMap` stage attestations, 7-component `PropositionIdentity`,
+    11-requirement `evaluateCandidate` gate, and 9-step `publishCandidate` workflow.
 
 ---
 
@@ -355,28 +380,26 @@ accountable forecasting should not begin with an inflated account of itself.
     can still produce this failure. If it appears in CI, run that file in isolation rather than
     raising the number again.
 
-### Official Publication Protocol v1.3 (domain layer)
+### Official Publication Protocol v1.10 & PostgreSQL Ledger
 
-37. **The publication protocol is a domain specification and reference implementation, not a
-    live server.** `src/data/publication-types.ts`, `src/data/canonical-identity.ts`, and
-    `src/data/publication.ts` define and test the attested lifecycle, canonical identity,
-    evaluation gate, domain-level sealed record construction (`buildSealedPredictionRecord`),
-    official record validator (`validateOfficialRecord` / `validateOfficialArchive`), and
-    `PublicationRegistry` contract in pure TypeScript. No HTTP API, worker process, or
-    persistent database exists in this repository; `docs/PUBLICATION-API-CONTRACT.md`
-    specifies the storage and transaction requirements a future backend must implement.
-38. **`InMemoryRegistry` is single-process and ephemeral; single-threaded tests do not prove
-    distributed atomicity.** `InMemoryRegistry.commitPublication` executes its idempotency
-    lookup/conflict check, canonical identity claim, sealed `PredictionRecord` storage, and
-    idempotency binding in a single synchronous critical section inside one JavaScript event
-    loop. That proves the domain contract and state-machine invariants in unit tests, but it
-    provides no crash durability and no multi-process or multi-node concurrency control.
-    Production uniqueness and atomic idempotency+publication commit depend on PostgreSQL
-    enforcing `PRIMARY KEY (idempotency_key)` (`INSERT ... ON CONFLICT (idempotency_key) DO NOTHING`),
-    a transaction-local `'{"kind":"__pending__"}'::jsonb` sentinel validated at `COMMIT` by a
+37. **The PostgreSQL 16+ ledger and HTTP API are implemented and verified, while autonomous
+    probability synthesis remains deliberately absent.** `src/server/postgres-registry.ts`,
+    `migrations/0001_oracle_ledger_v1_10.sql`, and `src/server/api.ts` implement the real
+    PostgreSQL 16+ append-only ledger (`oracle_ledger`), startup §2.5 security audits,
+    public read/verification endpoints, canonical question resolution (`GET/POST /v1/questions/resolve`),
+    and token-authenticated (`ORACLE_PUBLICATION_TOKEN`) operator publication and resolution
+    endpoints (`POST /v1/publications`, `POST /v1/predictions/:id/events`). However, the
+    system does **not** fabricate probabilities from free-text queries: without pre-publication
+    evidence, explicit falsifiability review, and a calibrated probability, the abstention
+    gate (`evaluateCandidate` / `resolveQuestionProposal`) refuses publication (`shouldAbstain: true`).
+38. **Production uniqueness and atomic idempotency+publication commit are enforced in
+    PostgreSQL.** `oracle_ledger.commit_publication` enforces `PRIMARY KEY (idempotency_key)`
+    (`INSERT ... ON CONFLICT (idempotency_key) DO NOTHING`), a transaction-local
+    `'{"kind":"__pending__"}'::jsonb` sentinel validated at `COMMIT` by a
     `DEFERRABLE INITIALLY DEFERRED` `CONSTRAINT TRIGGER`
     (`publication_idempotency_outcome_complete_trg`), and `UNIQUE (identity_digest)` inside a
-    single `READ COMMITTED` ACID transaction (`docs/PUBLICATION-API-CONTRACT.md` §2.1–§2.4).
+    single `READ COMMITTED` ACID transaction (`docs/PUBLICATION-API-CONTRACT.md` §2.1–§2.4),
+    verified across 19 real PostgreSQL 16+ integration tests (`src/server/postgres-integration.test.ts`).
 39. **Historical DEMO validation (`validateArchive`) and official publication validation
     (`validateOfficialRecord` / `validateOfficialArchive`) are intentionally separate.**
     Protected `src/data/validate.ts` (`validateArchive`) is the build-time gate for the 10
@@ -387,18 +410,19 @@ accountable forecasting should not begin with an inflated account of itself.
     `publishedLinkProblems`, `digestProblems`) while enforcing `demo === false`,
     `payloadScope === 'sealed-payload'`, `sealClaim === 'published-before-outcome'`,
     `anchored === false`, `publishedAt < horizon.endsAt`, and `evidence[i].publishedAt <= publishedAt`.
-40. **`AliasTable` is curated editorial data, not semantic inference.** `compareIdentities`
-    and `identityDigest` merge two different identifiers (`albiceleste` and `fifa-argentina`)
-    only when an explicit `AliasEntry` lists both under the same namespace. Nothing in
-    `src/data/canonical-identity.ts` parses free-text questions into `PropositionIdentity`
-    components or infers synonymy from prose.
+40. **`AliasTable` is curated editorial data, and `resolveQuestionProposal` only resolves
+    registered canonical components.** `src/data/question-resolver.ts` maps known entity,
+    event, condition, region, horizon, and deciding-authority aliases into structured
+    `PropositionIdentity` components using `DEFAULT_ALIAS_TABLE`. When any of the 7 required
+    components cannot be deterministically resolved from the query, `identityDigest` is `null`
+    and `abstention.shouldAbstain` is `true` — preventing ambiguous paraphrases from ever
+    entering the official ledger.
 41. **Falsifiability is a recorded review assertion, not an automated proof, and stage
-    attestation is in-memory (`WeakMap`).** Requirement `falsifiable-proposition` checks
-    that `candidate.inferences` contains a recorded `falsifiability-review` entry. Similarly,
-    `advanceCandidate` / `qualifyCandidate` track verified stage transitions in a
-    module-private `WeakMap`; across HTTP requests in a future backend, candidate stage
-    transitions must be persisted and verified by the server rather than trusted from client
-    JSON.
+    attestation is enforced server-side.** Requirement `falsifiable-proposition` checks
+    that `candidate.inferences` contains a recorded `falsifiability-review` entry. On
+    `POST /v1/publications`, the server evaluates all 11 protocol requirements via
+    `evaluateCandidate(candidate, { publishedAt })` before attaching `WeakMap` lifecycle
+    attestations (`advanceCandidate` / `qualifyCandidate`) and committing to PostgreSQL.
 42. **Clock honesty is enforced structurally (`recordedAt > publishedAt`), not attested by an
     external time authority.** `buildSealedPredictionRecord` and `publishCandidate` require
     injected `publishedAt` and `recordedAt` UTC timestamps with `recordedAt > publishedAt`
@@ -406,3 +430,47 @@ accountable forecasting should not begin with an inflated account of itself.
     refusing invalid or non-increasing clocks (`InvalidClockError` / `invalid-clock`). However,
     without an external RFC 3161 timestamp authority or transparency log (`anchored: false`),
     a party controlling the server clock could still supply a backdated clock at sealing time.
+
+---
+
+## 5. Autonomous Evaluation, Abstention, and Forecasting Architecture
+
+To evaluate and publish official predictions autonomously while abstaining whenever
+ambiguity or insufficient evidence exists, THE ORACLE separates **deterministic protocol
+enforcement** (implemented now) from **evidence retrieval & probability estimation** (future
+autonomous worker):
+
+1. **Implemented deterministic abstention & deduplication layer (`src/data/question-resolver.ts`, `src/data/publication.ts`, `src/server/api.ts`)**:
+   - **Canonical question resolution (`resolveQuestionProposal` / `/v1/questions/resolve`)**:
+     extracts the 7-component `PropositionIdentity` (`subject`, `event`, `condition`,
+     `geographicScope`, `horizon`, `resolutionDate`, `decidingAuthority`), normalizes aliases
+     via `DEFAULT_ALIAS_TABLE`, computes `identityDigest` (`oracle.identity/1`), and checks
+     whether an official prediction with that `identityDigest` already exists in
+     `oracle_ledger.official_predictions`.
+   - **11-gate abstention check (`evaluateCandidate`)**: refuses publication whenever any
+     identity component is missing (`incomplete-identity`), falsifiability review is absent
+     (`falsifiable-proposition`), deciding authority or resolution rule is unspecified
+     (`named-authority`, `explicit-resolution-criteria`, `pre-registered-edge-cases`),
+     time horizon or resolution date is invalid/expired (`bounded-horizon`, `valid-resolution-date`),
+     supporting evidence predating `publishedAt` is missing (`minimum-evidence`,
+     `preserved-evidence-provenance`), or calibrated probability/confidence is out of range
+     (`calibrated-probability`, `confidence-floor`).
+   - **Authenticated publication & resolution pipeline (`POST /v1/publications`, `POST /v1/predictions/:id/events`)**:
+     accepts structured candidates from an authorized operator or autonomous worker holding
+     `ORACLE_PUBLICATION_TOKEN`, re-verifies all 11 gates server-side, deduplicates by
+     `identityDigest` and `idempotencyKey`, and seals `demo: false` records in PostgreSQL.
+2. **What remains to build a fully autonomous forecasting worker**:
+   - **Structured proposition extraction & disambiguation**: an upstream parser/extractor that
+     maps open-ended questions into candidate `PropositionIdentity` tuples (or explicitly marks
+     unresolved components so the abstention gate halts).
+   - **Verifiable primary-source evidence retrieval**: an ingestion pipeline that fetches
+     dated primary sources (`evidence[i].publishedAt <= publishedAt`) from named institutional
+     authorities (central banks, statistical agencies, peer-reviewed registries) with preserved
+     URLs/digests.
+   - **Calibrated reference-class probability estimator**: a statistical / ensemble model
+     evaluated on out-of-sample Brier scores that outputs `probability` ($0.01 \le p \le 0.99$)
+     and `confidence` ($\ge 0.50$), abstaining whenever ensemble dispersion or evidence
+     scarcity falls below the confidence floor.
+   - **Automated resolution monitor**: a scheduled job that polls the pre-registered
+     `decidingAuthority` on or after `resolutionCriteria.resolveOn` and submits a signed
+     terminal `resolved` or `annulled` event (`e1`) to `POST /v1/predictions/:id/events`.
