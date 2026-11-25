@@ -2,7 +2,7 @@ import { useEffect, useMemo, useState } from 'react';
 import { Link } from 'react-router-dom';
 import { ArrowUpRight, LockKeyhole } from 'lucide-react';
 import { deriveLifecycle } from '@/data/lifecycle';
-import { predictionRecords, summarizeArchive } from '@/data/records';
+import { summarizeArchive } from '@/data/records';
 import type { PredictionRecord } from '@/data/types';
 import { fetchArchivePredictions } from '@/lib/api-client';
 import { formatDate, formatPercent } from '@/lib/format';
@@ -11,8 +11,9 @@ import { Callout } from '@/components/ui/Callout';
 import styles from './ArchiveSection.module.css';
 
 /**
- * A ledger-style preview of the archive: dense, monospaced, and oriented around
- * what a record *is* rather than how it looks in a marketing card.
+ * A ledger-style preview of the official archive: dense, monospaced, and
+ * oriented around what a canonical sealed record is. Only official predictions
+ * (`demo: false`) are listed here.
  */
 export function ArchiveSection() {
   const [officialRecords, setOfficialRecords] = useState<PredictionRecord[]>([]);
@@ -26,38 +27,36 @@ export function ArchiveSection() {
         }
       })
       .catch(() => {
-        // Keep local preview fallback
+        // Keep empty official archive when ledger API is unavailable
       });
     return () => {
       cancelled = true;
     };
   }, []);
 
-  const combinedPool = useMemo(
-    () => [...officialRecords, ...predictionRecords],
-    [officialRecords],
-  );
   const records = useMemo(
     () =>
-      [...combinedPool]
+      [...officialRecords]
         .sort((a, b) => Date.parse(b.publishedAt) - Date.parse(a.publishedAt))
         .slice(0, 5),
-    [combinedPool],
+    [officialRecords],
   );
-  const summary = useMemo(() => summarizeArchive(combinedPool), [combinedPool]);
+  const summary = useMemo(() => summarizeArchive(officialRecords), [officialRecords]);
+  const hasOfficialRecords = records.length > 0;
+  const hasOfficialResolvedStats = summary.published > 0 && summary.resolved > 0 && summary.hitRate !== null;
 
   return (
     <section className={styles.section} aria-labelledby="archive-title">
       <div className={styles.inner}>
         <SectionHeader
-          index="02"
-          eyebrow="The official archive"
-          title={<span id="archive-title">Published once. Read forever.</span>}
+          index="01"
+          eyebrow="The public ledger"
+          title={<span id="archive-title">Structured once. Auditable over time.</span>}
           description={
             <>
-              Every official prediction is a permanent public record: a canonical
-              question, a probability fixed at publication, the test that will
-              decide it, and the evidence it rested on.
+              The archive is designed so each registered entry forms a permanent
+              public record: a formal proposition, a timestamped publication
+              seal, explicit evaluation conditions, and its supporting context.
             </>
           }
           action={{ to: '/predictions', label: 'Enter the archive' }}
@@ -72,38 +71,59 @@ export function ArchiveSection() {
               <span className={styles.alignRight}>P</span>
               <span className={styles.alignRight}>Status</span>
             </div>
-            <ul className={styles.rows}>
-              {records.map((record) => (
-                <li key={record.id}>
-                  <Link to={`/predictions/${record.id}`} className={styles.row}>
-                    <span className={`${styles.cellId} mono`}>{record.id}</span>
-                    <span className={styles.cellQuestion}>
-                      {record.title}
-                      <span className={styles.cellQuestionSub}>
-                        {record.horizon.label}
-                      </span>
-                    </span>
-                    <span className={`${styles.cellDate} mono`}>{formatDate(record.publishedAt)}</span>
-                    <span className={`${styles.cellProb} mono`}>{formatPercent(record.probability)}</span>
-                    <span className={styles.cellStatus}>
-                      <span
-                        className={[styles.statusPill, styles[deriveLifecycle(record).status]].join(' ')}
-                      >
-                        {deriveLifecycle(record).status}
-                      </span>
-                    </span>
+
+            {hasOfficialRecords ? (
+              <>
+                <ul className={styles.rows}>
+                  {records.map((record) => (
+                    <li key={record.id}>
+                      <Link to={`/predictions/${record.id}`} className={styles.row}>
+                        <span className={`${styles.cellId} mono`}>{record.id}</span>
+                        <span className={styles.cellQuestion}>
+                          {record.title}
+                          <span className={styles.cellQuestionSub}>
+                            {record.horizon.label}
+                          </span>
+                        </span>
+                        <span className={`${styles.cellDate} mono`}>{formatDate(record.publishedAt)}</span>
+                        <span className={`${styles.cellProb} mono`}>{formatPercent(record.probability)}</span>
+                        <span className={styles.cellStatus}>
+                          <span
+                            className={[styles.statusPill, styles[deriveLifecycle(record).status]].join(' ')}
+                          >
+                            {deriveLifecycle(record).status}
+                          </span>
+                        </span>
+                      </Link>
+                    </li>
+                  ))}
+                </ul>
+                <div className={styles.ledgerFoot}>
+                  <span>
+                    Showing {records.length} of {summary.published} official records
+                  </span>
+                  <Link to="/predictions" className={styles.ledgerLink}>
+                    View all <ArrowUpRight size={12} aria-hidden="true" />
                   </Link>
-                </li>
-              ))}
-            </ul>
-            <div className={styles.ledgerFoot}>
-              <span>
-                Showing {records.length} of {summary.published} illustrative records
-              </span>
-              <Link to="/predictions" className={styles.ledgerLink}>
-                View all <ArrowUpRight size={12} aria-hidden="true" />
-              </Link>
-            </div>
+                </div>
+              </>
+            ) : (
+              <div className={styles.emptyLedger}>
+                <p className={styles.emptyLedgerTitle}>
+                  No official predictions have been published yet
+                </p>
+                <p className={styles.emptyLedgerBody}>
+                  The ledger schema and publication protocol are defined, and no
+                  official predictions have been published to the public archive
+                  yet.
+                </p>
+                <div className={styles.emptyLedgerActions}>
+                  <Link to="/predictions" className={styles.ledgerLink}>
+                    Open archive ledger <ArrowUpRight size={12} aria-hidden="true" />
+                  </Link>
+                </div>
+              </div>
+            )}
           </div>
 
           <aside className={styles.aside} aria-label="Archive integrity notes">
@@ -111,39 +131,42 @@ export function ArchiveSection() {
               <span className={styles.integrityIcon}>
                 <LockKeyhole size={16} strokeWidth={1.6} aria-hidden="true" />
               </span>
-              <h3 className={styles.integrityTitle}>What is sealed today</h3>
+              <h3 className={styles.integrityTitle}>Record verification design</h3>
               <ul className={styles.integrityList}>
                 <li>
-                  <strong>Digest present.</strong> Each record's exact payload hashes
-                  to a SHA-256 digest stored with it.
+                  <strong>Payload digest specification.</strong> The record schema
+                  pairs each serialized payload with a deterministic SHA-256 digest.
                 </li>
                 <li>
-                  <strong>Verifiable locally.</strong> The digest is recomputed in your
-                  browser when you open a record, so a silent edit would show.
+                  <strong>Client-side consistency check.</strong> When inspecting a
+                  record, your browser recomputes the digest locally to verify payload
+                  integrity.
                 </li>
                 <li>
-                  <strong>Not yet anchored.</strong> No external witness has attested
-                  these digests. That layer is future work.
+                  <strong>Event-chain architecture.</strong> Lifecycle events are
+                  structured as hash-linked entries; external third-party anchoring is
+                  planned for future phases.
                 </li>
               </ul>
             </div>
 
             <Callout tone="integrity" title="Integrity is not the same as accuracy">
-              A sealed record proves what was said and when. It does not prove the
-              forecast was right. Resolution status is tracked separately, and losing
-              forecasts stay in the archive.
+              A sealed digest verifies internal payload consistency. It does not
+              generate forecasts or attest real-world outcomes, which remain
+              governed by explicit evaluation rules.
             </Callout>
 
-            <div className={styles.rateBlock}>
-              <p className={styles.rateLabel}>Illustrative resolved hit rate</p>
-              <p className={styles.rateValue}>
-                {summary.hitRate === null ? '—' : formatPercent(summary.hitRate)}
-              </p>
-              <p className={styles.rateNote}>
-                Computed from {summary.resolved} demo records. Far too small to mean
-                anything, and shown only to demonstrate the metric's structure.
-              </p>
-            </div>
+            {hasOfficialResolvedStats ? (
+              <div className={styles.rateBlock}>
+                <p className={styles.rateLabel}>Resolved hit rate</p>
+                <p className={styles.rateValue}>
+                  {formatPercent(summary.hitRate!)}
+                </p>
+                <p className={styles.rateNote}>
+                  Computed from {summary.resolved} resolved official predictions.
+                </p>
+              </div>
+            ) : null}
           </aside>
         </div>
       </div>

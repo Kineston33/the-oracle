@@ -83,7 +83,7 @@ describe('homepage question input', () => {
       name: /see what['\u2019]s coming/i,
     });
     const description = within(main).getByText(
-      /ask any question about the future\. the oracle publishes one official prediction per question/i,
+      /formulate any question about the future\. the oracle is designed to establish one canonical, time-stamped, and verifiable record per question/i,
     );
     const heroSphere = within(main).getAllByTestId('crystal-sphere')[0]!;
     const composerForm = within(main).getByRole('search', {
@@ -113,6 +113,39 @@ describe('homepage question input', () => {
       composerForm.compareDocumentPosition(suggestionsLabel) &
         Node.DOCUMENT_POSITION_FOLLOWING,
     ).toBeTruthy();
+  });
+
+  it('presents a clean institutional homepage without DEMO/Illustrative labels, fake sphere coordinates, demo statistics, fictional trends, or fictional records masquerading as official predictions', () => {
+    renderApp('/');
+
+    const main = screen.getByRole('main');
+    const mainText = main.textContent ?? '';
+    const footer = screen.getByRole('contentinfo');
+    const footerText = footer.textContent ?? '';
+
+    // No DEMO / Illustrative / Demonstration / Fabricated labels on the public homepage
+    expect(mainText).not.toMatch(/\b(demo|demonstration|illustrative|fabricated)\b/i);
+    // No technical coordinates or internal ORB-01 sync labels below the sphere
+    expect(mainText).not.toMatch(/ORB-01|SYNCED|40\.7128/i);
+    // No "no forecasting engine is live" disclaimer below the question input
+    expect(mainText).not.toMatch(/no forecasting engine is live/i);
+    // No statistics panel or fictional ORC-2025 demo records shown as official predictions when no official predictions exist
+    expect(within(main).queryByLabelText(/archive summary/i)).toBeNull();
+    expect(within(main).queryAllByText(/^ORC-\d{4}-\d{4}$/)).toHaveLength(0);
+    // Fictional TrendsSection is hidden on the homepage until verifiable signals exist
+    expect(within(main).queryByText(/fastest moving signal/i)).toBeNull();
+    expect(within(main).queryByText(/index pts \/ 90d/i)).toBeNull();
+    // PrincipleSection states architectural/protocol specifications rather than claiming full operational status
+    expect(within(main).getAllByText(/protocol specification/i).length).toBeGreaterThan(0);
+    expect(within(main).getByText(/ledger specification/i)).toBeInTheDocument();
+    expect(within(main).getByText(/local digest · anchoring planned/i)).toBeInTheDocument();
+    expect(within(main).getAllByText(/architectural objective/i).length).toBeGreaterThan(0);
+    // Footer does not overclaim autonomous forecasting intelligence
+    expect(footerText).not.toMatch(/public forecasting intelligence/i);
+    expect(footerText).not.toMatch(/transparent resolution criteria/i);
+    expect(footerText).toMatch(/platform in active development/i);
+    // Suggested explorations remain available as question proposals
+    expect(within(main).getByText(/suggested explorations/i)).toBeInTheDocument();
   });
 
   it('asks for at least a dozen characters before submitting', async () => {

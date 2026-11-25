@@ -1,4 +1,4 @@
-import { trendSignals } from '@/data/trends';
+import { TREND_CATEGORY_LABELS, trendSignals } from '@/data/trends';
 import { TrendCard } from '@/components/trends/TrendCard';
 import { SectionHeader } from '@/components/ui/SectionHeader';
 import styles from './TrendsSection.module.css';
@@ -44,8 +44,8 @@ export function TrendsSection() {
               {lead.tension.slice(1)}
             </p>
             <p className={styles.leadMeta}>
-              <span className={styles.leadFlag}>Demo signal</span>
-              Illustrative index · not a measurement
+              <span className={styles.leadFlag}>{TREND_CATEGORY_LABELS[lead.category]}</span>
+              {lead.region} · {lead.horizon}
             </p>
           </article>
 

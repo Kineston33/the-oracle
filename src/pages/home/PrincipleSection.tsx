@@ -5,30 +5,34 @@ const PRINCIPLES = [
   {
     icon: Scale,
     index: 'I',
-    title: 'One canonical question',
-    body: 'Every way of asking the same thing resolves to a single record. Two phrasings of one question cannot produce two different answers.',
-    status: 'Designed',
+    title: 'One canonical proposition',
+    body: 'The protocol is designed so equivalent phrasings map to a single structured proposition, preventing duplicate or contradictory entries for the same question.',
+    status: 'Protocol specification',
+    inProgress: true,
   },
   {
     icon: Hash,
     index: 'II',
-    title: 'Sealed at publication',
-    body: 'A probability is fixed the moment a record is published. Corrections append a new revision; the original figure is never overwritten.',
-    status: 'Designed',
+    title: 'Sealed at registration',
+    body: 'Under the target ledger design, each registered record is fixed at publication. Subsequent updates are structured to append new revisions rather than overwrite prior entries.',
+    status: 'Ledger specification',
+    inProgress: true,
   },
   {
     icon: Fingerprint,
     index: 'III',
     title: 'Independently checkable',
-    body: 'Each record carries a SHA-256 digest of its exact payload, so a reader can detect a silent edit. Public anchoring is the next step.',
-    status: 'Partial',
+    body: 'The record schema includes a SHA-256 digest of its serialized payload for client-side consistency checks, while external third-party anchoring is planned for future development.',
+    status: 'Local digest · anchoring planned',
+    inProgress: true,
   },
   {
     icon: Globe2,
     index: 'IV',
-    title: 'The same answer for everyone',
-    body: 'No personalisation, no per-user probabilities, no paywalled resolution. The archive reads identically whether you are in Lagos, Lima, or Lisbon.',
-    status: 'Designed',
+    title: 'Uniform public reference',
+    body: 'Architected as a shared public reference without user-specific probabilities or personalized feeds — presenting the exact same record structure to every reader.',
+    status: 'Architectural objective',
+    inProgress: true,
   },
 ] as const;
 
@@ -38,20 +42,20 @@ export function PrincipleSection() {
       <div className={styles.inner}>
         <div className={styles.head}>
           <p className="eyebrow eyebrow--gold">
-            <span>§</span> The immutable record
+            <span>§</span> Architectural principles
           </p>
           <h2 id="principle-title" className={`display ${styles.title}`}>
-            A prediction is a promise you can <em>check later.</em>
+            Designed as a record you can <em>verify later.</em>
           </h2>
           <p className={styles.lede}>
-            Forecasters are rarely held to their words. THE ORACLE is built around
-            the opposite premise: publish precisely, seal the record, and let anyone
-            audit how it aged.
+            THE ORACLE is being developed around a verifiable record architecture:
+            formalize propositions precisely, define how records are sealed, and
+            enable transparent future inspection.
           </p>
         </div>
 
         <ol className={styles.grid}>
-          {PRINCIPLES.map(({ icon: Icon, index, title, body, status }) => (
+          {PRINCIPLES.map(({ icon: Icon, index, title, body, status, inProgress }) => (
             <li key={index} className={styles.item}>
               <div className={styles.itemTop}>
                 <span className={styles.iconWrap}>
@@ -67,8 +71,10 @@ export function PrincipleSection() {
                 <span
                   className={[
                     styles.statusDot,
-                    status === 'Partial' ? styles.statusPartial : '',
-                  ].join(' ')}
+                    inProgress ? styles.statusPartial : '',
+                  ]
+                    .filter(Boolean)
+                    .join(' ')}
                   aria-hidden="true"
                 />
                 {status}
@@ -78,9 +84,9 @@ export function PrincipleSection() {
         </ol>
 
         <p className={styles.footnote}>
-          Status reflects what this prototype actually implements. &ldquo;Designed&rdquo;
-          means the data model and interface anticipate it; no server-side seal,
-          anchoring service, or public ledger is live.
+          These four pillars define the target specification and architectural
+          objectives of THE ORACLE while core operational services remain in
+          development.
         </p>
       </div>
     </section>

@@ -100,7 +100,7 @@ export function NavBar() {
           </span>
           <span className={styles.wordmark}>
             <span className={styles.wordmarkMain}>THE ORACLE</span>
-            <span className={styles.wordmarkSub}>Forecasting intelligence</span>
+            <span className={styles.wordmarkSub}>Verifiable record architecture</span>
           </span>
         </Link>
 
@@ -173,7 +173,7 @@ export function NavBar() {
         </nav>
         <div className={styles.panelFooter}>
           <p className={styles.panelNotice}>
-            Illustrative archive. No official predictions have been published yet.
+            THE ORACLE · Architecture for verifiable public records.
           </p>
         </div>
       </div>

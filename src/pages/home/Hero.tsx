@@ -1,16 +1,37 @@
-import { useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import { Link } from 'react-router-dom';
 import { ArrowDown, ArrowUpRight, CircleDot } from 'lucide-react';
 import { CrystalSphere, type SphereState } from '@/components/oracle/CrystalSphere';
 import { QuestionComposer } from '@/components/explore/QuestionComposer';
 import { suggestedQuestions } from '@/lib/question';
-import { CATEGORY_LABELS, predictionRecords, summarizeArchive } from '@/data/records';
+import { CATEGORY_LABELS, summarizeArchive } from '@/data/records';
+import type { PredictionRecord } from '@/data/types';
+import { fetchArchivePredictions } from '@/lib/api-client';
 import { formatInteger } from '@/lib/format';
 import styles from './Hero.module.css';
 
 export function Hero() {
   const [state, setState] = useState<SphereState>('idle');
-  const summary = summarizeArchive(predictionRecords);
+  const [officialRecords, setOfficialRecords] = useState<PredictionRecord[]>([]);
+
+  useEffect(() => {
+    let cancelled = false;
+    fetchArchivePredictions({ includeDemo: false })
+      .then((res) => {
+        if (!cancelled && res.source === 'ledger-api') {
+          setOfficialRecords(res.predictions.filter((r) => !r.demo));
+        }
+      })
+      .catch(() => {
+        // Keep empty official archive when ledger API is unavailable
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  const summary = useMemo(() => summarizeArchive(officialRecords), [officialRecords]);
+  const hasOfficialPredictions = summary.published > 0;
 
   return (
     <section className={styles.hero} aria-labelledby="hero-title">
@@ -19,7 +40,7 @@ export function Hero() {
         <header className={styles.lead}>
           <p className={styles.eyebrow}>
             <span className={styles.eyebrowDot} aria-hidden="true" />
-            <span>Public forecasting intelligence</span>
+            <span>Structured foresight architecture</span>
             <span className={styles.eyebrowRule} aria-hidden="true" />
             <span className={styles.eyebrowMeta}>EST. 2026</span>
           </p>
@@ -36,9 +57,9 @@ export function Hero() {
           </h1>
 
           <p className={styles.subtitle}>
-            Ask any question about the future. THE ORACLE publishes one official
-            prediction per question — time-stamped, evidence-backed, and identical
-            for every reader.
+            Formulate any question about the future. THE ORACLE is designed to
+            establish one canonical, time-stamped, and verifiable record per
+            question — structured on evidence and identical for every reader.
           </p>
         </header>
 
@@ -54,11 +75,6 @@ export function Hero() {
             <CrystalSphere state={state} size="hero" />
           </div>
 
-          <div className={styles.orbCaption} aria-hidden="true">
-            <span className={styles.captionRule} />
-            <span className={`${styles.captionText} mono`}>ORB-01 · CONTINUOUS</span>
-            <span className={styles.captionRule} />
-          </div>
           <span className={styles.orbTether} aria-hidden="true" />
         </div>
 
@@ -82,7 +98,6 @@ export function Hero() {
               <p className={styles.suggestionsLabel}>
                 <CircleDot size={11} aria-hidden="true" />
                 Suggested explorations
-                <span className={styles.demoFlag}>Illustrative</span>
               </p>
               <ul className={styles.suggestionList}>
                 {suggestedQuestions.slice(0, 3).map((item) => (
@@ -108,24 +123,22 @@ export function Hero() {
               </ul>
             </div>
 
-            <dl className={styles.stats} aria-label="Archive summary">
-              <div className={styles.stat}>
-                <dt>Archive</dt>
-                <dd>{formatInteger(summary.published)}</dd>
-              </div>
-              <div className={styles.stat}>
-                <dt>Open</dt>
-                <dd>{formatInteger(summary.open)}</dd>
-              </div>
-              <div className={styles.stat}>
-                <dt>Resolved</dt>
-                <dd>{formatInteger(summary.resolved)}</dd>
-              </div>
-              <div className={`${styles.stat} ${styles.statDemo}`}>
-                <dt>Status</dt>
-                <dd>Demo</dd>
-              </div>
-            </dl>
+            {hasOfficialPredictions ? (
+              <dl className={styles.stats} aria-label="Archive summary">
+                <div className={styles.stat}>
+                  <dt>Archive</dt>
+                  <dd>{formatInteger(summary.published)}</dd>
+                </div>
+                <div className={styles.stat}>
+                  <dt>Open</dt>
+                  <dd>{formatInteger(summary.open)}</dd>
+                </div>
+                <div className={styles.stat}>
+                  <dt>Resolved</dt>
+                  <dd>{formatInteger(summary.resolved)}</dd>
+                </div>
+              </dl>
+            ) : null}
           </div>
         </div>
       </div>
