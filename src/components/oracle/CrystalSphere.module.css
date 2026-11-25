@@ -1,5 +1,5 @@
 /* ==========================================================================
-   Crystal Sphere — cut-crystal instrument
+   THE ORACLE — Holographic Energy Sphere (Pure SVG + CSS)
    ========================================================================== */
 
 .sphere {
@@ -8,9 +8,12 @@
   display: grid;
   place-items: center;
   pointer-events: none;
-  --spin-outer: 150s;
-  --spin-inner: 96s;
-  --spin-collar: 220s;
+  --spin-outer: 84s;
+  --spin-inner: 52s;
+  --spin-collar: 110s;
+  --spin-collar-rev: 76s;
+  --spin-gyro-outer: 36s;
+  --spin-gyro-inner: 26s;
 }
 
 .hero {
@@ -31,6 +34,7 @@
   display: grid;
   place-items: center;
   isolation: isolate;
+  background: radial-gradient(circle, rgba(0, 12, 32, 0.45) 0%, rgba(0, 0, 0, 0) 70%);
 }
 
 .hero .stage {
@@ -49,222 +53,389 @@
   height: 100%;
   overflow: visible;
   z-index: 2;
-  filter: drop-shadow(0 30px 76px rgba(8, 6, 30, 0.82));
+  filter: drop-shadow(0 0 38px rgba(0, 180, 255, 0.28))
+    drop-shadow(0 24px 64px rgba(0, 6, 24, 0.9));
 }
 
-.video {
-  position: relative;
-  z-index: 2;
-  width: 100%;
-  height: 100%;
-  display: block;
-  object-fit: contain;
-  object-position: center;
-  background-color: #000000;
-  border-radius: 50%;
-  pointer-events: none;
-}
-
-.compact .video {
-  width: 40px;
-  height: 40px;
-}
-
-/* --- Ambient light ------------------------------------------------------- */
+/* --- Ambient Electric-Blue & Cyan Holographic Bloom ---------------------- */
 
 .bloom,
-.bloomWarm {
+.bloomCyan,
+.bloomCore {
   position: absolute;
   border-radius: 50%;
-  filter: blur(52px);
+  pointer-events: none;
   z-index: 1;
-  transition: opacity var(--dur-atmos) var(--ease-out);
 }
 
 .bloom {
-  width: 62%;
-  height: 62%;
+  width: 66%;
+  height: 66%;
+  filter: blur(50px);
   background: radial-gradient(
     circle,
-    rgba(120, 107, 255, 0.34) 0%,
-    rgba(74, 63, 190, 0.14) 44%,
-    transparent 72%
+    rgba(0, 132, 255, 0.36) 0%,
+    rgba(0, 68, 204, 0.18) 46%,
+    transparent 74%
   );
-  animation: bloomPulse 12s var(--ease-in-out) infinite;
+  animation: bloomPulse 9s ease-in-out infinite;
 }
 
-.bloomWarm {
-  width: 30%;
-  height: 30%;
-  transform: translate(18%, -14%);
-  background: radial-gradient(circle, rgba(0, 212, 255, 0.2) 0%, transparent 70%);
-  animation: bloomPulse 17s var(--ease-in-out) infinite reverse;
+.bloomCyan {
+  width: 46%;
+  height: 46%;
+  filter: blur(36px);
+  background: radial-gradient(
+    circle,
+    rgba(0, 240, 255, 0.34) 0%,
+    rgba(0, 162, 255, 0.14) 52%,
+    transparent 74%
+  );
+  animation: bloomPulse 13s ease-in-out infinite reverse;
+}
+
+.bloomCore {
+  width: 24%;
+  height: 24%;
+  filter: blur(22px);
+  background: radial-gradient(
+    circle,
+    rgba(190, 255, 255, 0.48) 0%,
+    rgba(0, 224, 255, 0.22) 55%,
+    transparent 78%
+  );
+  animation: coreGlowPulse 5.5s ease-in-out infinite;
 }
 
 @keyframes bloomPulse {
-  0%, 100% { opacity: 0.6; transform: scale(1); }
-  48% { opacity: 0.92; transform: scale(1.06); }
+  0%, 100% {
+    opacity: 0.68;
+    transform: scale(0.97);
+  }
+  50% {
+    opacity: 0.98;
+    transform: scale(1.05);
+  }
 }
 
-/* --- Motion -------------------------------------------------------------- */
+@keyframes coreGlowPulse {
+  0%, 100% {
+    opacity: 0.72;
+    transform: scale(0.94);
+  }
+  50% {
+    opacity: 1;
+    transform: scale(1.08);
+  }
+}
+
+/* --- Fixed Camera & Sphere Position -------------------------------------- */
 
 .crystalBody {
   transform-origin: 200px 200px;
-  animation: crystalFloat 15s var(--ease-in-out) infinite;
 }
 
-@keyframes crystalFloat {
-  0%, 100% { transform: translateY(-2.5px); }
-  50% { transform: translateY(3.5px); }
-}
+/* --- Multi-Axis Orbital Rings & Gyroscopes ------------------------------- */
 
-.ringOuter {
+.ringOuter,
+.ringMid,
+.ringInner,
+.ringCollar,
+.ringCollarReverse,
+.gyroOuter,
+.gyroInner {
   transform-origin: 200px 200px;
 }
 
-.ringInner {
-  transform-origin: 200px 200px;
-  animation: drift 70s var(--ease-in-out) infinite;
+@keyframes spinCw {
+  from {
+    transform: rotate(0deg);
+  }
+  to {
+    transform: rotate(360deg);
+  }
 }
 
-@keyframes drift {
-  0%, 100% { transform: rotate(0deg); }
-  50% { transform: rotate(2.4deg); }
+@keyframes spinCcw {
+  from {
+    transform: rotate(360deg);
+  }
+  to {
+    transform: rotate(0deg);
+  }
 }
 
 .ringCollar {
-  transform-origin: 200px 200px;
-  animation: spin var(--spin-collar) linear infinite;
+  animation: spinCw var(--spin-collar) linear infinite;
 }
 
-.ringMid {
-  transform-origin: 200px 200px;
-  animation: spin var(--spin-inner) linear infinite reverse;
+.ringCollarReverse {
+  animation: spinCcw var(--spin-collar-rev) linear infinite;
+}
+
+.gyroOuter {
+  animation: spinCw var(--spin-gyro-outer) linear infinite;
+}
+
+.gyroInner {
+  animation: spinCcw var(--spin-gyro-inner) linear infinite;
 }
 
 .ringsFar {
-  opacity: 0.9;
+  opacity: 0.88;
 }
 
-/* The far half of each orbit fades as it passes behind the crystal. */
 .ringsNear {
   opacity: 1;
 }
 
-/* Interior groups: no motion of their own, animated by their children. */
-.cosmos,
-.facetPlate,
-.particles {
+/* --- Curved Surface Filaments (Seamless Continuous Dash Flow) ------------ */
+
+.surfaceFilaments {
+  transform-origin: 200px 200px;
+  animation: spinCw 96s linear infinite;
+}
+
+@keyframes filamentFlowForward {
+  from {
+    stroke-dashoffset: 1000;
+  }
+  to {
+    stroke-dashoffset: 0;
+  }
+}
+
+@keyframes filamentFlowReverse {
+  from {
+    stroke-dashoffset: 0;
+  }
+  to {
+    stroke-dashoffset: 1000;
+  }
+}
+
+.filamentPrimary {
+  animation: filamentFlowForward 11s linear infinite;
+  filter: drop-shadow(0 0 4px rgba(0, 240, 255, 0.75));
+}
+
+.filamentSecondary {
+  animation: filamentFlowReverse 15s linear infinite;
+  filter: drop-shadow(0 0 4px rgba(0, 140, 255, 0.7));
+}
+
+.filamentAccent {
+  animation: filamentFlowForward 8.5s linear infinite;
+  filter: drop-shadow(0 0 5px rgba(130, 250, 255, 0.85));
+}
+
+/* --- Propagating Energy Waves -------------------------------------------- */
+
+.energyWaves {
   transform-origin: 200px 200px;
 }
 
-@keyframes spin {
-  to { transform: rotate(360deg); }
-}
-
-/* The whole outer assembly turns slowly; the node travels independently. */
-.ringsNear .ringOuter {
-  animation: spin var(--spin-outer) linear infinite;
-}
-
-.disc {
-  transform-origin: 200px 203px;
-  animation: spin 96s linear infinite reverse;
-}
-
-.aurora {
+.energyWave {
   transform-origin: 200px 200px;
-  animation: auroraDrift 24s var(--ease-in-out) infinite;
+  animation: energyWaveExpand 9s cubic-bezier(0.22, 0.61, 0.36, 1) infinite;
 }
 
-@keyframes auroraDrift {
-  0%, 100% { opacity: 0.62; transform: rotate(-26deg) scale(1); }
-  50% { opacity: 0.94; transform: rotate(-20deg) scale(1.03); }
+.wave1 {
+  animation-delay: 0s;
 }
 
-.core {
-  transform-origin: 200px 198px;
-  animation: corePulse 8s var(--ease-in-out) infinite;
+.wave2 {
+  animation-delay: -3s;
 }
 
-@keyframes corePulse {
-  0%, 100% { opacity: 0.86; transform: scale(1); }
-  40% { opacity: 1; transform: scale(1.05); }
+.wave3 {
+  animation-delay: -6s;
+}
+
+@keyframes energyWaveExpand {
+  0% {
+    transform: scale(0.14);
+    opacity: 0;
+  }
+  18% {
+    opacity: 0.72;
+  }
+  82% {
+    opacity: 0.24;
+  }
+  100% {
+    transform: scale(1.04);
+    opacity: 0;
+  }
+}
+
+.scanWave {
+  transform-origin: 200px 200px;
+  animation: scanWaveTraverse 7.5s ease-in-out infinite;
+}
+
+@keyframes scanWaveTraverse {
+  0%, 100% {
+    transform: translateY(-76px) scaleX(0.62);
+    opacity: 0.14;
+  }
+  50% {
+    transform: translateY(0px) scaleX(1);
+    opacity: 0.68;
+  }
+}
+
+/* --- Orbital Particle Streams & Twinkle ---------------------------------- */
+
+.particleStreamCw {
+  transform-origin: 200px 200px;
+  animation: spinCw 68s linear infinite;
+}
+
+.particleStreamCcw {
+  transform-origin: 200px 200px;
+  animation: spinCcw 48s linear infinite;
 }
 
 .particle {
-  animation: particleTwinkle 6.5s var(--ease-in-out) infinite;
+  animation: particleTwinkle 4.8s ease-in-out infinite;
 }
 
 @keyframes particleTwinkle {
-  0%, 100% { opacity: 0.18; }
-  50% { opacity: 0.78; }
-}
-
-.specular {
-  animation: specularShift 20s var(--ease-in-out) infinite;
-}
-
-@keyframes specularShift {
-  0%, 100% { opacity: 0.9; }
-  50% { opacity: 0.5; }
-}
-
-.caustic {
-  animation: causticPulse 14s var(--ease-in-out) infinite;
-}
-
-@keyframes causticPulse {
-  0%, 100% { opacity: 0.5; }
-  50% { opacity: 0.82; }
+  0%, 100% {
+    opacity: 0.22;
+  }
+  50% {
+    opacity: 0.92;
+  }
 }
 
 .nodeOuter {
-  filter: drop-shadow(0 0 6px rgba(155, 238, 255, 0.9));
+  filter: drop-shadow(0 0 7px rgba(140, 250, 255, 0.95));
 }
 
-/* --- Interaction states -------------------------------------------------- */
+.nodeSecondary {
+  filter: drop-shadow(0 0 5px rgba(0, 216, 255, 0.9));
+}
 
-/* `idle` is the resting state; listed so the class name always resolves. */
+/* --- Core Singularity & Plasma Corona ------------------------------------ */
+
+.core {
+  transform-origin: 200px 200px;
+  animation: corePulse 5.2s ease-in-out infinite;
+}
+
+.coreCorona {
+  transform-origin: 200px 200px;
+  animation: coronaPulse 3.6s ease-in-out infinite;
+}
+
+.plasmaGlow {
+  transform-origin: 200px 200px;
+  animation: plasmaBreathe 7.8s ease-in-out infinite;
+}
+
+@keyframes corePulse {
+  0%, 100% {
+    opacity: 0.9;
+    transform: scale(0.96);
+  }
+  50% {
+    opacity: 1;
+    transform: scale(1.06);
+  }
+}
+
+@keyframes coronaPulse {
+  0%, 100% {
+    opacity: 0.82;
+    transform: scale(0.92);
+  }
+  50% {
+    opacity: 1;
+    transform: scale(1.1);
+  }
+}
+
+@keyframes plasmaBreathe {
+  0%, 100% {
+    opacity: 0.78;
+  }
+  50% {
+    opacity: 0.98;
+  }
+}
+
+.specular {
+  animation: specularShift 14s ease-in-out infinite;
+}
+
+@keyframes specularShift {
+  0%, 100% {
+    opacity: 0.88;
+  }
+  50% {
+    opacity: 0.56;
+  }
+}
+
+.caustic {
+  animation: causticPulse 10s ease-in-out infinite;
+}
+
+@keyframes causticPulse {
+  0%, 100% {
+    opacity: 0.45;
+  }
+  50% {
+    opacity: 0.82;
+  }
+}
+
+/* --- Interaction States (`idle`, `reading`, `thinking`) ------------------ */
+
 .idle {
   --sphere-intensity: 1;
 }
 
+.reading .bloom,
+.reading .bloomCyan {
+  opacity: 0.96;
+}
+
+.reading .filamentPrimary,
+.reading .filamentAccent {
+  animation-duration: 6.5s;
+}
+
 .thinking .bloom {
-  animation-duration: 2.6s;
+  animation-duration: 2.8s;
 }
 
 .thinking .core {
-  animation-duration: 1.6s;
+  animation-duration: 1.8s;
 }
 
-.thinking .disc {
-  animation-duration: 16s;
+.thinking .coreCorona {
+  animation-duration: 1.3s;
 }
 
-.thinking .ringMid {
-  animation-duration: 14s;
+.thinking .gyroOuter {
+  animation-duration: 12s;
 }
 
-.thinking .ringInner {
-  animation-duration: 9s;
+.thinking .gyroInner {
+  animation-duration: 8.5s;
 }
 
-.thinking .crystalBody {
-  animation-duration: 3.2s;
+.thinking .filamentPrimary,
+.thinking .filamentSecondary,
+.thinking .filamentAccent {
+  animation-duration: 4.2s;
 }
 
-.thinking .aurora {
-  animation-duration: 5s;
-}
-
-.reading .facetVeins {
-  opacity: 1;
-}
-
-.facetVeins {
-  opacity: 0.9;
-  transition: opacity var(--dur-atmos) var(--ease-out);
+.thinking .energyWave {
+  animation-duration: 4.5s;
 }
 
 .paused *,
@@ -273,7 +444,7 @@
   animation-play-state: paused !important;
 }
 
-/* --- Instrument readout -------------------------------------------------- */
+/* --- Instrument Readout -------------------------------------------------- */
 
 .readout {
   position: absolute;
@@ -285,13 +456,13 @@
   gap: 0.75rem;
   width: min(88%, 500px);
   z-index: 3;
-  opacity: 0.6;
+  opacity: 0.65;
 }
 
 .readoutLine {
   flex: 1;
   height: 1px;
-  background: linear-gradient(90deg, transparent, var(--line-3), transparent);
+  background: linear-gradient(90deg, transparent, rgba(0, 216, 255, 0.32), transparent);
 }
 
 .readoutText {
@@ -304,8 +475,10 @@
 
 .compact .readout,
 .compact .bloom,
-.compact .bloomWarm,
-.compact .compass {
+.compact .bloomCyan,
+.compact .bloomCore,
+.compact .compass,
+.compact .energyWaves {
   display: none;
 }
 
@@ -313,10 +486,16 @@
   filter: none;
 }
 
-.compact .crystalBody,
 .compact .core,
-.compact .aurora,
-.compact .disc,
+.compact .coreCorona,
+.compact .gyroOuter,
+.compact .gyroInner,
+.compact .surfaceFilaments,
+.compact .filamentPrimary,
+.compact .filamentSecondary,
+.compact .filamentAccent,
+.compact .particleStreamCw,
+.compact .particleStreamCcw,
 .compact .particle {
   animation: none;
 }
@@ -343,20 +522,46 @@
   }
 }
 
+/* --- Accessible Reduced-Motion State ------------------------------------- */
+
+.reducedMotion *,
+.reducedMotion *::before,
+.reducedMotion *::after {
+  animation: none !important;
+}
+
+.reducedMotion .energyWave {
+  opacity: 0.28;
+  transform: scale(0.76);
+}
+
 @media (prefers-reduced-motion: reduce) {
-  .crystalBody,
-  .core,
-  .aurora,
-  .disc,
   .bloom,
-  .bloomWarm,
+  .bloomCyan,
+  .bloomCore,
+  .core,
+  .coreCorona,
+  .plasmaGlow,
   .caustic,
-  .particle,
   .specular,
   .ringCollar,
-  .ringMid,
-  .ringInner,
-  .ringsNear .ringOuter {
-    animation: none;
+  .ringCollarReverse,
+  .gyroOuter,
+  .gyroInner,
+  .surfaceFilaments,
+  .filamentPrimary,
+  .filamentSecondary,
+  .filamentAccent,
+  .energyWave,
+  .scanWave,
+  .particleStreamCw,
+  .particleStreamCcw,
+  .particle {
+    animation: none !important;
+  }
+
+  .energyWave {
+    opacity: 0.28;
+    transform: scale(0.76);
   }
 }
