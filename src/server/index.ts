@@ -94,8 +94,17 @@ export interface StartOracleServerOptions {
    * to disable static SPA serving.
    */
   staticDir?: string | null;
-  /** Optional allowed CORS origin (defaults to `process.env.ORACLE_CORS_ORIGIN ?? '*'`). */
+  /**
+   * Optional explicit CORS origin (defaults to same-origin only; no
+   * `Access-Control-Allow-Origin` header is emitted unless a specific
+   * non-wildcard origin is configured via `corsOrigin` or `ORACLE_CORS_ORIGIN`).
+   */
   corsOrigin?: string;
+  /**
+   * Optional trusted server-side clock provider returning UTC ISO-8601 timestamps.
+   * Defaults to the monotonic system wall clock on the server.
+   */
+  now?: () => string;
 }
 
 export interface RunningOracleServer {
@@ -296,6 +305,7 @@ export async function startOracleServer(
       publicationToken: options?.publicationToken,
       staticDir: resolvedStaticDir,
       corsOrigin: options?.corsOrigin,
+      now: options?.now,
     });
     const host = options?.host ?? process.env.HOST ?? '0.0.0.0';
     const requestedPort = options?.port ?? Number(process.env.PORT ?? 3001);

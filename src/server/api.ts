@@ -39,6 +39,7 @@ import { deriveLifecycle } from '../data/lifecycle.ts';
 import {
   candidateContentDigest,
   evaluateCandidate,
+  parseIsoDateTimeMs,
   publishCandidate,
   qualifyCandidate,
 } from '../data/publication.ts';
@@ -88,14 +89,60 @@ export interface OracleApiServerDeps {
    */
   staticDir?: string | null;
   /**
-   * Optional allowed CORS origin (defaults to `process.env.ORACLE_CORS_ORIGIN ?? '*'`).
+   * Optional explicit CORS origin (defaults to same-origin only — no
+   * `Access-Control-Allow-Origin` header is emitted unless a specific
+   * non-wildcard origin is configured via `corsOrigin` or `ORACLE_CORS_ORIGIN`).
    */
   corsOrigin?: string;
+  /**
+   * Optional trusted server-side clock provider returning UTC ISO-8601 timestamps.
+   * Defaults to the monotonic system wall clock on the server.
+   */
+  now?: () => string;
 }
 
 const VALID_CATEGORIES = new Set<string>(['all', ...CATEGORY_ORDER]);
 const VALID_STATUSES = new Set<string>(['all', 'open', 'resolved', 'annulled']);
 const MAX_JSON_BODY_BYTES = 256 * 1024;
+
+let lastServerTimestampMs = 0;
+
+/**
+ * Generates a strictly monotonic UTC ISO-8601 timestamp from the trusted
+ * server clock (`deps.now` when injected on the server, or `Date.now()`).
+ */
+async function nextServerTimestamp(deps: OracleApiServerDeps): Promise<string> {
+  if (deps.now) {
+    const iso = deps.now();
+    const parsedMs = parseIsoDateTimeMs(iso);
+    if (parsedMs === null) {
+      throw new Error(
+        `Trusted server clock returned invalid UTC ISO-8601 timestamp '${iso}'.`,
+      );
+    }
+    return iso;
+  }
+
+  let nowMs = Date.now();
+  while (nowMs <= lastServerTimestampMs) {
+    await new Promise((r) => setTimeout(r, 1));
+    nowMs = Date.now();
+  }
+  lastServerTimestampMs = nowMs;
+  return new Date(nowMs).toISOString();
+}
+
+/**
+ * Generates an official server-authoritative `(publishedAt, recordedAt)` pair
+ * with `recordedAt > publishedAt` guaranteed by real elapsed server clock ticks.
+ */
+async function nextServerPublicationClockPair(
+  deps: OracleApiServerDeps,
+): Promise<{ publishedAt: string; recordedAt: string }> {
+  const publishedAt = await nextServerTimestamp(deps);
+  const recordedAt = await nextServerTimestamp(deps);
+  return { publishedAt, recordedAt };
+}
 
 const MIME_TYPES: Readonly<Record<string, string>> = {
   '.html': 'text/html; charset=utf-8',
@@ -115,11 +162,15 @@ const MIME_TYPES: Readonly<Record<string, string>> = {
 };
 
 function getCorsHeaders(deps: OracleApiServerDeps): Record<string, string> {
-  const origin = deps.corsOrigin ?? process.env.ORACLE_CORS_ORIGIN ?? '*';
+  const origin = (deps.corsOrigin ?? process.env.ORACLE_CORS_ORIGIN ?? '').trim();
+  if (!origin || origin === '*') {
+    return {};
+  }
   return {
     'access-control-allow-origin': origin,
     'access-control-allow-methods': 'GET, HEAD, POST, OPTIONS',
     'access-control-allow-headers': 'Content-Type, Authorization',
+    vary: 'Origin',
   };
 }
 
@@ -389,20 +440,83 @@ export async function handleOracleApiRequest(
             return;
           }
 
-          const rawCandidate = body.candidate as CandidateProposition | undefined;
+          const rawCandidate = body.candidate as
+            | (CandidateProposition & Record<string, unknown>)
+            | undefined;
           const idempotencyKey =
             typeof body.idempotencyKey === 'string' ? body.idempotencyKey.trim() : '';
-          const nowIso = new Date().toISOString().replace(/\.\d{3}Z$/, '.000Z');
-          const publishedAt =
-            typeof body.publishedAt === 'string'
-              ? body.publishedAt
-              : nowIso;
-          const recordedAt =
-            typeof body.recordedAt === 'string'
-              ? body.recordedAt
-              : new Date(Date.now() + 5).toISOString();
-          const requestedAt =
-            typeof body.requestedAt === 'string' ? body.requestedAt : publishedAt;
+
+          // 1. Reject any attempt by the caller to supply official timestamps
+          // (`publishedAt`, `recordedAt`) either at the top level or inside `candidate`.
+          if (
+            body.publishedAt !== undefined ||
+            body.recordedAt !== undefined ||
+            (rawCandidate &&
+              typeof rawCandidate === 'object' &&
+              (rawCandidate.publishedAt !== undefined ||
+                rawCandidate.recordedAt !== undefined))
+          ) {
+            sendJson(
+              res,
+              400,
+              {
+                error: 'server_authoritative_timestamp',
+                message:
+                  'Official timestamps (publishedAt, recordedAt) are generated exclusively by the server clock and cannot be supplied by the client.',
+              },
+              corsHeaders,
+            );
+            return;
+          }
+
+          // 2. Reject any attempt by the caller to choose an official `predictionId` or `id`.
+          if (
+            body.predictionId !== undefined ||
+            body.id !== undefined ||
+            (rawCandidate &&
+              typeof rawCandidate === 'object' &&
+              (rawCandidate.predictionId !== undefined ||
+                rawCandidate.id !== undefined))
+          ) {
+            sendJson(
+              res,
+              400,
+              {
+                error: 'server_authoritative_identifier',
+                message:
+                  'Official predictionId is assigned exclusively by the server and cannot be supplied by the client.',
+              },
+              corsHeaders,
+            );
+            return;
+          }
+
+          // 3. Validate optional external request timestamp (`requestedAt` / `externalRequestedAt`)
+          //    strictly as separate provenance metadata — never as an official timestamp.
+          const rawExternalRequestedAt =
+            body.externalRequestedAt !== undefined
+              ? body.externalRequestedAt
+              : body.requestedAt;
+          let externalRequestedAt: string | undefined;
+          if (rawExternalRequestedAt !== undefined) {
+            if (
+              typeof rawExternalRequestedAt !== 'string' ||
+              parseIsoDateTimeMs(rawExternalRequestedAt.trim()) === null
+            ) {
+              sendJson(
+                res,
+                400,
+                {
+                  error: 'invalid_external_timestamp',
+                  message:
+                    'Optional requestedAt / externalRequestedAt provenance must be a valid UTC ISO-8601 timestamp.',
+                },
+                corsHeaders,
+              );
+              return;
+            }
+            externalRequestedAt = rawExternalRequestedAt.trim();
+          }
 
           if (!rawCandidate || typeof rawCandidate !== 'object' || !idempotencyKey) {
             sendJson(
@@ -417,8 +531,12 @@ export async function handleOracleApiRequest(
             return;
           }
 
-          // Evaluate candidate against all 11 protocol requirements before qualifying;
-          // abstain whenever ambiguity or missing evidence is detected.
+          // 4. Generate server-authoritative `(publishedAt, recordedAt)` from the trusted server clock.
+          const { publishedAt, recordedAt } =
+            await nextServerPublicationClockPair(deps);
+
+          // 5. Evaluate candidate against all 11 protocol requirements bound to the server's `publishedAt`;
+          //    abstain whenever ambiguity, expired horizon, or missing/post-dated evidence is detected.
           const verdict = evaluateCandidate(rawCandidate, { publishedAt });
           if (!verdict.eligible) {
             const failed = verdict.results.filter((r) => !r.passed);
@@ -456,11 +574,12 @@ export async function handleOracleApiRequest(
             idempotencyKey,
             identity: qualified.proposedIdentity,
             candidateDigest,
-            requestedAt,
+            // Official request chronology is bound to the server clock, never client requestedAt
+            requestedAt: publishedAt,
           };
 
           const existingOfficial = await deps.registry.listOfficialPredictions();
-          const year = new Date(publishedAt).getUTCFullYear() || 2026;
+          const year = new Date(publishedAt).getUTCFullYear();
           const yearPrefix = `ORC-${year}-`;
           let maxSeq = 0;
           for (const rec of existingOfficial) {
@@ -471,11 +590,7 @@ export async function handleOracleApiRequest(
               }
             }
           }
-          const assignedPredictionId =
-            typeof body.predictionId === 'string' &&
-            /^ORC-\d{4}-\d{4,}$/.test(body.predictionId.trim())
-              ? body.predictionId.trim()
-              : `${yearPrefix}${String(maxSeq + 1).padStart(4, '0')}`;
+          const assignedPredictionId = `${yearPrefix}${String(maxSeq + 1).padStart(4, '0')}`;
 
           const outcome = await publishCandidate(
             qualified,
@@ -505,6 +620,13 @@ export async function handleOracleApiRequest(
             {
               status: outcome.kind,
               outcome,
+              provenance: {
+                officialPublishedAt: publishedAt,
+                officialRecordedAt: recordedAt,
+                ...(externalRequestedAt !== undefined
+                  ? { externalRequestedAt }
+                  : {}),
+              },
             },
             corsHeaders,
           );
@@ -535,14 +657,28 @@ export async function handleOracleApiRequest(
             return;
           }
 
+          // Reject any attempt by the caller to control `recordedAt` or `publishedAt` on a terminal event.
+          if (body.recordedAt !== undefined || body.publishedAt !== undefined) {
+            sendJson(
+              res,
+              400,
+              {
+                error: 'server_authoritative_timestamp',
+                message:
+                  'Official registration timestamp (recordedAt) is generated exclusively by the server clock and cannot be supplied by the client.',
+              },
+              corsHeaders,
+            );
+            return;
+          }
+
           const eventType = (body.kind ?? body.type) as
             | 'resolved'
             | 'annulled'
             | undefined;
           const occurredAt =
             typeof body.occurredAt === 'string' ? body.occurredAt.trim() : '';
-          const recordedAt =
-            typeof body.recordedAt === 'string' ? body.recordedAt.trim() : '';
+          const recordedAt = await nextServerTimestamp(deps);
           const basis = typeof body.basis === 'string' ? body.basis.trim() : '';
           const note = typeof body.note === 'string' ? body.note.trim() : '';
           const reason =
@@ -559,7 +695,6 @@ export async function handleOracleApiRequest(
           if (
             (eventType !== 'resolved' && eventType !== 'annulled') ||
             !occurredAt ||
-            !recordedAt ||
             !basis
           ) {
             sendJson(
@@ -568,7 +703,7 @@ export async function handleOracleApiRequest(
               {
                 error: 'invalid_terminal_event',
                 message:
-                  "Terminal event requires kind/type ('resolved' | 'annulled'), occurredAt, recordedAt, and basis.",
+                  "Terminal event requires kind/type ('resolved' | 'annulled'), occurredAt, and basis.",
               },
               corsHeaders,
             );
