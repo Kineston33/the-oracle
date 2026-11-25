@@ -73,10 +73,6 @@ export function MethodSection() {
               Browse the archive
             </Link>
           </div>
-          <p className={styles.closingNotice}>
-            No forecasting engine is live. Exploration returns a transparent reading
-            of your question, never an invented probability.
-          </p>
         </div>
       </div>
     </section>

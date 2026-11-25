@@ -7,28 +7,28 @@ const PRINCIPLES = [
     index: 'I',
     title: 'One canonical question',
     body: 'Every way of asking the same thing resolves to a single record. Two phrasings of one question cannot produce two different answers.',
-    status: 'Designed',
+    status: 'Canonical identity',
   },
   {
     icon: Hash,
     index: 'II',
     title: 'Sealed at publication',
     body: 'A probability is fixed the moment a record is published. Corrections append a new revision; the original figure is never overwritten.',
-    status: 'Designed',
+    status: 'Immutable seal',
   },
   {
     icon: Fingerprint,
     index: 'III',
     title: 'Independently checkable',
-    body: 'Each record carries a SHA-256 digest of its exact payload, so a reader can detect a silent edit. Public anchoring is the next step.',
-    status: 'Partial',
+    body: 'Each record carries a SHA-256 digest of its exact payload, so a reader can detect a silent edit.',
+    status: 'SHA-256 verification',
   },
   {
     icon: Globe2,
     index: 'IV',
     title: 'The same answer for everyone',
     body: 'No personalisation, no per-user probabilities, no paywalled resolution. The archive reads identically whether you are in Lagos, Lima, or Lisbon.',
-    status: 'Designed',
+    status: 'Public access',
   },
 ] as const;
 
@@ -64,24 +64,12 @@ export function PrincipleSection() {
               <h3 className={styles.itemTitle}>{title}</h3>
               <p className={styles.itemBody}>{body}</p>
               <p className={styles.itemStatus}>
-                <span
-                  className={[
-                    styles.statusDot,
-                    status === 'Partial' ? styles.statusPartial : '',
-                  ].join(' ')}
-                  aria-hidden="true"
-                />
+                <span className={styles.statusDot} aria-hidden="true" />
                 {status}
               </p>
             </li>
           ))}
         </ol>
-
-        <p className={styles.footnote}>
-          Status reflects what this prototype actually implements. &ldquo;Designed&rdquo;
-          means the data model and interface anticipate it; no server-side seal,
-          anchoring service, or public ledger is live.
-        </p>
       </div>
     </section>
   );

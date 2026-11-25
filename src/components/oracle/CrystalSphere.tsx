@@ -838,17 +838,6 @@ export function CrystalSphere({
             </g>
           </g>
         </svg>
-
-        {/* Measurements: a quiet instrument readout, not decoration */}
-        {!isCompact && (
-          <div className={styles.readout}>
-            <span className={styles.readoutLine} />
-            <span className={`${styles.readoutText} mono`}>
-              {(state === 'thinking' ? 'READING' : 'SYNCED')} · ORB-01 · 40.7128°N 74.0060°W
-            </span>
-            <span className={styles.readoutLine} />
-          </div>
-        )}
       </div>
     </div>
   );

@@ -6,10 +6,10 @@ A public forecasting intelligence platform: explore the future, interrogate your
 questions, discover emerging signals, and read a public archive of official predictions
 designed to be **immutable, timestamped, evidence-backed and independently checkable**.
 
-> **Status: v0.1 prototype.** There is **no forecasting engine**, no server and no
-> database. Every prediction, probability, trend value and source in this repository is
-> **illustrative demo data** and is labelled as such throughout the interface. Nothing
-> here is a claim about the real world.
+> **Development Status & Technical Notice (DEMO Data & Current Limitations):**
+> - **No automated forecasting engine:** The question composer performs deterministic local analysis (subject classification, horizon extraction, and canonical draft construction) and queries the ledger; it never invents a probability.
+> - **DEMO / Fictional Records (`src/data/records.json`, `demo: true`) & Trend Signals (`src/data/trends.ts`):** The repository ships 10 historical demonstration records (`ORC-2025-0001` .. `ORC-2025-0010`) and 9 trend signals constructed to exercise the canonical schema, SHA-256 payload sealing, event-chain verification, and lifecycle rules. They are fabricated demonstration fixtures and are never converted into official predictions (`demo: false`).
+> - **Institutional Public Homepage Presentation:** These technical disclaimers, DEMO/ILLUSTRATIVE badges, and demo-derived statistics are intentionally excluded from the visual presentation of the main public homepage. On the homepage, the archive statistics panel and official ledger rows are hidden until real official predictions (`demo: false`) are published in the PostgreSQL ledger, while individual record detail views preserve full provenance and classification metadata when inspecting a specific record.
 
 ---
 

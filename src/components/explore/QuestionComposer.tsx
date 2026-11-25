@@ -1,6 +1,6 @@
 import { useId, useRef, useState, type FormEvent, type KeyboardEvent } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { ArrowUp, CornerDownLeft } from 'lucide-react';
+import { ArrowUp } from 'lucide-react';
 import { detectCategory, detectHorizonYear, normalizeQuestion } from '@/lib/question';
 import { CATEGORY_LABELS } from '@/data/records';
 import styles from './QuestionComposer.module.css';
@@ -143,14 +143,6 @@ export function QuestionComposer({
           </p>
         ) : null}
       </div>
-
-      <p className={styles.disclaimer}>
-        <span className={styles.disclaimerMark} aria-hidden="true">
-          <CornerDownLeft size={11} strokeWidth={2} />
-        </span>
-        No forecasting engine is live yet. Submitting opens a demonstration
-        reading of your question — it will not invent a probability.
-      </p>
     </form>
   );
 }

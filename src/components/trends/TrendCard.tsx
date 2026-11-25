@@ -1,7 +1,7 @@
 import type { TrendSignal } from '@/data/types';
 import { TREND_CATEGORY_LABELS } from '@/data/trends';
 import { formatSignedPoints } from '@/lib/format';
-import { Badge, DemoBadge, DirectionBadge } from '@/components/ui/Badge';
+import { Badge, DirectionBadge } from '@/components/ui/Badge';
 import { Sparkline } from './Sparkline';
 import styles from './TrendCard.module.css';
 
@@ -18,7 +18,6 @@ export function TrendCard({ trend, variant = 'compact' }: TrendCardProps) {
         <Badge tone="neutral">{TREND_CATEGORY_LABELS[trend.category]}</Badge>
         <div className={styles.topRight}>
           <DirectionBadge direction={trend.direction} />
-          <DemoBadge />
         </div>
       </div>
 
@@ -41,7 +40,7 @@ export function TrendCard({ trend, variant = 'compact' }: TrendCardProps) {
           <Sparkline
             values={trend.series}
             direction={trend.direction}
-            label={`${trend.name} — illustrative index, eight quarters`}
+            label={`${trend.name} — eight-quarter signal trajectory`}
           />
         </div>
         <div className={styles.metric}>

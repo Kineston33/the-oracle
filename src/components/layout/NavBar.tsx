@@ -173,7 +173,7 @@ export function NavBar() {
         </nav>
         <div className={styles.panelFooter}>
           <p className={styles.panelNotice}>
-            Illustrative archive. No official predictions have been published yet.
+            THE ORACLE · Public forecasting intelligence.
           </p>
         </div>
       </div>

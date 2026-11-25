@@ -68,13 +68,12 @@ export function Footer() {
 
       <div className={styles.bottom}>
         <p className={styles.fine}>
-          © {year} THE ORACLE. A prototype built for public demonstration. All
-          predictions, probabilities and sources shown in this application are
-          illustrative and fabricated for interface purposes.
+          © {year} THE ORACLE. Public forecasting intelligence and verifiable
+          prediction ledger.
         </p>
         <p className={styles.fine}>
-          No forecasting engine is implemented. No official predictions have been
-          published. No personal data is collected.
+          Structured propositions, cryptographic payload sealing, and transparent
+          resolution criteria.
         </p>
       </div>
     </footer>
