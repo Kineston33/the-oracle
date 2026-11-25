@@ -320,6 +320,59 @@ describe('accessibility basics', () => {
     }
   });
 
+  it('renders the animated cosmic iris SVG with counter-rotating filament layers, contraction/dilation, multi-depth stardust, and a stationary black central pupil', () => {
+    renderApp('/');
+    const main = screen.getByRole('main');
+    const heroSphere = within(main).getAllByTestId('crystal-sphere')[0]!;
+
+    // Pure SVG + CSS implementation: no video or raster substitute
+    expect(heroSphere.querySelector('video')).toBeNull();
+    expect(heroSphere.querySelector('img')).toBeNull();
+    const svg = heroSphere.querySelector('svg');
+    expect(svg).not.toBeNull();
+
+    // Active animation state under normal conditions
+    expect(heroSphere).toHaveAttribute('data-reduced-motion', 'false');
+    expect(heroSphere.className).not.toMatch(/paused/);
+
+    // Contraction & dilation groups
+    const dilationGroup = heroSphere.querySelector('[data-layer="iris-dilation"]');
+    const collarettePulse = heroSphere.querySelector('[data-layer="iris-collarette-pulse"]');
+    expect(dilationGroup).not.toBeNull();
+    expect(collarettePulse).not.toBeNull();
+
+    // Counter-rotating iris filament and limbus layers inside the dilation group
+    const deepCw = dilationGroup!.querySelector('[data-layer="iris-deep-cw"]');
+    const electricCcw = dilationGroup!.querySelector('[data-layer="iris-electric-ccw"]');
+    const cyanCw = dilationGroup!.querySelector('[data-layer="iris-cyan-cw"]');
+    const limbusCw = dilationGroup!.querySelector('[data-layer="limbus-ring-cw"]');
+    const limbusCcw = dilationGroup!.querySelector('[data-layer="limbus-ring-ccw"]');
+    expect(deepCw).not.toBeNull();
+    expect(electricCcw).not.toBeNull();
+    expect(cyanCw).not.toBeNull();
+    expect(limbusCw).not.toBeNull();
+    expect(limbusCcw).not.toBeNull();
+
+    // Multi-layer curved filaments and particles are rendered inside the iris
+    expect(dilationGroup!.querySelectorAll('path').length).toBeGreaterThan(150);
+    expect(svg!.querySelectorAll('circle').length).toBeGreaterThan(200);
+
+    // Outer dispersing stardust orbital & drift layers
+    expect(heroSphere.querySelector('[data-layer="stardust-drift-outer"]')).not.toBeNull();
+    expect(heroSphere.querySelector('[data-layer="stardust-orbit-cw"]')).not.toBeNull();
+    expect(heroSphere.querySelector('[data-layer="stardust-drift-inner"]')).not.toBeNull();
+    expect(heroSphere.querySelector('[data-layer="stardust-orbit-ccw"]')).not.toBeNull();
+
+    // Stationary deep black central pupil is outside the rotating/scaling iris group
+    const pupilFixed = heroSphere.querySelector('[data-layer="pupil-fixed"]');
+    const pupilCore = within(heroSphere).getByTestId('pupil-core');
+    expect(pupilFixed).not.toBeNull();
+    expect(dilationGroup!.contains(pupilFixed)).toBe(false);
+    expect(pupilCore).toHaveAttribute('fill', '#000000');
+    expect(pupilCore).toHaveAttribute('cx', '200');
+    expect(pupilCore).toHaveAttribute('cy', '200');
+  });
+
   it('announces search result counts politely', () => {
     renderApp('/predictions');
     const input = screen.getByLabelText(/search records/i);

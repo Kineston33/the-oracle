@@ -1,5 +1,5 @@
 /* ==========================================================================
-   THE ORACLE — Holographic Energy Sphere (Pure SVG + CSS)
+   THE ORACLE — Cosmic Iris Sphere (Pure SVG + CSS)
    ========================================================================== */
 
 .sphere {
@@ -8,12 +8,6 @@
   display: grid;
   place-items: center;
   pointer-events: none;
-  --spin-outer: 84s;
-  --spin-inner: 52s;
-  --spin-collar: 110s;
-  --spin-collar-rev: 76s;
-  --spin-gyro-outer: 36s;
-  --spin-gyro-inner: 26s;
 }
 
 .hero {
@@ -34,7 +28,8 @@
   display: grid;
   place-items: center;
   isolation: isolate;
-  background: radial-gradient(circle, rgba(0, 12, 32, 0.45) 0%, rgba(0, 0, 0, 0) 70%);
+  background-color: #000000;
+  border-radius: 50%;
 }
 
 .hero .stage {
@@ -53,343 +48,248 @@
   height: 100%;
   overflow: visible;
   z-index: 2;
-  filter: drop-shadow(0 0 38px rgba(0, 180, 255, 0.28))
-    drop-shadow(0 24px 64px rgba(0, 6, 24, 0.9));
+  filter: drop-shadow(0 0 34px rgba(0, 162, 255, 0.28));
 }
 
-/* --- Ambient Electric-Blue & Cyan Holographic Bloom ---------------------- */
+/* --- Ambient Cosmic Iris Glow on Pure Black ------------------------------ */
 
-.bloom,
-.bloomCyan,
-.bloomCore {
+.bloomOuter,
+.bloomIris {
   position: absolute;
   border-radius: 50%;
   pointer-events: none;
   z-index: 1;
 }
 
-.bloom {
-  width: 66%;
-  height: 66%;
-  filter: blur(50px);
+.bloomOuter {
+  width: 72%;
+  height: 72%;
+  filter: blur(48px);
   background: radial-gradient(
     circle,
-    rgba(0, 132, 255, 0.36) 0%,
-    rgba(0, 68, 204, 0.18) 46%,
-    transparent 74%
+    transparent 18%,
+    rgba(0, 102, 255, 0.32) 42%,
+    rgba(92, 75, 255, 0.16) 60%,
+    transparent 76%
   );
-  animation: bloomPulse 9s ease-in-out infinite;
+  animation: ambientPulse 7.5s ease-in-out infinite;
 }
 
-.bloomCyan {
-  width: 46%;
-  height: 46%;
-  filter: blur(36px);
+.bloomIris {
+  width: 56%;
+  height: 56%;
+  filter: blur(30px);
   background: radial-gradient(
     circle,
-    rgba(0, 240, 255, 0.34) 0%,
-    rgba(0, 162, 255, 0.14) 52%,
-    transparent 74%
+    transparent 24%,
+    rgba(0, 224, 255, 0.34) 48%,
+    rgba(0, 110, 255, 0.2) 66%,
+    transparent 80%
   );
-  animation: bloomPulse 13s ease-in-out infinite reverse;
+  animation: ambientPulse 5.8s ease-in-out infinite reverse;
 }
 
-.bloomCore {
-  width: 24%;
-  height: 24%;
-  filter: blur(22px);
-  background: radial-gradient(
-    circle,
-    rgba(190, 255, 255, 0.48) 0%,
-    rgba(0, 224, 255, 0.22) 55%,
-    transparent 78%
-  );
-  animation: coreGlowPulse 5.5s ease-in-out infinite;
-}
-
-@keyframes bloomPulse {
-  0%, 100% {
-    opacity: 0.68;
-    transform: scale(0.97);
-  }
-  50% {
-    opacity: 0.98;
-    transform: scale(1.05);
-  }
-}
-
-@keyframes coreGlowPulse {
+@keyframes ambientPulse {
   0%, 100% {
     opacity: 0.72;
-    transform: scale(0.94);
-  }
-  50% {
-    opacity: 1;
-    transform: scale(1.08);
-  }
-}
-
-/* --- Fixed Camera & Sphere Position -------------------------------------- */
-
-.crystalBody {
-  transform-origin: 200px 200px;
-}
-
-/* --- Multi-Axis Orbital Rings & Gyroscopes ------------------------------- */
-
-.ringOuter,
-.ringMid,
-.ringInner,
-.ringCollar,
-.ringCollarReverse,
-.gyroOuter,
-.gyroInner {
-  transform-origin: 200px 200px;
-}
-
-@keyframes spinCw {
-  from {
-    transform: rotate(0deg);
-  }
-  to {
-    transform: rotate(360deg);
-  }
-}
-
-@keyframes spinCcw {
-  from {
-    transform: rotate(360deg);
-  }
-  to {
-    transform: rotate(0deg);
-  }
-}
-
-.ringCollar {
-  animation: spinCw var(--spin-collar) linear infinite;
-}
-
-.ringCollarReverse {
-  animation: spinCcw var(--spin-collar-rev) linear infinite;
-}
-
-.gyroOuter {
-  animation: spinCw var(--spin-gyro-outer) linear infinite;
-}
-
-.gyroInner {
-  animation: spinCcw var(--spin-gyro-inner) linear infinite;
-}
-
-.ringsFar {
-  opacity: 0.88;
-}
-
-.ringsNear {
-  opacity: 1;
-}
-
-/* --- Curved Surface Filaments (Seamless Continuous Dash Flow) ------------ */
-
-.surfaceFilaments {
-  transform-origin: 200px 200px;
-  animation: spinCw 96s linear infinite;
-}
-
-@keyframes filamentFlowForward {
-  from {
-    stroke-dashoffset: 1000;
-  }
-  to {
-    stroke-dashoffset: 0;
-  }
-}
-
-@keyframes filamentFlowReverse {
-  from {
-    stroke-dashoffset: 0;
-  }
-  to {
-    stroke-dashoffset: 1000;
-  }
-}
-
-.filamentPrimary {
-  animation: filamentFlowForward 11s linear infinite;
-  filter: drop-shadow(0 0 4px rgba(0, 240, 255, 0.75));
-}
-
-.filamentSecondary {
-  animation: filamentFlowReverse 15s linear infinite;
-  filter: drop-shadow(0 0 4px rgba(0, 140, 255, 0.7));
-}
-
-.filamentAccent {
-  animation: filamentFlowForward 8.5s linear infinite;
-  filter: drop-shadow(0 0 5px rgba(130, 250, 255, 0.85));
-}
-
-/* --- Propagating Energy Waves -------------------------------------------- */
-
-.energyWaves {
-  transform-origin: 200px 200px;
-}
-
-.energyWave {
-  transform-origin: 200px 200px;
-  animation: energyWaveExpand 9s cubic-bezier(0.22, 0.61, 0.36, 1) infinite;
-}
-
-.wave1 {
-  animation-delay: 0s;
-}
-
-.wave2 {
-  animation-delay: -3s;
-}
-
-.wave3 {
-  animation-delay: -6s;
-}
-
-@keyframes energyWaveExpand {
-  0% {
-    transform: scale(0.14);
-    opacity: 0;
-  }
-  18% {
-    opacity: 0.72;
-  }
-  82% {
-    opacity: 0.24;
-  }
-  100% {
-    transform: scale(1.04);
-    opacity: 0;
-  }
-}
-
-.scanWave {
-  transform-origin: 200px 200px;
-  animation: scanWaveTraverse 7.5s ease-in-out infinite;
-}
-
-@keyframes scanWaveTraverse {
-  0%, 100% {
-    transform: translateY(-76px) scaleX(0.62);
-    opacity: 0.14;
-  }
-  50% {
-    transform: translateY(0px) scaleX(1);
-    opacity: 0.68;
-  }
-}
-
-/* --- Orbital Particle Streams & Twinkle ---------------------------------- */
-
-.particleStreamCw {
-  transform-origin: 200px 200px;
-  animation: spinCw 68s linear infinite;
-}
-
-.particleStreamCcw {
-  transform-origin: 200px 200px;
-  animation: spinCcw 48s linear infinite;
-}
-
-.particle {
-  animation: particleTwinkle 4.8s ease-in-out infinite;
-}
-
-@keyframes particleTwinkle {
-  0%, 100% {
-    opacity: 0.22;
-  }
-  50% {
-    opacity: 0.92;
-  }
-}
-
-.nodeOuter {
-  filter: drop-shadow(0 0 7px rgba(140, 250, 255, 0.95));
-}
-
-.nodeSecondary {
-  filter: drop-shadow(0 0 5px rgba(0, 216, 255, 0.9));
-}
-
-/* --- Core Singularity & Plasma Corona ------------------------------------ */
-
-.core {
-  transform-origin: 200px 200px;
-  animation: corePulse 5.2s ease-in-out infinite;
-}
-
-.coreCorona {
-  transform-origin: 200px 200px;
-  animation: coronaPulse 3.6s ease-in-out infinite;
-}
-
-.plasmaGlow {
-  transform-origin: 200px 200px;
-  animation: plasmaBreathe 7.8s ease-in-out infinite;
-}
-
-@keyframes corePulse {
-  0%, 100% {
-    opacity: 0.9;
     transform: scale(0.96);
   }
   50% {
     opacity: 1;
-    transform: scale(1.06);
+    transform: scale(1.05);
   }
 }
 
-@keyframes coronaPulse {
+/* --- Shared 400x400 Center Transform Anchor ------------------------------ */
+
+.irisDilationGroup,
+.irisInnerCollarettePulse,
+.irisLayerDeepCw,
+.irisLayerElectricCcw,
+.irisLayerCyanCw,
+.limbusRingCw,
+.limbusRingCcw,
+.stardustDriftOuter,
+.stardustDriftInner,
+.stardustOrbitCw,
+.stardustOrbitCcw {
+  transform-box: fill-box;
+  transform-origin: center;
+  will-change: transform;
+}
+
+/* --- Organic Iris Contraction & Dilation --------------------------------- */
+
+.irisDilationGroup {
+  animation: irisContractDilate 6.8s ease-in-out infinite;
+}
+
+.irisInnerCollarettePulse {
+  animation: collaretteContractDilate 5.2s ease-in-out infinite;
+}
+
+@keyframes irisContractDilate {
   0%, 100% {
-    opacity: 0.82;
-    transform: scale(0.92);
+    transform: scale(0.935);
+  }
+  50% {
+    transform: scale(1.055);
+  }
+}
+
+@keyframes collaretteContractDilate {
+  0%, 100% {
+    transform: scale(1.065);
+  }
+  50% {
+    transform: scale(0.915);
+  }
+}
+
+.irisAmbientGlow {
+  animation: irisGlowBreathe 5.6s ease-in-out infinite;
+}
+
+@keyframes irisGlowBreathe {
+  0%, 100% {
+    opacity: 0.74;
   }
   50% {
     opacity: 1;
-    transform: scale(1.1);
   }
 }
 
-@keyframes plasmaBreathe {
+/* --- Counter-Rotating Iris Stroma & Limbus Layers ------------------------ */
+
+@keyframes rotateCw {
+  from {
+    transform: rotate(0deg);
+  }
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+@keyframes rotateCcw {
+  from {
+    transform: rotate(360deg);
+  }
+  to {
+    transform: rotate(0deg);
+  }
+}
+
+.irisLayerDeepCw {
+  animation: rotateCw 38s linear infinite;
+}
+
+.irisLayerElectricCcw {
+  animation: rotateCcw 27s linear infinite;
+}
+
+.irisLayerCyanCw {
+  animation: rotateCw 20s linear infinite;
+}
+
+.limbusRingCw {
+  animation: rotateCw 44s linear infinite;
+}
+
+.limbusRingCcw {
+  animation: rotateCcw 32s linear infinite;
+}
+
+.limbusGlowPath {
+  filter: drop-shadow(0 0 6px rgba(0, 229, 255, 0.85));
+  animation: limbusIntensity 4.4s ease-in-out infinite;
+}
+
+.limbusSecondaryPath {
+  filter: drop-shadow(0 0 5px rgba(41, 136, 255, 0.75));
+  animation: limbusIntensity 6.2s ease-in-out infinite reverse;
+}
+
+@keyframes limbusIntensity {
   0%, 100% {
-    opacity: 0.78;
+    opacity: 0.72;
   }
   50% {
-    opacity: 0.98;
+    opacity: 1;
   }
 }
 
-.specular {
-  animation: specularShift 14s ease-in-out infinite;
+/* --- Outer Stardust Orbit & Gentle Radial Dispersion --------------------- */
+
+.stardustOrbitCw {
+  animation: rotateCw 34s linear infinite;
 }
 
-@keyframes specularShift {
+.stardustOrbitCcw {
+  animation: rotateCcw 48s linear infinite;
+}
+
+.stardustDriftOuter {
+  animation: stardustBreatheOuter 8.4s ease-in-out infinite;
+}
+
+.stardustDriftInner {
+  animation: stardustBreatheInner 6.6s ease-in-out infinite;
+}
+
+@keyframes stardustBreatheOuter {
   0%, 100% {
-    opacity: 0.88;
-  }
-  50% {
-    opacity: 0.56;
-  }
-}
-
-.caustic {
-  animation: causticPulse 10s ease-in-out infinite;
-}
-
-@keyframes causticPulse {
-  0%, 100% {
-    opacity: 0.45;
-  }
-  50% {
+    transform: scale(0.96);
     opacity: 0.82;
   }
+  50% {
+    transform: scale(1.05);
+    opacity: 1;
+  }
+}
+
+@keyframes stardustBreatheInner {
+  0%, 100% {
+    transform: scale(1.04);
+    opacity: 0.96;
+  }
+  50% {
+    transform: scale(0.95);
+    opacity: 0.76;
+  }
+}
+
+/* --- Multi-Depth Particle Shimmer ---------------------------------------- */
+
+@keyframes particleTwinkle {
+  0%, 100% {
+    opacity: 0.32;
+  }
+  50% {
+    opacity: 1;
+  }
+}
+
+.twinkleA {
+  animation: particleTwinkle 3.2s ease-in-out infinite;
+}
+
+.twinkleB {
+  animation: particleTwinkle 4.4s ease-in-out -1.1s infinite;
+}
+
+.twinkleC {
+  animation: particleTwinkle 3.8s ease-in-out -2.3s infinite;
+}
+
+.twinkleD {
+  animation: particleTwinkle 5.0s ease-in-out -3.4s infinite;
+}
+
+/* --- Stationary Central Black Pupil -------------------------------------- */
+
+.pupilFixed {
+  transform: none !important;
+  animation: none !important;
 }
 
 /* --- Interaction States (`idle`, `reading`, `thinking`) ------------------ */
@@ -398,44 +298,40 @@
   --sphere-intensity: 1;
 }
 
-.reading .bloom,
-.reading .bloomCyan {
-  opacity: 0.96;
+.reading .irisDilationGroup {
+  animation-duration: 4.8s;
 }
 
-.reading .filamentPrimary,
-.reading .filamentAccent {
-  animation-duration: 6.5s;
+.reading .irisLayerCyanCw {
+  animation-duration: 14s;
 }
 
-.thinking .bloom {
+.reading .irisLayerElectricCcw {
+  animation-duration: 19s;
+}
+
+.thinking .irisDilationGroup {
   animation-duration: 2.8s;
 }
 
-.thinking .core {
-  animation-duration: 1.8s;
+.thinking .irisInnerCollarettePulse {
+  animation-duration: 2.2s;
 }
 
-.thinking .coreCorona {
-  animation-duration: 1.3s;
+.thinking .irisLayerCyanCw {
+  animation-duration: 9s;
 }
 
-.thinking .gyroOuter {
+.thinking .irisLayerElectricCcw {
   animation-duration: 12s;
 }
 
-.thinking .gyroInner {
-  animation-duration: 8.5s;
+.thinking .irisLayerDeepCw {
+  animation-duration: 18s;
 }
 
-.thinking .filamentPrimary,
-.thinking .filamentSecondary,
-.thinking .filamentAccent {
-  animation-duration: 4.2s;
-}
-
-.thinking .energyWave {
-  animation-duration: 4.5s;
+.thinking .stardustOrbitCw {
+  animation-duration: 16s;
 }
 
 .paused *,
@@ -474,11 +370,10 @@
 }
 
 .compact .readout,
-.compact .bloom,
-.compact .bloomCyan,
-.compact .bloomCore,
-.compact .compass,
-.compact .energyWaves {
+.compact .bloomOuter,
+.compact .bloomIris,
+.compact .stardustDriftOuter,
+.compact .stardustDriftInner {
   display: none;
 }
 
@@ -486,17 +381,17 @@
   filter: none;
 }
 
-.compact .core,
-.compact .coreCorona,
-.compact .gyroOuter,
-.compact .gyroInner,
-.compact .surfaceFilaments,
-.compact .filamentPrimary,
-.compact .filamentSecondary,
-.compact .filamentAccent,
-.compact .particleStreamCw,
-.compact .particleStreamCcw,
-.compact .particle {
+.compact .irisDilationGroup,
+.compact .irisInnerCollarettePulse,
+.compact .irisLayerDeepCw,
+.compact .irisLayerElectricCcw,
+.compact .irisLayerCyanCw,
+.compact .limbusRingCw,
+.compact .limbusRingCcw,
+.compact .twinkleA,
+.compact .twinkleB,
+.compact .twinkleC,
+.compact .twinkleD {
   animation: none;
 }
 
@@ -530,38 +425,27 @@
   animation: none !important;
 }
 
-.reducedMotion .energyWave {
-  opacity: 0.28;
-  transform: scale(0.76);
-}
-
 @media (prefers-reduced-motion: reduce) {
-  .bloom,
-  .bloomCyan,
-  .bloomCore,
-  .core,
-  .coreCorona,
-  .plasmaGlow,
-  .caustic,
-  .specular,
-  .ringCollar,
-  .ringCollarReverse,
-  .gyroOuter,
-  .gyroInner,
-  .surfaceFilaments,
-  .filamentPrimary,
-  .filamentSecondary,
-  .filamentAccent,
-  .energyWave,
-  .scanWave,
-  .particleStreamCw,
-  .particleStreamCcw,
-  .particle {
+  .bloomOuter,
+  .bloomIris,
+  .irisDilationGroup,
+  .irisInnerCollarettePulse,
+  .irisAmbientGlow,
+  .irisLayerDeepCw,
+  .irisLayerElectricCcw,
+  .irisLayerCyanCw,
+  .limbusRingCw,
+  .limbusRingCcw,
+  .limbusGlowPath,
+  .limbusSecondaryPath,
+  .stardustOrbitCw,
+  .stardustOrbitCcw,
+  .stardustDriftOuter,
+  .stardustDriftInner,
+  .twinkleA,
+  .twinkleB,
+  .twinkleC,
+  .twinkleD {
     animation: none !important;
-  }
-
-  .energyWave {
-    opacity: 0.28;
-    transform: scale(0.76);
   }
 }
