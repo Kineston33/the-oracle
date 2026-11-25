@@ -74,6 +74,47 @@ describe('navigation', () => {
 });
 
 describe('homepage question input', () => {
+  it('orders the hero vertically: title & description above the centered sphere, question composer immediately below, and secondary elements last', () => {
+    renderApp('/');
+
+    const main = screen.getByRole('main');
+    const heading = within(main).getByRole('heading', {
+      level: 1,
+      name: /see what['\u2019]s coming/i,
+    });
+    const description = within(main).getByText(
+      /ask any question about the future\. the oracle publishes one official prediction per question/i,
+    );
+    const heroSphere = within(main).getAllByTestId('crystal-sphere')[0]!;
+    const composerForm = within(main).getByRole('search', {
+      name: /ask the oracle a question/i,
+    });
+    const consultButton = within(composerForm).getByRole('button', {
+      name: /consult the oracle/i,
+    });
+    const suggestionsLabel = within(main).getByText(/suggested explorations/i);
+
+    expect(consultButton).toBeInTheDocument();
+
+    // Verify strict vertical DOM order: heading -> description -> sphere -> composer -> secondary suggestions
+    expect(
+      heading.compareDocumentPosition(description) &
+        Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy();
+    expect(
+      description.compareDocumentPosition(heroSphere) &
+        Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy();
+    expect(
+      heroSphere.compareDocumentPosition(composerForm) &
+        Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy();
+    expect(
+      composerForm.compareDocumentPosition(suggestionsLabel) &
+        Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy();
+  });
+
   it('asks for at least a dozen characters before submitting', async () => {
     const user = userEvent.setup();
     renderApp('/');
