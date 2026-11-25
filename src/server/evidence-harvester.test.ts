@@ -516,6 +516,29 @@ describe('EvidenceHarvester — Stage 1', () => {
         'https://172.32.0.1/report',
       );
 
+      // Deprecated 6to4 Relay Anycast 192.88.99.0/24 (RFC 7526, Not Globally Reachable)
+      expect(isPrivateOrLocalHostname('192.88.99.0')).toBe(true);
+      expect(isPrivateOrLocalHostname('192.88.99.1')).toBe(true);
+      expect(isPrivateOrLocalHostname('192.88.99.2')).toBe(true);
+      expect(isPrivateOrLocalHostname('192.88.99.255')).toBe(true);
+      expect(validateAndNormalizeEvidenceUrl('http://192.88.99.1/relay')).toBeNull();
+      expect(validateAndNormalizeEvidenceUrl('https://192.88.99.2/relay')).toBeNull();
+      expect(validateAndNormalizeEvidenceUrl('https://192.88.99.255/relay')).toBeNull();
+      // Adjacent public addresses outside 192.88.99.0/24 remain allowed
+      expect(isPrivateOrLocalHostname('192.88.98.255')).toBe(false);
+      expect(isPrivateOrLocalHostname('192.88.100.1')).toBe(false);
+
+      // IANA globally reachable special-purpose IPv4 blocks must NOT be falsely blocked:
+      // 192.31.196.0/24 (AS112-v4, RFC 7535) and 192.52.193.0/24 (AMT, RFC 7450)
+      expect(isPrivateOrLocalHostname('192.31.196.1')).toBe(false);
+      expect(isPrivateOrLocalHostname('192.52.193.1')).toBe(false);
+      expect(validateAndNormalizeEvidenceUrl('https://192.31.196.1/info')).toBe(
+        'https://192.31.196.1/info',
+      );
+      expect(validateAndNormalizeEvidenceUrl('https://192.52.193.1/info')).toBe(
+        'https://192.52.193.1/info',
+      );
+
       // Other private, loopback, link-local, CGNAT, multicast, and reserved IPv4 blocks
       expect(validateAndNormalizeEvidenceUrl('http://0.0.0.0/test')).toBeNull();
       expect(validateAndNormalizeEvidenceUrl('http://10.0.0.1/test')).toBeNull();
@@ -571,26 +594,59 @@ describe('EvidenceHarvester — Stage 1', () => {
       expect(validateAndNormalizeEvidenceUrl('https://[fc00::1]/test')).toBeNull();
       expect(validateAndNormalizeEvidenceUrl('https://[fd12:3456:789a::1]/test')).toBeNull();
 
-      // IPv4-mapped IPv6 (::ffff:0:0/96), IPv4-compatible, NAT64, 6to4, and Teredo with private IPv4
+      // IPv4-mapped IPv6 (::ffff:0:0/96), IPv4-compatible, NAT64, 6to4, and Teredo with private/reserved IPv4
       expect(isPrivateOrLocalHostname('::ffff:127.0.0.1')).toBe(true);
       expect(isPrivateOrLocalHostname('::ffff:10.0.0.1')).toBe(true);
       expect(isPrivateOrLocalHostname('::ffff:172.16.0.1')).toBe(true);
       expect(isPrivateOrLocalHostname('::ffff:172.31.255.255')).toBe(true);
       expect(isPrivateOrLocalHostname('::ffff:192.168.1.1')).toBe(true);
+      expect(isPrivateOrLocalHostname('::ffff:192.88.99.1')).toBe(true);
       expect(isPrivateOrLocalHostname('::ffff:169.254.169.254')).toBe(true);
       expect(isPrivateOrLocalHostname('::127.0.0.1')).toBe(true);
       expect(isPrivateOrLocalHostname('64:ff9b::10.0.0.1')).toBe(true);
       expect(isPrivateOrLocalHostname('64:ff9b::172.16.0.1')).toBe(true);
+      expect(isPrivateOrLocalHostname('64:ff9b::192.88.99.1')).toBe(true);
       expect(isPrivateOrLocalHostname('64:ff9b:1::1')).toBe(true); // RFC 8215 Local-Use NAT64
       expect(isPrivateOrLocalHostname('2002:ac10:1::1')).toBe(true); // 6to4 with 172.16.0.1
       expect(isPrivateOrLocalHostname('2002:c0a8:101::1')).toBe(true); // 6to4 with 192.168.1.1
-      // Teredo (2001:0000::/32): client IPv4 is XORed with 0xffff in last 32 bits:
-      // 127.0.0.1 (0x7f00:0x0001) XOR 0xffff = 0x80ff:0xfffe
+      expect(isPrivateOrLocalHostname('2002:c058:6301::1')).toBe(true); // 6to4 with 192.88.99.1
+
+      // Teredo (2001:0000::/32) server & client validation:
+      // 1) Server IPv4 is 0.0.0.0 (h[2]=0, h[3]=0) with public client 93.184.216.34 (XOR = a247:27dd) -> REJECTED
+      expect(isPrivateOrLocalHostname('2001:0:0:0:8000:63bf:a247:27dd')).toBe(true);
+      expect(isPrivateOrLocalHostname('2001::a247:27dd')).toBe(true);
+      expect(isPrivateOrLocalHostname('2001::1')).toBe(true);
+      expect(
+        validateAndNormalizeEvidenceUrl('https://[2001:0:0:0:8000:63bf:a247:27dd]/teredo'),
+      ).toBeNull();
+      expect(validateAndNormalizeEvidenceUrl('https://[2001::a247:27dd]/teredo')).toBeNull();
+
+      // 2) Private/non-public server IPv4 (10.0.0.1, 172.16.0.1, 192.88.99.1) with public client -> REJECTED
+      expect(isPrivateOrLocalHostname('2001:0:0a00:0001:8000:63bf:a247:27dd')).toBe(
+        true,
+      );
+      expect(isPrivateOrLocalHostname('2001:0:ac10:0001:8000:63bf:a247:27dd')).toBe(
+        true,
+      );
+      expect(isPrivateOrLocalHostname('2001:0:c058:6301:8000:63bf:a247:27dd')).toBe(
+        true,
+      );
+
+      // 3) Public server IPv4 (65.54.227.120 = 4136:e378) with private/reserved client IPv4 -> REJECTED
+      //    - Client 127.0.0.1 (7f00:0001) XOR ffff = 80ff:fffe
+      //    - Client 0.0.0.0 (0000:0000) XOR ffff = ffff:ffff
+      //    - Client 172.16.0.1 (ac10:0001) XOR ffff = 53ef:fffe
+      //    - Client 192.88.99.1 (c058:6301) XOR ffff = 3fa7:9cfe
       expect(isPrivateOrLocalHostname('2001:0:4136:e378:8000:63bf:80ff:fffe')).toBe(
         true,
       );
-      // Teredo with private server IPv4 10.0.0.1 (0x0a00:0x0001) even if client IPv4 is public
-      expect(isPrivateOrLocalHostname('2001:0:0a00:0001:8000:63bf:a247:27dd')).toBe(
+      expect(isPrivateOrLocalHostname('2001:0:4136:e378:8000:63bf:ffff:ffff')).toBe(
+        true,
+      );
+      expect(isPrivateOrLocalHostname('2001:0:4136:e378:8000:63bf:53ef:fffe')).toBe(
+        true,
+      );
+      expect(isPrivateOrLocalHostname('2001:0:4136:e378:8000:63bf:3fa7:9cfe')).toBe(
         true,
       );
 

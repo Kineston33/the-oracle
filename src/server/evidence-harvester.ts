@@ -363,6 +363,8 @@ function isPrivateOrReservedIpv4Octets(
   if (o0 === 192 && o1 === 0 && o2 === 0) return true;
   // 192.0.2.0/24 — TEST-NET-1 Documentation (RFC 5737)
   if (o0 === 192 && o1 === 0 && o2 === 2) return true;
+  // 192.88.99.0/24 — Deprecated 6to4 Relay Anycast (RFC 7526, Not Globally Reachable)
+  if (o0 === 192 && o1 === 88 && o2 === 99) return true;
   // 192.168.0.0/16 — Private-Use (RFC 1918)
   if (o0 === 192 && o1 === 168) return true;
   // 198.18.0.0/15 — Benchmarking (RFC 2544)
@@ -560,22 +562,18 @@ function isPrivateOrReservedIpv6Hextets(h: readonly number[]): boolean {
   // 7a. IETF Protocol Assignments 2001:0000::/23 (h[0] === 0x2001 && h[1] in 0x0000..0x01ff)
   if (h[0] === 0x2001 && (h[1] & 0xfe00) === 0x0000) {
     // Teredo 2001:0000::/32 (RFC 4380): embeds server IPv4 in h[2..3] and
-    // XOR-obfuscated client IPv4 in h[6..7].
+    // XOR-obfuscated client IPv4 in h[6..7]. Both must always be validated,
+    // including when h[2..3] is 0 (0.0.0.0).
     if (h[1] === 0x0000) {
+      const serverOctets = extractEmbeddedIpv4OctetsFromHextets(h[2], h[3]);
       const clientOctets = extractEmbeddedIpv4OctetsFromHextets(
         h[6] ^ 0xffff,
         h[7] ^ 0xffff,
       );
-      if (isPrivateOrReservedIpv4Octets(clientOctets)) {
-        return true;
-      }
-      if (h[2] !== 0 || h[3] !== 0) {
-        const serverOctets = extractEmbeddedIpv4OctetsFromHextets(h[2], h[3]);
-        if (isPrivateOrReservedIpv4Octets(serverOctets)) {
-          return true;
-        }
-      }
-      return false;
+      return (
+        isPrivateOrReservedIpv4Octets(serverOctets) ||
+        isPrivateOrReservedIpv4Octets(clientOctets)
+      );
     }
 
     // All other sub-allocations in 2001:0000::/23 (0x0001..0x01ff) — including
