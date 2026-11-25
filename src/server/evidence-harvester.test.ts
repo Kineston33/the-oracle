@@ -6,12 +6,14 @@ import {
   HARD_MAX_TOTAL_RESULTS,
   InvalidHarvestRequestError,
   MAX_RESPONSE_BODY_BYTES,
+  classifyOpenAlexWorkType,
   computeDeterministicEvidenceId,
   computeThematicRelevance,
   createGdeltAdapter,
   createOpenAlexAdapter,
   createWikipediaAdapter,
-   harvestEvidence,
+  harvestEvidence,
+  isPrivateOrLocalHostname,
   normalizeVerifiableTimestamp,
   selectProvidersForCategory,
   selectVerifiedEvidenceReferences,
@@ -114,7 +116,8 @@ describe('EvidenceHarvester — Stage 1', () => {
         'Atmospheric carbon dioxide concentrations continued rising in early 2026.',
       );
       expect(paperItem?.sourceProvider).toBe('openalex');
-      expect(paperItem?.sourceType).toBe('peer-reviewed-work');
+      // Peer review is not explicitly attested in standard OpenAlex article payload:
+      expect(paperItem?.sourceType).toBe('scholarly-work');
       expect(paperItem?.isPrimarySourceVerified).toBe(false);
       expect(paperItem?.provenance.metadataOrigin).toBe('http-response-verbatim');
 
@@ -181,7 +184,7 @@ describe('EvidenceHarvester — Stage 1', () => {
       expect(item.isPrimarySourceVerified).toBe(false);
     });
 
-    it('normalizes valid GDELT DOC 2.0 responses when a verifiable publication date is present alongside seendate', async () => {
+    it('normalizes GDELT responses when a verifiable publication date is present alongside seendate', async () => {
       const mockFetch: typeof globalThis.fetch = vi.fn(async (input) => {
         const url = String(input);
         expect(url).toContain('api.gdeltproject.org/api/v2/doc/doc');
@@ -225,6 +228,57 @@ describe('EvidenceHarvester — Stage 1', () => {
       expect(item.kind).toBe('report');
       expect(item.sourceType).toBe('news-article');
       expect(item.isPrimarySourceVerified).toBe(false);
+    });
+
+    it('handles the real unenriched GDELT DOC 2.0 ArtList schema by recording seendate as indexedDate and discarding records lacking a verifiable publication/update date', async () => {
+      // Exact schema returned by https://api.gdeltproject.org/api/v2/doc/doc?mode=ArtList&format=json:
+      // { url, url_mobile, title, seendate, socialimage, domain, language, sourcecountry }
+      const realGdeltArtListFixture = {
+        articles: [
+          {
+            url: 'https://www.reuters.com/markets/europe/ecb-monetary-policy-inflation-2026-04-18/',
+            url_mobile: 'https://www.reuters.com/markets/europe/ecb-monetary-policy-inflation-2026-04-18/amp/',
+            title: 'European Central Bank monetary policy review targets inflation in 2026',
+            seendate: '20260418T140000Z',
+            socialimage: 'https://www.reuters.com/resizer/v2/sample.jpg',
+            domain: 'reuters.com',
+            language: 'English',
+            sourcecountry: 'United Kingdom',
+          },
+          {
+            url: 'https://www.bloomberg.com/news/articles/2026-04-19/eurozone-inflation-outlook',
+            url_mobile: '',
+            title: 'Eurozone inflation outlook steady before European Central Bank meeting',
+            seendate: '20260419T093000Z',
+            socialimage: '',
+            domain: 'bloomberg.com',
+            language: 'English',
+            sourcecountry: 'United States',
+          },
+        ],
+      };
+
+      const result = await harvestEvidence({
+        query: 'European Central Bank monetary policy inflation 2026',
+        providers: ['gdelt'],
+        referenceTime: SERVER_REFERENCE_TIME,
+        fetchImpl: async () => jsonResponse(realGdeltArtListFixture),
+      });
+
+      // Must NOT fabricate publication dates or promote seendate to publishedAt:
+      expect(result.items).toHaveLength(0);
+      expect(result.providerReports).toHaveLength(1);
+      expect(result.providerReports[0].status).toBe('empty');
+      expect(result.providerReports[0].rawCandidateCount).toBe(2);
+      expect(result.discarded).toHaveLength(2);
+
+      for (const diag of result.discarded) {
+        expect(diag.provider).toBe('gdelt');
+        expect(diag.reason).toBe('indexing-date-only');
+        expect(diag.rawPublishedDate).toBeNull();
+        expect(diag.rawUpdatedDate).toBeNull();
+        expect(diag.rawIndexedDate).toMatch(/^2026041[89]T\d{6}Z$/);
+      }
     });
   });
 
@@ -382,7 +436,7 @@ describe('EvidenceHarvester — Stage 1', () => {
     });
   });
 
-  describe('4. URLs inválidas descartadas', () => {
+  describe('4. URLs inválidas y validación completa de IP privadas / públicas', () => {
     it('discards records with missing, non-HTTP(S), localhost, credentialed, or malformed URLs', async () => {
       const mockFetch: typeof globalThis.fetch = vi.fn(async () =>
         jsonResponse({
@@ -439,20 +493,144 @@ describe('EvidenceHarvester — Stage 1', () => {
       expect(result.discarded.every((d) => d.reason === 'invalid-url')).toBe(true);
     });
 
-    it('validates validateAndNormalizeEvidenceUrl directly', () => {
+    it('rejects the full IPv4 172.16.0.0/12 range and other private/reserved IPv4 blocks while allowing public IPv4s', () => {
+      // 172.16.0.0/12 boundaries and interior addresses
+      expect(isPrivateOrLocalHostname('172.16.0.0')).toBe(true);
+      expect(isPrivateOrLocalHostname('172.16.0.1')).toBe(true);
+      expect(isPrivateOrLocalHostname('172.20.15.200')).toBe(true);
+      expect(isPrivateOrLocalHostname('172.31.255.254')).toBe(true);
+      expect(isPrivateOrLocalHostname('172.31.255.255')).toBe(true);
+
+      expect(validateAndNormalizeEvidenceUrl('http://172.16.0.1/data')).toBeNull();
+      expect(validateAndNormalizeEvidenceUrl('https://172.24.10.5/data')).toBeNull();
+      expect(validateAndNormalizeEvidenceUrl('https://172.31.255.255/data')).toBeNull();
+
+      // Immediately adjacent public IPv4 addresses outside 172.16.0.0/12
+      expect(isPrivateOrLocalHostname('172.15.255.255')).toBe(false);
+      expect(isPrivateOrLocalHostname('172.32.0.0')).toBe(false);
+      expect(isPrivateOrLocalHostname('172.32.0.1')).toBe(false);
+      expect(validateAndNormalizeEvidenceUrl('https://172.15.255.255/report')).toBe(
+        'https://172.15.255.255/report',
+      );
+      expect(validateAndNormalizeEvidenceUrl('https://172.32.0.1/report')).toBe(
+        'https://172.32.0.1/report',
+      );
+
+      // Other private, loopback, link-local, CGNAT, multicast, and reserved IPv4 blocks
+      expect(validateAndNormalizeEvidenceUrl('http://0.0.0.0/test')).toBeNull();
+      expect(validateAndNormalizeEvidenceUrl('http://10.0.0.1/test')).toBeNull();
+      expect(validateAndNormalizeEvidenceUrl('http://10.255.255.254/test')).toBeNull();
+      expect(validateAndNormalizeEvidenceUrl('http://100.64.0.1/test')).toBeNull();
+      expect(validateAndNormalizeEvidenceUrl('http://100.127.255.254/test')).toBeNull();
       expect(validateAndNormalizeEvidenceUrl('http://127.0.0.1/test')).toBeNull();
-      expect(validateAndNormalizeEvidenceUrl('https://192.168.1.1/test')).toBeNull();
-      expect(validateAndNormalizeEvidenceUrl('https://singlelabel/test')).toBeNull();
+      expect(validateAndNormalizeEvidenceUrl('http://127.255.255.254/test')).toBeNull();
+      expect(validateAndNormalizeEvidenceUrl('http://169.254.169.254/latest/meta-data')).toBeNull();
+      expect(validateAndNormalizeEvidenceUrl('https://192.168.0.1/test')).toBeNull();
+      expect(validateAndNormalizeEvidenceUrl('https://192.168.255.255/test')).toBeNull();
+      expect(validateAndNormalizeEvidenceUrl('https://224.0.0.1/test')).toBeNull();
+      expect(validateAndNormalizeEvidenceUrl('https://255.255.255.255/test')).toBeNull();
+
+      // Public IPv4 addresses
+      expect(validateAndNormalizeEvidenceUrl('https://93.184.216.34/article')).toBe(
+        'https://93.184.216.34/article',
+      );
+      expect(validateAndNormalizeEvidenceUrl('https://8.8.8.8/dns')).toBe(
+        'https://8.8.8.8/dns',
+      );
+      expect(validateAndNormalizeEvidenceUrl('https://100.63.255.255/public')).toBe(
+        'https://100.63.255.255/public',
+      );
+      expect(validateAndNormalizeEvidenceUrl('https://100.128.0.1/public')).toBe(
+        'https://100.128.0.1/public',
+      );
+    });
+
+    it('rejects local, loopback, link-local, unique-local, and private IPv4-mapped IPv6 addresses while allowing public IPv6 and public domains', () => {
+      // Loopback & Unspecified IPv6
+      expect(isPrivateOrLocalHostname('::1')).toBe(true);
+      expect(isPrivateOrLocalHostname('[::1]')).toBe(true);
+      expect(isPrivateOrLocalHostname('0:0:0:0:0:0:0:1')).toBe(true);
+      expect(isPrivateOrLocalHostname('::')).toBe(true);
+      expect(validateAndNormalizeEvidenceUrl('http://[::1]/test')).toBeNull();
+      expect(validateAndNormalizeEvidenceUrl('http://[::]/test')).toBeNull();
+
+      // Link-Local IPv6 (fe80::/10 -> fe80:: through febf::) and scoped zone IDs
+      expect(isPrivateOrLocalHostname('fe80::1')).toBe(true);
+      expect(isPrivateOrLocalHostname('fe9a::1234')).toBe(true);
+      expect(isPrivateOrLocalHostname('febf:ffff:ffff:ffff:ffff:ffff:ffff:ffff')).toBe(true);
+      expect(isPrivateOrLocalHostname('fe80::1%eth0')).toBe(true);
+      expect(validateAndNormalizeEvidenceUrl('http://[fe80::1]/test')).toBeNull();
+      expect(validateAndNormalizeEvidenceUrl('http://[febf::1]/test')).toBeNull();
+
+      // Unique-Local IPv6 (fc00::/7 -> fc00:: through fdff::) & Site-Local (fec0::/10)
+      expect(isPrivateOrLocalHostname('fc00::1')).toBe(true);
+      expect(isPrivateOrLocalHostname('fd00::1')).toBe(true);
+      expect(isPrivateOrLocalHostname('fd12:3456:789a:1::1')).toBe(true);
+      expect(isPrivateOrLocalHostname('fdff:ffff:ffff:ffff:ffff:ffff:ffff:ffff')).toBe(true);
+      expect(isPrivateOrLocalHostname('fec0::1')).toBe(true);
+      expect(validateAndNormalizeEvidenceUrl('https://[fc00::1]/test')).toBeNull();
+      expect(validateAndNormalizeEvidenceUrl('https://[fd12:3456:789a::1]/test')).toBeNull();
+
+      // IPv4-mapped IPv6 (::ffff:0:0/96), IPv4-compatible, NAT64, and 6to4 with private IPv4
+      expect(isPrivateOrLocalHostname('::ffff:127.0.0.1')).toBe(true);
+      expect(isPrivateOrLocalHostname('::ffff:10.0.0.1')).toBe(true);
+      expect(isPrivateOrLocalHostname('::ffff:172.16.0.1')).toBe(true);
+      expect(isPrivateOrLocalHostname('::ffff:172.31.255.255')).toBe(true);
+      expect(isPrivateOrLocalHostname('::ffff:192.168.1.1')).toBe(true);
+      expect(isPrivateOrLocalHostname('::ffff:169.254.169.254')).toBe(true);
+      expect(isPrivateOrLocalHostname('::127.0.0.1')).toBe(true);
+      expect(isPrivateOrLocalHostname('64:ff9b::10.0.0.1')).toBe(true);
+      expect(isPrivateOrLocalHostname('2002:ac10:1::1')).toBe(true); // 2002::/16 with 172.16.0.1
+
+      expect(validateAndNormalizeEvidenceUrl('http://[::ffff:127.0.0.1]/test')).toBeNull();
+      expect(validateAndNormalizeEvidenceUrl('http://[::ffff:10.0.0.1]/test')).toBeNull();
+      expect(validateAndNormalizeEvidenceUrl('http://[::ffff:172.16.0.1]/test')).toBeNull();
+      expect(validateAndNormalizeEvidenceUrl('http://[::ffff:172.31.255.255]/test')).toBeNull();
+      expect(validateAndNormalizeEvidenceUrl('http://[::ffff:192.168.1.1]/test')).toBeNull();
+      expect(validateAndNormalizeEvidenceUrl('http://[::ffff:169.254.169.254]/test')).toBeNull();
+
+      // IPv4-mapped IPv6 with PUBLIC IPv4 addresses must be allowed
+      expect(isPrivateOrLocalHostname('::ffff:93.184.216.34')).toBe(false);
+      expect(isPrivateOrLocalHostname('::ffff:172.15.255.255')).toBe(false);
+      expect(isPrivateOrLocalHostname('::ffff:172.32.0.1')).toBe(false);
+      expect(
+        validateAndNormalizeEvidenceUrl('https://[::ffff:93.184.216.34]/public'),
+      ).toBe('https://[::ffff:5db8:d822]/public');
+
+      // Global unicast public IPv6 addresses must be allowed
+      expect(
+        isPrivateOrLocalHostname('2606:2800:220:1:248:1893:25c8:1946'),
+      ).toBe(false);
       expect(
         validateAndNormalizeEvidenceUrl(
-          'HTTPS://Example.COM:443/path/item/?utm_source=x&b=2&a=1#section',
+          'https://[2606:2800:220:1:248:1893:25c8:1946]/report',
         ),
-      ).toBe('https://example.com/path/item?a=1&b=2');
+      ).toBe('https://[2606:2800:220:1:248:1893:25c8:1946]/report');
+
+      // Public domains that start with numbers or IP-like substrings must NOT trigger false positives
+      expect(isPrivateOrLocalHostname('172.example.com')).toBe(false);
+      expect(isPrivateOrLocalHostname('172-16.example.com')).toBe(false);
+      expect(isPrivateOrLocalHostname('fe80.example.org')).toBe(false);
+      expect(isPrivateOrLocalHostname('fc00.example.org')).toBe(false);
+      expect(isPrivateOrLocalHostname('localhost.example.com')).toBe(false);
+      expect(isPrivateOrLocalHostname('10.org')).toBe(false);
+      expect(
+        validateAndNormalizeEvidenceUrl(
+          'HTTPS://172.Example.COM:443/path/item/?utm_source=x&b=2&a=1#section',
+        ),
+      ).toBe('https://172.example.com/path/item?a=1&b=2');
+      expect(
+        validateAndNormalizeEvidenceUrl('https://fe80.example.org/paper'),
+      ).toBe('https://fe80.example.org/paper');
+      expect(
+        validateAndNormalizeEvidenceUrl('https://localhost.example.com/paper'),
+      ).toBe('https://localhost.example.com/paper');
+      expect(validateAndNormalizeEvidenceUrl('https://singlelabel/test')).toBeNull();
     });
   });
 
-  describe('5. Timeouts', () => {
-    it('aborts slow providers using AbortSignal.timeout and reports status="timeout" without throwing', async () => {
+  describe('5. Timeouts (en conexión y durante la lectura del stream)', () => {
+    it('aborts slow connection providers using AbortSignal.timeout and reports status="timeout" without throwing', async () => {
       const slowFetch: typeof globalThis.fetch = vi.fn(async (_input, init) => {
         expect(init?.signal).toBeDefined();
         return new Promise<Response>((_resolve, reject) => {
@@ -485,9 +663,146 @@ describe('EvidenceHarvester — Stage 1', () => {
       expect(result.providerReports[0].error).toMatch(/timed out/i);
       expect(result.summary.providersFailed).toBe(1);
     });
+
+    it('enforces timeout during response body stream reading, cancels the stream, and releases the reader lock', async () => {
+      const encoder = new TextEncoder();
+      const cancelSpy = vi.fn();
+      let firstChunkSent = false;
+      const stallingStream = new ReadableStream<Uint8Array>({
+        pull(controller) {
+          if (!firstChunkSent) {
+            firstChunkSent = true;
+            controller.enqueue(encoder.encode('{"results":['));
+            return;
+          }
+          // Stall indefinitely on the second chunk until timeout cancels the reader
+          return new Promise<void>(() => {
+            // Never resolves
+          });
+        },
+        cancel(reason) {
+          cancelSpy(reason);
+        },
+      });
+
+      const stallingStreamFetch: typeof globalThis.fetch = vi.fn(async () => {
+        return new Response(stallingStream, {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        });
+      });
+
+      const result = await harvestEvidence({
+        query: 'Solar photovoltaic capacity additions 2026',
+        providers: ['openalex'],
+        timeoutMs: 120,
+        referenceTime: SERVER_REFERENCE_TIME,
+        fetchImpl: stallingStreamFetch,
+      });
+
+      expect(result.items).toHaveLength(0);
+      expect(result.providerReports).toHaveLength(1);
+      expect(result.providerReports[0].status).toBe('timeout');
+      expect(result.providerReports[0].httpStatus).toBe(200);
+      expect(result.providerReports[0].error).toMatch(/response body timed out/i);
+      expect(cancelSpy).toHaveBeenCalledTimes(1);
+      expect(stallingStream.locked).toBe(false);
+    });
   });
 
-  describe('6. Errores HTTP y respuestas malformadas o vacías', () => {
+  describe('6. Límite progresivo del cuerpo HTTP (ReadableStream), errores HTTP y JSON malformado', () => {
+    it('reads a multi-chunk ReadableStream within MAX_RESPONSE_BODY_BYTES and parses valid JSON', async () => {
+      const payloadJson = JSON.stringify({
+        results: [
+          {
+            id: 'https://openalex.org/W-stream-ok',
+            title: 'Arctic sea ice extent seasonal forecast model',
+            publication_date: '2026-04-05',
+            primary_location: {
+              landing_page_url: 'https://cryosphere.example.org/arctic-2026',
+              source: { display_name: 'The Cryosphere' },
+            },
+          },
+        ],
+      });
+      const bytes = new TextEncoder().encode(payloadJson);
+      const chunkSize = 25;
+
+      const chunkedStreamFetch: typeof globalThis.fetch = vi.fn(async () => {
+        let offset = 0;
+        const stream = new ReadableStream<Uint8Array>({
+          pull(controller) {
+            if (offset >= bytes.byteLength) {
+              controller.close();
+              return;
+            }
+            const nextChunk = bytes.subarray(offset, offset + chunkSize);
+            offset += chunkSize;
+            controller.enqueue(nextChunk);
+          },
+        });
+        return new Response(stream, { status: 200 });
+      });
+
+      const result = await harvestEvidence({
+        query: 'Arctic sea ice extent seasonal forecast',
+        providers: ['openalex'],
+        referenceTime: SERVER_REFERENCE_TIME,
+        fetchImpl: chunkedStreamFetch,
+      });
+
+      expect(result.providerReports[0].status).toBe('ok');
+      expect(result.items).toHaveLength(1);
+      expect(result.items[0].title).toBe(
+        'Arctic sea ice extent seasonal forecast model',
+      );
+    });
+
+    it('immediately cancels ReadableStream reading and releases the reader lock as soon as received bytes exceed MAX_RESPONSE_BODY_BYTES', async () => {
+      const chunkBytes = 100 * 1024; // 100 KB per chunk
+      const totalPlannedChunks = 30; // 3 MB total if not cancelled early
+      let pulledChunks = 0;
+      const cancelSpy = vi.fn();
+      const oversizedStream = new ReadableStream<Uint8Array>({
+        pull(controller) {
+          if (pulledChunks >= totalPlannedChunks) {
+            controller.close();
+            return;
+          }
+          pulledChunks += 1;
+          const chunk = new Uint8Array(chunkBytes);
+          chunk.fill(0x61); // 'a'
+          controller.enqueue(chunk);
+        },
+        cancel(reason) {
+          cancelSpy(reason);
+        },
+      });
+
+      const oversizedStreamFetch: typeof globalThis.fetch = vi.fn(async () => {
+        return new Response(oversizedStream, { status: 200 });
+      });
+
+      const result = await harvestEvidence({
+        query: 'Arctic sea ice extent minimum',
+        providers: ['wikipedia'],
+        referenceTime: SERVER_REFERENCE_TIME,
+        fetchImpl: oversizedStreamFetch,
+      });
+
+      // 512 KB = 524,288 bytes. With 100 KB (102,400 byte) chunks, the 6th read reaches
+      // 614,400 bytes and immediately triggers cancellation without reading the remaining chunks.
+      expect(pulledChunks).toBeLessThanOrEqual(7);
+      expect(pulledChunks).toBeLessThan(totalPlannedChunks);
+      expect(cancelSpy).toHaveBeenCalledTimes(1);
+      expect(oversizedStream.locked).toBe(false);
+      expect(result.items).toHaveLength(0);
+      expect(result.providerReports[0].status).toBe('invalid-payload');
+      expect(result.providerReports[0].error).toContain(
+        `exceeded ${MAX_RESPONSE_BODY_BYTES} bytes limit (stopped at 614400 bytes)`,
+      );
+    });
+
     it('handles HTTP 429/500/503 responses gracefully and records httpStatus', async () => {
       const mockFetch: typeof globalThis.fetch = vi.fn(async (input) => {
         const url = String(input);
@@ -516,16 +831,14 @@ describe('EvidenceHarvester — Stage 1', () => {
       ]);
     });
 
-    it('handles invalid JSON, oversized responses, and empty results safely', async () => {
+    it('handles invalid JSON and empty responses safely', async () => {
       const mockFetch: typeof globalThis.fetch = vi.fn(async (input) => {
         const url = String(input);
         if (url.includes('openalex.org')) {
           return new Response('{broken-json', { status: 200 });
         }
         if (url.includes('wikipedia.org')) {
-          return new Response('x'.repeat(MAX_RESPONSE_BODY_BYTES + 1024), {
-            status: 200,
-          });
+          return new Response('   ', { status: 200 });
         }
         return jsonResponse({ articles: [] });
       });
@@ -539,7 +852,7 @@ describe('EvidenceHarvester — Stage 1', () => {
 
       expect(result.items).toHaveLength(0);
       expect(result.providerReports[0].status).toBe('invalid-payload');
-      expect(result.providerReports[1].status).toBe('invalid-payload');
+      expect(result.providerReports[1].status).toBe('empty');
       expect(result.providerReports[2].status).toBe('empty');
     });
   });
@@ -558,7 +871,7 @@ describe('EvidenceHarvester — Stage 1', () => {
               pages: [
                 {
                   pageid: 777,
-                  title: ' fusion energy tokamak milestone',
+                  title: 'Fusion energy tokamak milestone',
                   canonicalurl: 'https://en.wikipedia.org/wiki/Fusion_energy_tokamak',
                   timestamp: '2026-04-12T09:00:00Z',
                   extract: 'Tokamak fusion energy experiments achieved plasma confinement milestones.',
@@ -718,7 +1031,7 @@ describe('EvidenceHarvester — Stage 1', () => {
     });
   });
 
-  describe('10. No inventar metadatos y no afirmar fuente primaria sin verificación', () => {
+  describe('10. No inventar metadatos, clasificación rigurosa de OpenAlex y no afirmar fuente primaria sin verificación', () => {
     it('discards records missing title or publisher instead of inventing placeholders', async () => {
       const mockFetch: typeof globalThis.fetch = vi.fn(async () =>
         jsonResponse({
@@ -768,6 +1081,152 @@ describe('EvidenceHarvester — Stage 1', () => {
         'missing-title',
         'retracted-source',
       ]);
+    });
+
+    it('classifies OpenAlex work types accurately without assuming unverified peer review or unknown types', async () => {
+      // 1. Known scholarly work ('article') WITHOUT verified peer review -> 'scholarly-work'
+      expect(classifyOpenAlexWorkType('article')).toEqual({
+        kind: 'paper',
+        sourceType: 'scholarly-work',
+        reportedWorkType: 'article',
+        peerReviewVerified: false,
+      });
+      expect(
+        classifyOpenAlexWorkType({
+          type: 'article',
+          sourceType: 'repository',
+          sourceIsPeerReviewed: false,
+          publishedVersion: 'submittedVersion',
+        }),
+      ).toEqual({
+        kind: 'paper',
+        sourceType: 'scholarly-work',
+        reportedWorkType: 'article',
+        peerReviewVerified: false,
+      });
+
+      // 2. Known scholarly work ('article') WITH verified peer review -> 'peer-reviewed-work'
+      expect(
+        classifyOpenAlexWorkType({
+          type: 'article',
+          sourceType: 'journal',
+          sourceIsPeerReviewed: true,
+          publishedVersion: 'publishedVersion',
+        }),
+      ).toEqual({
+        kind: 'paper',
+        sourceType: 'peer-reviewed-work',
+        reportedWorkType: 'article',
+        peerReviewVerified: true,
+      });
+
+      // 3. Known specialized types: dataset, preprint, report
+      expect(classifyOpenAlexWorkType('dataset')).toEqual({
+        kind: 'dataset',
+        sourceType: 'dataset',
+        reportedWorkType: 'dataset',
+        peerReviewVerified: false,
+      });
+      expect(classifyOpenAlexWorkType('preprint')).toEqual({
+        kind: 'paper',
+        sourceType: 'preprint-or-working-paper',
+        reportedWorkType: 'preprint',
+        peerReviewVerified: false,
+      });
+      expect(classifyOpenAlexWorkType('report')).toEqual({
+        kind: 'report',
+        sourceType: 'secondary-report',
+        reportedWorkType: 'report',
+        peerReviewVerified: false,
+      });
+
+      // 4. Unknown, non-scholarly, or missing types -> 'unverified-type', never 'peer-reviewed-work'
+      expect(classifyOpenAlexWorkType('paratext')).toEqual({
+        kind: 'report',
+        sourceType: 'unverified-type',
+        reportedWorkType: 'paratext',
+        peerReviewVerified: false,
+      });
+      expect(classifyOpenAlexWorkType('unknown-custom-type')).toEqual({
+        kind: 'report',
+        sourceType: 'unverified-type',
+        reportedWorkType: 'unknown-custom-type',
+        peerReviewVerified: false,
+      });
+      expect(classifyOpenAlexWorkType(null)).toEqual({
+        kind: 'report',
+        sourceType: 'unverified-type',
+        reportedWorkType: null,
+        peerReviewVerified: false,
+      });
+
+      // End-to-end verification through harvestEvidence
+      const result = await harvestEvidence({
+        query: 'Hydrogen electrolyzer efficiency',
+        providers: ['openalex'],
+        referenceTime: SERVER_REFERENCE_TIME,
+        fetchImpl: async () =>
+          jsonResponse({
+            results: [
+              {
+                id: 'https://openalex.org/W-unverified-article',
+                title: 'Hydrogen electrolyzer efficiency in industrial trials',
+                publication_date: '2026-02-01',
+                type: 'article',
+                primary_location: {
+                  landing_page_url: 'https://example.org/h2-article',
+                  source: { display_name: 'Energy Preprints' },
+                },
+              },
+              {
+                id: 'https://openalex.org/W-verified-peer-review',
+                title: 'Hydrogen electrolyzer efficiency peer-reviewed benchmark',
+                publication_date: '2026-02-10',
+                type: 'article',
+                primary_location: {
+                  landing_page_url: 'https://example.org/h2-peer-reviewed',
+                  version: 'publishedVersion',
+                  source: {
+                    display_name: 'Nature Energy',
+                    type: 'journal',
+                    is_peer_reviewed: true,
+                  },
+                },
+              },
+              {
+                id: 'https://openalex.org/W-unknown-type',
+                title: 'Hydrogen electrolyzer efficiency supplementary paratext',
+                publication_date: '2026-02-15',
+                type: 'paratext',
+                primary_location: {
+                  landing_page_url: 'https://example.org/h2-paratext',
+                  source: { display_name: 'Energy Catalog' },
+                },
+              },
+            ],
+          }),
+      });
+
+      expect(result.items).toHaveLength(3);
+      const unverifiedArticle = result.items.find((i) =>
+        i.url.endsWith('/h2-article'),
+      );
+      const verifiedArticle = result.items.find((i) =>
+        i.url.endsWith('/h2-peer-reviewed'),
+      );
+      const unknownTypeItem = result.items.find((i) =>
+        i.url.endsWith('/h2-paratext'),
+      );
+
+      expect(unverifiedArticle?.sourceType).toBe('scholarly-work');
+      expect(unverifiedArticle?.isPrimarySourceVerified).toBe(false);
+
+      expect(verifiedArticle?.sourceType).toBe('peer-reviewed-work');
+      expect(verifiedArticle?.isPrimarySourceVerified).toBe(false);
+
+      expect(unknownTypeItem?.sourceType).toBe('unverified-type');
+      expect(unknownTypeItem?.kind).toBe('report');
+      expect(unknownTypeItem?.isPrimarySourceVerified).toBe(false);
     });
 
     it('freezes harvested items and prevents downstream LLM selections from fabricating metadata', async () => {

@@ -18,16 +18,22 @@
  *      UTC timestamp (`publishedAt <= referenceTime`). If an item also carries
  *      an `updatedDate`, that update must likewise satisfy
  *      `publishedDate <= updatedDate <= referenceTime`.
- *   4. Primary-source honesty: a source is never labeled as a verified primary
- *      source (`isPrimarySourceVerified: false`) when the upstream provider is
- *      an encyclopedia, news aggregator, or bibliographic index that does not
- *      attest primary authority.
- *   5. Fault isolation & Render Free Tier protection: each provider runs with
- *      `AbortSignal.timeout`, strict result count caps, and response size caps.
- *      A slow or failing provider never aborts the overall harvest.
+ *   4. Primary-source & peer-review honesty: a source is never labeled as a
+ *      verified primary source (`isPrimarySourceVerified: false`) when the
+ *      upstream provider is an encyclopedia, news aggregator, or bibliographic
+ *      index that does not attest primary authority. Likewise, an OpenAlex work
+ *      is only classified as `peer-reviewed-work` when peer review is explicitly
+ *      verified in the payload; otherwise known scholarly types use the neutral
+ *      `scholarly-work` classification and unknown types use `unverified-type`.
+ *   5. True streaming byte cap & Render Free Tier protection: each provider
+ *      runs with `AbortSignal.timeout` enforced across both connection and body
+ *      streaming, progressive `ReadableStream` byte counting that immediately
+ *      cancels the stream upon exceeding `MAX_RESPONSE_BODY_BYTES`, and strict
+ *      result count caps. A slow or failing provider never aborts the harvest.
  */
 
 import { createHash } from 'node:crypto';
+import { isIP } from 'node:net';
 import { isValidIsoDateTime, parseIsoDateTimeMs } from '../data/publication.ts';
 import type {
   EvidenceKind,
@@ -54,7 +60,7 @@ export const DEFAULT_MAX_TOTAL_RESULTS = 10;
 export const HARD_MAX_TOTAL_RESULTS = 25;
 
 export const DEFAULT_MIN_RELEVANCE_SCORE = 0.15;
-export const MAX_RESPONSE_BODY_BYTES = 512 * 1024; // 512 KB cap for Render 512 MB RAM
+export const MAX_RESPONSE_BODY_BYTES = 512 * 1024; // 512 KB streaming cap for Render 512 MB RAM
 export const MAX_SNIPPET_LENGTH = 400;
 
 const HARVESTER_USER_AGENT =
@@ -87,11 +93,13 @@ export type EvidenceTemporalBasis = 'published' | 'updated';
 
 export type EvidenceSourceClassification =
   | 'peer-reviewed-work'
+  | 'scholarly-work'
   | 'preprint-or-working-paper'
   | 'dataset'
   | 'encyclopedic-reference'
   | 'news-article'
-  | 'secondary-report';
+  | 'secondary-report'
+  | 'unverified-type';
 
 export type EvidenceDiscardReason =
   | 'missing-title'
@@ -281,7 +289,7 @@ export interface EvidenceHarvestResult {
 export class InvalidHarvestRequestError extends Error {}
 
 /* -------------------------------------------------------------------------
-   Deterministic IDs, URL validation, and Temporal normalization
+   Deterministic IDs, IP/URL validation, and Temporal normalization
    ------------------------------------------------------------------------- */
 
 const TRACKING_QUERY_PARAMS = new Set([
@@ -311,30 +319,341 @@ export function computeDeterministicEvidenceId(
   return `ev-${provider}-${hex}`;
 }
 
-function isPrivateOrLocalHostname(hostname: string): boolean {
-  const lower = hostname.toLowerCase();
+/**
+ * Parse a dotted-decimal IPv4 string into its 4 numeric octets `[o0, o1, o2, o3]`.
+ * Uses Node's `net.isIP` plus strict octet bounds checking.
+ */
+function parseIpv4Octets(ip: string): [number, number, number, number] | null {
+  if (isIP(ip) !== 4) return null;
+  const parts = ip.split('.');
+  if (parts.length !== 4) return null;
+  const octets: number[] = [];
+  for (const part of parts) {
+    if (!/^\d{1,3}$/.test(part)) return null;
+    if (part.length > 1 && part.startsWith('0')) return null;
+    const value = Number(part);
+    if (!Number.isInteger(value) || value < 0 || value > 255) return null;
+    octets.push(value);
+  }
+  return [octets[0], octets[1], octets[2], octets[3]];
+}
+
+/**
+ * True when an IPv4 octet tuple falls within any private, loopback, link-local,
+ * CGNAT, documentation, benchmarking, multicast, or reserved range.
+ */
+function isPrivateOrReservedIpv4Octets(
+  octets: readonly [number, number, number, number],
+): boolean {
+  const [o0, o1, o2] = octets;
+
+  // 0.0.0.0/8 — "This" network / unspecified (RFC 1122)
+  if (o0 === 0) return true;
+  // 10.0.0.0/8 — Private-Use (RFC 1918)
+  if (o0 === 10) return true;
+  // 100.64.0.0/10 — Shared CGNAT Address Space (RFC 6598)
+  if (o0 === 100 && o1 >= 64 && o1 <= 127) return true;
+  // 127.0.0.0/8 — Loopback (RFC 1122)
+  if (o0 === 127) return true;
+  // 169.254.0.0/16 — Link-Local / Cloud Metadata (RFC 3927)
+  if (o0 === 169 && o1 === 254) return true;
+  // 172.16.0.0/12 — Private-Use (RFC 1918): 172.16.0.0 – 172.31.255.255
+  if (o0 === 172 && o1 >= 16 && o1 <= 31) return true;
+  // 192.0.0.0/24 — IETF Protocol Assignments (RFC 6890)
+  if (o0 === 192 && o1 === 0 && o2 === 0) return true;
+  // 192.0.2.0/24 — TEST-NET-1 Documentation (RFC 5737)
+  if (o0 === 192 && o1 === 0 && o2 === 2) return true;
+  // 192.168.0.0/16 — Private-Use (RFC 1918)
+  if (o0 === 192 && o1 === 168) return true;
+  // 198.18.0.0/15 — Benchmarking (RFC 2544)
+  if (o0 === 198 && (o1 === 18 || o1 === 19)) return true;
+  // 198.51.100.0/24 — TEST-NET-2 Documentation (RFC 5737)
+  if (o0 === 198 && o1 === 51 && o2 === 100) return true;
+  // 203.0.113.0/24 — TEST-NET-3 Documentation (RFC 5737)
+  if (o0 === 203 && o1 === 0 && o2 === 113) return true;
+  // 224.0.0.0/4 (Multicast) & 240.0.0.0/4 (Reserved / Broadcast)
+  if (o0 >= 224) return true;
+
+  return false;
+}
+
+/**
+ * Parse a valid IPv6 address (without surrounding brackets or zone id) into
+ * its 8 16-bit numeric hextets `[h0, h1, h2, h3, h4, h5, h6, h7]`.
+ *
+ * Supports compressed `::` notation and embedded trailing IPv4 dotted-quads
+ * (such as `::ffff:172.16.0.1` or `::127.0.0.1`).
+ */
+function parseIpv6Hextets(ip: string): number[] | null {
+  if (isIP(ip) !== 6) return null;
+
+  let normalized = ip.toLowerCase();
+
+  // If the IPv6 address has a trailing dotted-quad IPv4 (e.g. ::ffff:172.16.0.1),
+  // convert the final IPv4 portion into two 16-bit hex groups.
+  const lastColonIdx = normalized.lastIndexOf(':');
+  if (lastColonIdx !== -1 && normalized.slice(lastColonIdx + 1).includes('.')) {
+    const ipv4Tail = normalized.slice(lastColonIdx + 1);
+    const octets = parseIpv4Octets(ipv4Tail);
+    if (!octets) return null;
+    const high = ((octets[0] << 8) | octets[1]).toString(16);
+    const low = ((octets[2] << 8) | octets[3]).toString(16);
+    normalized = `${normalized.slice(0, lastColonIdx + 1)}${high}:${low}`;
+  }
+
+  const doubleColonParts = normalized.split('::');
+  if (doubleColonParts.length > 2) return null;
+
+  const parseSegmentList = (segment: string): number[] | null => {
+    if (segment.length === 0) return [];
+    const tokens = segment.split(':');
+    const values: number[] = [];
+    for (const token of tokens) {
+      if (!/^[0-9a-f]{1,4}$/.test(token)) return null;
+      const parsed = Number.parseInt(token, 16);
+      if (!Number.isInteger(parsed) || parsed < 0 || parsed > 0xffff) return null;
+      values.push(parsed);
+    }
+    return values;
+  };
+
+  if (doubleColonParts.length === 1) {
+    const groups = parseSegmentList(doubleColonParts[0]);
+    return groups && groups.length === 8 ? groups : null;
+  }
+
+  const left = parseSegmentList(doubleColonParts[0]);
+  const right = parseSegmentList(doubleColonParts[1]);
+  if (!left || !right) return null;
+
+  const missingGroups = 8 - (left.length + right.length);
+  if (missingGroups < 1) return null;
+
+  return [...left, ...new Array<number>(missingGroups).fill(0), ...right];
+}
+
+function extractEmbeddedIpv4OctetsFromHextets(
+  highHextet: number,
+  lowHextet: number,
+): [number, number, number, number] {
+  return [
+    (highHextet >> 8) & 0xff,
+    highHextet & 0xff,
+    (lowHextet >> 8) & 0xff,
+    lowHextet & 0xff,
+  ];
+}
+
+/**
+ * True when an 8-hextet IPv6 address falls within any non-public range
+ * (unspecified, loopback, link-local, unique-local, site-local, multicast,
+ * documentation, benchmarking, discard-only) OR embeds a private/reserved IPv4
+ * address (IPv4-mapped `::ffff:0:0/96`, IPv4-compatible `::/96`, IPv4-translated
+ * `::ffff:0:0:0/96`, NAT64 `64:ff9b::/96`, 6to4 `2002::/16`, or Teredo `2001::/32`).
+ */
+function isPrivateOrReservedIpv6Hextets(h: readonly number[]): boolean {
+  if (h.length !== 8) return true;
+
+  // 1. Unspecified ::/128
+  if (h.every((group) => group === 0)) return true;
+
+  // 2. Loopback ::1/128
   if (
-    lower === 'localhost' ||
-    lower === '0.0.0.0' ||
-    lower === '127.0.0.1' ||
-    lower === '[::1]' ||
-    lower.endsWith('.local') ||
-    lower.endsWith('.localhost')
+    h[0] === 0 &&
+    h[1] === 0 &&
+    h[2] === 0 &&
+    h[3] === 0 &&
+    h[4] === 0 &&
+    h[5] === 0 &&
+    h[6] === 0 &&
+    h[7] === 1
   ) {
     return true;
   }
-  if (/^127\.\d+\.\d+\.\d+$/.test(lower)) return true;
-  if (/^10\.\d+\.\d+\.\d+$/.test(lower)) return true;
-  if (/^192\.168\.\d+\.\d+$/.test(lower)) return true;
-  if (/^169\.254\.\d+\.\d+$/.test(lower)) return true;
+
+  // 3. IPv4-mapped IPv6 ::ffff:0:0/96 (e.g. ::ffff:172.16.0.1 or ::ffff:ac10:1)
+  if (
+    h[0] === 0 &&
+    h[1] === 0 &&
+    h[2] === 0 &&
+    h[3] === 0 &&
+    h[4] === 0 &&
+    h[5] === 0xffff
+  ) {
+    const octets = extractEmbeddedIpv4OctetsFromHextets(h[6], h[7]);
+    return isPrivateOrReservedIpv4Octets(octets);
+  }
+
+  // 4. IPv4-compatible IPv6 ::/96 (deprecated RFC 4291, e.g. ::127.0.0.1)
+  if (
+    h[0] === 0 &&
+    h[1] === 0 &&
+    h[2] === 0 &&
+    h[3] === 0 &&
+    h[4] === 0 &&
+    h[5] === 0 &&
+    (h[6] !== 0 || h[7] > 1)
+  ) {
+    const octets = extractEmbeddedIpv4OctetsFromHextets(h[6], h[7]);
+    return isPrivateOrReservedIpv4Octets(octets);
+  }
+
+  // 5. IPv4-translated IPv6 ::ffff:0:0:0/96 (RFC 2765)
+  if (
+    h[0] === 0 &&
+    h[1] === 0 &&
+    h[2] === 0 &&
+    h[3] === 0 &&
+    h[4] === 0xffff &&
+    h[5] === 0
+  ) {
+    const octets = extractEmbeddedIpv4OctetsFromHextets(h[6], h[7]);
+    return isPrivateOrReservedIpv4Octets(octets);
+  }
+
+  // 6. NAT64 Well-Known Prefix 64:ff9b::/96 (RFC 6052) & Local-Use 64:ff9b:1::/48 (RFC 8215)
+  if (h[0] === 0x0064 && h[1] === 0xff9b) {
+    if (h[2] === 0x0001) return true;
+    if (h[2] === 0 && h[3] === 0 && h[4] === 0 && h[5] === 0) {
+      const octets = extractEmbeddedIpv4OctetsFromHextets(h[6], h[7]);
+      return isPrivateOrReservedIpv4Octets(octets);
+    }
+  }
+
+  // 7. 6to4 2002::/16 (RFC 3056) — embeds IPv4 in h[1] and h[2]
+  if (h[0] === 0x2002) {
+    const octets = extractEmbeddedIpv4OctetsFromHextets(h[1], h[2]);
+    return isPrivateOrReservedIpv4Octets(octets);
+  }
+
+  // 8. Teredo 2001:0000::/32 (RFC 4380) — embeds XOR-obfuscated client IPv4 in h[6], h[7]
+  if (h[0] === 0x2001 && h[1] === 0x0000) {
+    const octets = extractEmbeddedIpv4OctetsFromHextets(
+      h[6] ^ 0xffff,
+      h[7] ^ 0xffff,
+    );
+    return isPrivateOrReservedIpv4Octets(octets);
+  }
+
+  // 9. Benchmarking 2001:2::/48 (RFC 5180)
+  if (h[0] === 0x2001 && h[1] === 0x0002 && h[2] === 0x0000) return true;
+
+  // 10. Documentation 2001:db8::/32 (RFC 3849)
+  if (h[0] === 0x2001 && h[1] === 0x0db8) return true;
+
+  // 11. Discard-Only 100::/64 (RFC 6666)
+  if (h[0] === 0x0100 && h[1] === 0 && h[2] === 0 && h[3] === 0) return true;
+
+  // 12. Unique Local fc00::/7 (RFC 4193): fc00:: through fdff:ffff:...
+  if ((h[0] & 0xfe00) === 0xfc00) return true;
+
+  // 13. Link-Local fe80::/10 (RFC 4291): fe80:: through febf:ffff:...
+  if ((h[0] & 0xffc0) === 0xfe80) return true;
+
+  // 14. Site-Local fec0::/10 (deprecated RFC 3879): fec0:: through feff:ffff:...
+  if ((h[0] & 0xffc0) === 0xfec0) return true;
+
+  // 15. Multicast ff00::/8 (RFC 4291)
+  if ((h[0] & 0xff00) === 0xff00) return true;
+
   return false;
+}
+
+const RESERVED_LOCAL_DOMAIN_SUFFIXES = [
+  '.localhost',
+  '.local',
+  '.localdomain',
+  '.internal',
+  '.home.arpa',
+  '.intranet',
+  '.lan',
+] as const;
+
+/**
+ * Determine whether a hostname or IP literal (IPv4, IPv6, or IPv4-mapped IPv6)
+ * points to a local, loopback, link-local, unique-local, or private network
+ * destination.
+ */
+export function isPrivateOrLocalHostname(hostname: string): boolean {
+  const trimmed = hostname.trim().toLowerCase();
+  if (trimmed.length === 0) return true;
+
+  // Unwrap bracketed IPv6 literal if present
+  const unbracketed =
+    trimmed.startsWith('[') && trimmed.endsWith(']')
+      ? trimmed.slice(1, -1)
+      : trimmed;
+
+  // Any IPv6 scoped zone identifier (e.g. fe80::1%eth0 or fe80::1%25eth0) is local
+  if (unbracketed.includes('%')) {
+    return true;
+  }
+
+  // 1. Check IPv4 literal via exact octet parsing
+  const ipv4Octets = parseIpv4Octets(unbracketed);
+  if (ipv4Octets !== null) {
+    return isPrivateOrReservedIpv4Octets(ipv4Octets);
+  }
+
+  // 2. Check IPv6 literal via exact 8-hextet parsing
+  const ipv6Hextets = parseIpv6Hextets(unbracketed);
+  if (ipv6Hextets !== null) {
+    return isPrivateOrReservedIpv6Hextets(ipv6Hextets);
+  }
+
+  // If brackets were used around something that is not a valid IPv6 literal, reject
+  if (trimmed.startsWith('[') || trimmed.endsWith(']') || unbracketed.includes(':')) {
+    return true;
+  }
+
+  // 3. Check reserved local DNS names
+  if (
+    unbracketed === 'localhost' ||
+    unbracketed === 'local' ||
+    unbracketed === 'localdomain' ||
+    unbracketed === 'internal' ||
+    unbracketed === 'home.arpa'
+  ) {
+    return true;
+  }
+
+  for (const suffix of RESERVED_LOCAL_DOMAIN_SUFFIXES) {
+    if (unbracketed.endsWith(suffix)) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+function isValidPublicDomainName(hostname: string): boolean {
+  if (hostname.length === 0 || hostname.length > 253) return false;
+  if (hostname.startsWith('.') || hostname.endsWith('.')) return false;
+
+  const labels = hostname.split('.');
+  if (labels.length < 2) return false;
+
+  for (const label of labels) {
+    if (label.length === 0 || label.length > 63) return false;
+    if (!/^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/i.test(label)) {
+      return false;
+    }
+  }
+
+  const tld = labels[labels.length - 1];
+  // RFC 1123 / ICANN: top-level domain label cannot be all-numeric (prevents malformed IPv4s like 127.0.0.999)
+  if (tld.length < 2 || /^\d+$/.test(tld)) {
+    return false;
+  }
+
+  return true;
 }
 
 /**
  * Validate and canonicalize an external HTTP(S) evidence URL.
  *
  * Returns `null` if `rawUrl` is missing, malformed, uses a non-HTTP(S) scheme,
- * embeds credentials, or points to a localhost/private address.
+ * embeds credentials, or points to a localhost/private IPv4 or IPv6 address.
  */
 export function validateAndNormalizeEvidenceUrl(rawUrl: unknown): string | null {
   if (typeof rawUrl !== 'string') return null;
@@ -357,14 +676,19 @@ export function validateAndNormalizeEvidenceUrl(rawUrl: unknown): string | null 
   }
 
   const hostname = parsed.hostname.toLowerCase();
-  if (
-    hostname.length === 0 ||
-    !hostname.includes('.') ||
-    hostname.startsWith('.') ||
-    hostname.endsWith('.') ||
-    isPrivateOrLocalHostname(hostname)
-  ) {
+  if (hostname.length === 0 || isPrivateOrLocalHostname(hostname)) {
     return null;
+  }
+
+  const isBracketedIpv6 = hostname.startsWith('[') && hostname.endsWith(']');
+  if (isBracketedIpv6) {
+    if (parseIpv6Hextets(hostname.slice(1, -1)) === null) {
+      return null;
+    }
+  } else if (parseIpv4Octets(hostname) === null) {
+    if (!isValidPublicDomainName(hostname)) {
+      return null;
+    }
   }
 
   if (
@@ -672,7 +996,7 @@ export function computeThematicRelevance(
 }
 
 /* -------------------------------------------------------------------------
-   Shared HTTP execution & candidate validation pipeline
+   Shared HTTP execution (streaming byte cap) & candidate validation pipeline
    ------------------------------------------------------------------------- */
 
 interface RawExtractedCandidate {
@@ -988,6 +1312,121 @@ function isTimeoutOrAbortError(error: unknown): boolean {
   );
 }
 
+function createTimeoutError(timeoutMs: number): Error {
+  const err = new Error(`Operation timed out after ${timeoutMs}ms`);
+  err.name = 'TimeoutError';
+  return err;
+}
+
+/**
+ * Progressively read `response.body` via its `ReadableStream`, counting bytes
+ * as each chunk arrives and immediately cancelling the stream if the cumulative
+ * byte count exceeds `maxBytes` or if `signal` aborts during the read.
+ *
+ * Always releases the reader lock in `finally`.
+ */
+async function readResponseBodyWithByteLimit(
+  response: Response,
+  maxBytes: number,
+  timeoutMs: number,
+  signal: AbortSignal,
+): Promise<
+  | { status: 'ok'; text: string; byteLength: number }
+  | { status: 'too-large'; byteLength: number }
+> {
+  if (signal.aborted) {
+    throw createTimeoutError(timeoutMs);
+  }
+
+  if (!response.body) {
+    return { status: 'ok', text: '', byteLength: 0 };
+  }
+
+  const reader = response.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let totalBytes = 0;
+
+  let abortReject: ((reason: Error) => void) | null = null;
+  const abortPromise = new Promise<never>((_resolve, reject) => {
+    abortReject = reject;
+  });
+
+  const onAbort = () => {
+    const err = createTimeoutError(timeoutMs);
+    void reader.cancel(err).catch(() => undefined);
+    if (abortReject) {
+      abortReject(err);
+    }
+  };
+
+  signal.addEventListener('abort', onAbort, { once: true });
+
+  try {
+    while (true) {
+      if (signal.aborted) {
+        throw createTimeoutError(timeoutMs);
+      }
+
+      const { done, value } = await Promise.race([
+        reader.read(),
+        abortPromise,
+      ]);
+
+      if (signal.aborted) {
+        throw createTimeoutError(timeoutMs);
+      }
+
+      if (done) {
+        break;
+      }
+
+      if (value && value.byteLength > 0) {
+        totalBytes += value.byteLength;
+        if (totalBytes > maxBytes) {
+          await reader
+            .cancel(`Response body exceeded ${maxBytes} bytes limit`)
+            .catch(() => undefined);
+          return { status: 'too-large', byteLength: totalBytes };
+        }
+        chunks.push(value);
+      }
+    }
+
+    if (chunks.length === 0) {
+      return { status: 'ok', text: '', byteLength: 0 };
+    }
+
+    const decoder = new TextDecoder('utf-8');
+    if (chunks.length === 1) {
+      return {
+        status: 'ok',
+        text: decoder.decode(chunks[0]),
+        byteLength: totalBytes,
+      };
+    }
+
+    const merged = new Uint8Array(totalBytes);
+    let offset = 0;
+    for (const chunk of chunks) {
+      merged.set(chunk, offset);
+      offset += chunk.byteLength;
+    }
+
+    return {
+      status: 'ok',
+      text: decoder.decode(merged),
+      byteLength: totalBytes,
+    };
+  } finally {
+    signal.removeEventListener('abort', onAbort);
+    try {
+      reader.releaseLock();
+    } catch {
+      // Reader lock was already released
+    }
+  }
+}
+
 async function fetchJsonWithGuardrails(
   provider: EvidenceProviderId,
   endpointUrl: string,
@@ -1033,9 +1472,11 @@ async function fetchJsonWithGuardrails(
     };
   }
 
-  const durationMs = Math.max(0, Date.now() - startedAt);
-
   if (!response.ok) {
+    if (response.body) {
+      await response.body.cancel().catch(() => undefined);
+    }
+    const durationMs = Math.max(0, Date.now() - startedAt);
     return {
       ok: false,
       report: Object.freeze({
@@ -1052,9 +1493,16 @@ async function fetchJsonWithGuardrails(
     };
   }
 
-  let rawText: string;
+  let bodyResult:
+    | { status: 'ok'; text: string; byteLength: number }
+    | { status: 'too-large'; byteLength: number };
   try {
-    rawText = await response.text();
+    bodyResult = await readResponseBodyWithByteLimit(
+      response,
+      MAX_RESPONSE_BODY_BYTES,
+      context.timeoutMs,
+      signal,
+    );
   } catch (error) {
     const isTimeout = isTimeoutOrAbortError(error) || signal.aborted;
     const message =
@@ -1071,13 +1519,15 @@ async function fetchJsonWithGuardrails(
         accepted: Object.freeze([]),
         discarded: Object.freeze([]),
         error: isTimeout
-          ? `Provider '${provider}' response body timed out: ${message}`
+          ? `Provider '${provider}' response body timed out after ${context.timeoutMs}ms: ${message}`
           : `Provider '${provider}' body read failed: ${message}`,
       }),
     };
   }
 
-  if (Buffer.byteLength(rawText, 'utf8') > MAX_RESPONSE_BODY_BYTES) {
+  const durationMs = Math.max(0, Date.now() - startedAt);
+
+  if (bodyResult.status === 'too-large') {
     return {
       ok: false,
       report: Object.freeze({
@@ -1089,11 +1539,12 @@ async function fetchJsonWithGuardrails(
         rawCandidateCount: 0,
         accepted: Object.freeze([]),
         discarded: Object.freeze([]),
-        error: `Provider '${provider}' payload exceeded ${MAX_RESPONSE_BODY_BYTES} bytes limit.`,
+        error: `Provider '${provider}' payload exceeded ${MAX_RESPONSE_BODY_BYTES} bytes limit (stopped at ${bodyResult.byteLength} bytes).`,
       }),
     };
   }
 
+  const rawText = bodyResult.text;
   if (rawText.trim().length === 0) {
     return {
       ok: false,
@@ -1220,6 +1671,32 @@ export interface OpenAlexAdapterOptions {
   readonly baseUrl?: string;
 }
 
+export interface OpenAlexWorkClassificationInput {
+  readonly type?: unknown;
+  readonly isPeerReviewed?: unknown;
+  readonly sourceType?: unknown;
+  readonly sourceIsPeerReviewed?: unknown;
+  readonly publishedVersion?: unknown;
+}
+
+export interface OpenAlexWorkClassification {
+  readonly kind: EvidenceKind;
+  readonly sourceType: EvidenceSourceClassification;
+  readonly reportedWorkType: string | null;
+  readonly peerReviewVerified: boolean;
+}
+
+const KNOWN_OPENALEX_SCHOLARLY_TYPES = new Set([
+  'article',
+  'journal-article',
+  'review',
+  'book-chapter',
+  'book',
+  'dissertation',
+  'monograph',
+  'proceedings-article',
+]);
+
 function reconstructOpenAlexAbstract(invertedIndex: unknown): string | null {
   if (!invertedIndex || typeof invertedIndex !== 'object' || Array.isArray(invertedIndex)) {
     return null;
@@ -1243,21 +1720,88 @@ function reconstructOpenAlexAbstract(invertedIndex: unknown): string | null {
   return positionedWords.map((entry) => entry.word).join(' ');
 }
 
-function classifyOpenAlexWorkType(rawType: unknown): {
-  kind: EvidenceKind;
-  sourceType: EvidenceSourceClassification;
-} {
-  const normalized = typeof rawType === 'string' ? rawType.trim().toLowerCase() : '';
-  if (normalized === 'dataset') {
-    return { kind: 'dataset', sourceType: 'dataset' };
+/**
+ * Classify an OpenAlex work while strictly distinguishing:
+ *   1. The work type reported by OpenAlex (`reportedWorkType`).
+ *   2. Whether peer-review status has been explicitly verified (`peerReviewVerified`).
+ *   3. Unknown or unverifiable work types (`unverified-type`).
+ *
+ * Never assigns `peer-reviewed-work` automatically to unknown types or to
+ * `article` records whose peer-review condition has not been demonstrated.
+ */
+export function classifyOpenAlexWorkType(
+  input: OpenAlexWorkClassificationInput | unknown,
+): OpenAlexWorkClassification {
+  const details: OpenAlexWorkClassificationInput =
+    input !== null && typeof input === 'object' && !Array.isArray(input)
+      ? (input as OpenAlexWorkClassificationInput)
+      : { type: input };
+
+  const rawType =
+    typeof details.type === 'string' ? details.type.trim().toLowerCase() : '';
+  const reportedWorkType = rawType.length > 0 ? rawType : null;
+
+  if (reportedWorkType === 'dataset') {
+    return Object.freeze({
+      kind: 'dataset',
+      sourceType: 'dataset',
+      reportedWorkType,
+      peerReviewVerified: false,
+    });
   }
-  if (normalized === 'report' || normalized === 'standard') {
-    return { kind: 'report', sourceType: 'secondary-report' };
+
+  if (reportedWorkType === 'report' || reportedWorkType === 'standard') {
+    return Object.freeze({
+      kind: 'report',
+      sourceType: 'secondary-report',
+      reportedWorkType,
+      peerReviewVerified: false,
+    });
   }
-  if (normalized === 'preprint' || normalized === 'working-paper') {
-    return { kind: 'paper', sourceType: 'preprint-or-working-paper' };
+
+  if (
+    reportedWorkType === 'preprint' ||
+    reportedWorkType === 'working-paper' ||
+    reportedWorkType === 'posted-content'
+  ) {
+    return Object.freeze({
+      kind: 'paper',
+      sourceType: 'preprint-or-working-paper',
+      reportedWorkType,
+      peerReviewVerified: false,
+    });
   }
-  return { kind: 'paper', sourceType: 'peer-reviewed-work' };
+
+  if (reportedWorkType !== null && KNOWN_OPENALEX_SCHOLARLY_TYPES.has(reportedWorkType)) {
+    const normalizedSourceType =
+      typeof details.sourceType === 'string'
+        ? details.sourceType.trim().toLowerCase()
+        : '';
+    const normalizedVersion =
+      typeof details.publishedVersion === 'string'
+        ? details.publishedVersion.trim()
+        : '';
+
+    const explicitlyPeerReviewed =
+      details.isPeerReviewed === true ||
+      (details.sourceIsPeerReviewed === true &&
+        (normalizedSourceType === 'journal' || normalizedSourceType === 'conference') &&
+        (normalizedVersion === 'publishedVersion' || normalizedVersion === 'acceptedVersion'));
+
+    return Object.freeze({
+      kind: 'paper',
+      sourceType: explicitlyPeerReviewed ? 'peer-reviewed-work' : 'scholarly-work',
+      reportedWorkType,
+      peerReviewVerified: explicitlyPeerReviewed,
+    });
+  }
+
+  return Object.freeze({
+    kind: 'report',
+    sourceType: 'unverified-type',
+    reportedWorkType,
+    peerReviewVerified: false,
+  });
 }
 
 export function createOpenAlexAdapter(
@@ -1375,7 +1919,14 @@ export function createOpenAlexAdapter(
           }
         }
 
-        const { kind, sourceType } = classifyOpenAlexWorkType(work.type);
+        const { kind, sourceType } = classifyOpenAlexWorkType({
+          type: work.type,
+          isPeerReviewed: work.is_peer_reviewed ?? work.peer_reviewed,
+          sourceType: primarySource?.type ?? hostVenue?.type,
+          sourceIsPeerReviewed:
+            primarySource?.is_peer_reviewed ?? hostVenue?.is_peer_reviewed,
+          publishedVersion: primaryLocation?.version ?? work.version,
+        });
         const rawSourceId = asDiagnosticString(work.id ?? work.doi);
 
         return {
@@ -1581,6 +2132,34 @@ export interface GdeltAdapterOptions {
   readonly baseUrl?: string;
 }
 
+/**
+ * Create a GDELT DOC 2.0 API (`mode=ArtList&format=json`) adapter.
+ *
+ * Real GDELT DOC 2.0 `ArtList` JSON response structure per item in `articles`:
+ *   - `url`: article origin URL
+ *   - `url_mobile`: mobile article URL (often `""`)
+ *   - `title`: article headline
+ *   - `seendate`: UTC timestamp (`YYYYMMDDTHHMMSSZ`) when GDELT's crawler
+ *     discovered/indexed the article — this is strictly an **indexing date**
+ *     (`indexedDate`), NEVER a publication date (`publishedDate`).
+ *   - `socialimage`: preview image URL
+ *   - `domain`: publisher domain (e.g. `"reuters.com"`)
+ *   - `language`: article language (e.g. `"English"`)
+ *   - `sourcecountry`: country of origin
+ *
+ * Temporal field mapping:
+ *   - Publication date (`rawPublishedDate`): `published_at`, `publishdate`,
+ *     `publication_date`, `date_published`, `publishedAt`.
+ *   - Update date (`rawUpdatedDate`): `updated_at`, `updateddate`,
+ *     `date_updated`, `updatedAt`.
+ *   - Indexing date (`rawIndexedDate`): `seendate`, `indexed_at`, `indexeddate`,
+ *     `crawled_at`, `indexedAt`.
+ *
+ * Because unenriched GDELT DOC 2.0 `ArtList` responses only return `seendate`
+ * (indexing timestamp) and do not include a verifiable article publication or
+ * update timestamp, standard unenriched GDELT `ArtList` entries are discarded
+ * with `reason: 'indexing-date-only'`. Dates and metadata are never fabricated.
+ */
 export function createGdeltAdapter(
   options?: GdeltAdapterOptions,
 ): EvidenceProviderAdapter {
