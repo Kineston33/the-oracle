@@ -74,7 +74,7 @@ function sectorLuminance(angle: number, phaseOffset: number): number {
 function buildIrregularRingPath(
   baseRadius: number,
   harmonics: ReadonlyArray<{ freq: number; amp: number; phase: number }>,
-  steps = 128,
+  steps = 120,
 ): string {
   const pts: Array<[number, number]> = [];
   for (let i = 0; i < steps; i++) {
@@ -114,12 +114,11 @@ function buildIrisFilaments(): {
   const electricColors = ['#0066ff', '#0088ff', '#1ca3ff', '#00bfff', '#6e58ff', '#0051d5'];
   const cyanColors = ['#00e5ff', '#5cf2ff', '#a8ffff', '#00b8ff', '#8066ff', '#dbfbff'];
 
-  // Layer 1: Deep Blue & Cosmic Violet Stroma + Outer Dispersing Tendrils (76 filaments)
-  const deepCount = 76;
+  // Layer 1: Deep Blue & Cosmic Violet Stroma + Outer Dispersing Tendrils (52 filaments)
+  const deepCount = 52;
   for (let i = 0; i < deepCount; i++) {
     const baseAngle = (i / deepCount) * Math.PI * 2 + (rng() - 0.5) * 0.05;
     const lum = sectorLuminance(baseAngle, 0.2);
-    // Start slightly inside the pupil edge (r=38..48) so dilation/contraction never exposes a gap
     const rStart = 38 + rng() * 14;
     const isOuterTendril = rng() > 0.68;
     const rEnd = isOuterTendril ? 144 + rng() * 28 : 124 + rng() * 20;
@@ -143,13 +142,13 @@ function buildIrisFilaments(): {
       d: `M${x0} ${y0} C${x1} ${y1}, ${x2} ${y2}, ${x3} ${y3}`,
       color: deepColors[Math.floor(rng() * deepColors.length)]!,
       opacity: r2(Math.min(0.88, (0.3 + rng() * 0.42) * lum)),
-      width: r2(0.75 + rng() * 1.25),
+      width: r2(0.8 + rng() * 1.25),
       glow: lum > 0.88 && rng() > 0.55,
     });
   }
 
-  // Layer 2: Electric-Blue & Cyan Fibrous Iris Stroma (88 filaments, counter-rotating)
-  const electricCount = 88;
+  // Layer 2: Electric-Blue & Cyan Fibrous Iris Stroma (60 filaments, counter-rotating)
+  const electricCount = 60;
   for (let i = 0; i < electricCount; i++) {
     const baseAngle = (i / electricCount) * Math.PI * 2 + (rng() - 0.5) * 0.045;
     const lum = sectorLuminance(baseAngle, 1.8);
@@ -175,13 +174,13 @@ function buildIrisFilaments(): {
       d: `M${x0} ${y0} C${x1} ${y1}, ${x2} ${y2}, ${x3} ${y3}`,
       color: electricColors[Math.floor(rng() * electricColors.length)]!,
       opacity: r2(Math.min(0.92, (0.36 + rng() * 0.46) * lum)),
-      width: r2(0.65 + rng() * 1.15),
+      width: r2(0.7 + rng() * 1.15),
       glow: lum > 0.85 && rng() > 0.5,
     });
   }
 
-  // Layer 3: Inner Cyan Corona & Pupillary Collarette Filaments (64 filaments)
-  const cyanCount = 64;
+  // Layer 3: Inner Cyan Corona & Pupillary Collarette Filaments (44 filaments)
+  const cyanCount = 44;
   for (let i = 0; i < cyanCount; i++) {
     const baseAngle = (i / cyanCount) * Math.PI * 2 + (rng() - 0.5) * 0.04;
     const lum = sectorLuminance(baseAngle, 3.1);
@@ -202,16 +201,15 @@ function buildIrisFilaments(): {
       d: `M${x0} ${y0} Q${x1} ${y1} ${x2} ${y2}`,
       color: cyanColors[Math.floor(rng() * cyanColors.length)]!,
       opacity: r2(Math.min(0.96, (0.48 + rng() * 0.44) * lum)),
-      width: r2(0.6 + rng() * 0.95),
+      width: r2(0.65 + rng() * 0.95),
       glow: lum > 0.82 && rng() > 0.45,
     });
   }
 
   // Sector Arc Wisps: luminous partial arcs inside the iris stroma & limbus
-  // that make the counter-rotation unmistakably visible
-  for (let i = 0; i < 18; i++) {
-    const startAngle = (i / 18) * Math.PI * 2 + rng() * 0.22;
-    const span = 0.22 + rng() * 0.34;
+  for (let i = 0; i < 14; i++) {
+    const startAngle = (i / 14) * Math.PI * 2 + rng() * 0.22;
+    const span = 0.24 + rng() * 0.34;
     const endAngle = startAngle + span;
     const midAngle = startAngle + span * 0.5;
     const radius = 56 + rng() * 78;
@@ -227,7 +225,7 @@ function buildIrisFilaments(): {
     const wisp: IrisArcWisp = {
       d: `M${x0} ${y0} Q${xm} ${ym} ${x1} ${y1}`,
       color: i % 3 === 0 ? '#78f6ff' : i % 3 === 1 ? '#1a94ff' : '#7b63ff',
-      opacity: r2(0.38 + rng() * 0.42),
+      opacity: r2(0.4 + rng() * 0.42),
       width: r2(0.85 + rng() * 1.15),
     };
     if (i % 2 === 0) {
@@ -289,37 +287,37 @@ function buildCosmicParticles(): {
   };
 
   const innerParticles: CosmicParticle[] = [];
-  for (let i = 0; i < 48; i++) {
+  for (let i = 0; i < 34; i++) {
     innerParticles.push(makeParticle(43, 78, 0.75, 1.9, 0.55, 0.98, innerPalette, 0.5));
   }
 
   const midParticles: CosmicParticle[] = [];
-  for (let i = 0; i < 64; i++) {
+  for (let i = 0; i < 44; i++) {
     midParticles.push(makeParticle(74, 128, 0.7, 2.05, 0.45, 0.94, midPalette, 0.42));
   }
 
   const limbusParticles: CosmicParticle[] = [];
-  for (let i = 0; i < 68; i++) {
+  for (let i = 0; i < 46; i++) {
     limbusParticles.push(makeParticle(128, 145, 0.85, 2.25, 0.55, 0.98, limbusPalette, 0.58));
   }
 
   const stardustOuterCw: CosmicParticle[] = [];
-  for (let i = 0; i < 42; i++) {
+  for (let i = 0; i < 28; i++) {
     stardustOuterCw.push(makeParticle(145, 194, 0.65, 2.1, 0.32, 0.88, dustPalette, 0.42));
   }
 
   const stardustOuterCcw: CosmicParticle[] = [];
-  for (let i = 0; i < 42; i++) {
+  for (let i = 0; i < 28; i++) {
     stardustOuterCcw.push(makeParticle(144, 192, 0.6, 1.95, 0.3, 0.85, dustPalette, 0.38));
   }
 
   const stardustMidCw: CosmicParticle[] = [];
-  for (let i = 0; i < 32; i++) {
+  for (let i = 0; i < 22; i++) {
     stardustMidCw.push(makeParticle(138, 178, 0.8, 2.2, 0.42, 0.92, dustPalette, 0.48));
   }
 
   const stardustMidCcw: CosmicParticle[] = [];
-  for (let i = 0; i < 32; i++) {
+  for (let i = 0; i < 22; i++) {
     stardustMidCcw.push(makeParticle(140, 182, 0.75, 2.0, 0.38, 0.88, dustPalette, 0.45));
   }
 
@@ -396,6 +394,8 @@ export function CrystalSphere({
   const [inView, setInView] = useState(true);
   const [documentVisible, setDocumentVisible] = useState(true);
   const [reducedMotion, setReducedMotion] = useState(false);
+
+  const isCompact = size === 'compact';
 
   useEffect(() => {
     if (typeof window === 'undefined' || typeof window.matchMedia !== 'function') {
@@ -547,105 +547,105 @@ export function CrystalSphere({
               <stop offset="100%" stopColor="#00e5ff" stopOpacity="0.72" />
             </radialGradient>
 
-            <filter id={particleGlowFilter} x="-60%" y="-60%" width="220%" height="220%">
-              <feGaussianBlur stdDeviation="1.45" result="blur" />
-              <feMerge>
-                <feMergeNode in="blur" />
-                <feMergeNode in="SourceGraphic" />
-              </feMerge>
-            </filter>
+            {!isCompact && (
+              <>
+                <filter id={particleGlowFilter} x="-60%" y="-60%" width="220%" height="220%">
+                  <feGaussianBlur stdDeviation="1.45" result="blur" />
+                  <feMerge>
+                    <feMergeNode in="blur" />
+                    <feMergeNode in="SourceGraphic" />
+                  </feMerge>
+                </filter>
 
-            <filter id={filamentGlowFilter} x="-30%" y="-30%" width="160%" height="160%">
-              <feGaussianBlur stdDeviation="1.1" result="blur" />
-              <feMerge>
-                <feMergeNode in="blur" />
-                <feMergeNode in="SourceGraphic" />
-              </feMerge>
-            </filter>
+                <filter id={filamentGlowFilter} x="-30%" y="-30%" width="160%" height="160%">
+                  <feGaussianBlur stdDeviation="1.1" result="blur" />
+                  <feMerge>
+                    <feMergeNode in="blur" />
+                    <feMergeNode in="SourceGraphic" />
+                  </feMerge>
+                </filter>
+              </>
+            )}
           </defs>
 
           {/* Master coordinate origin at the exact center (200, 200) of the 400x400 viewBox */}
           <g transform={`translate(${CENTER}, ${CENTER})`}>
             {/* ================= 1. OUTER DISPERSING STARDUST ================= */}
-            <circle cx="0" cy="0" r="196" fill={`url(#${stardustHaloGrad})`} />
+            {!isCompact && (
+              <>
+                <circle cx="0" cy="0" r="196" fill={`url(#${stardustHaloGrad})`} />
 
-            {/* Outer Stardust Layer A — slow clockwise orbit + gentle radial dispersion */}
-            <g className={styles.stardustDriftOuter} data-layer="stardust-drift-outer">
-              <circle cx="0" cy="0" r="198" fill="transparent" />
-              <g className={styles.stardustOrbitCw} data-layer="stardust-orbit-cw">
-                <circle cx="0" cy="0" r="198" fill="transparent" />
-                {PARTICLE_LAYERS.stardustOuterCw.map((p, idx) => (
-                  <circle
-                    key={`sdocw-${idx}`}
-                    cx={p.cx}
-                    cy={p.cy}
-                    r={p.r}
-                    fill={p.color}
-                    opacity={p.opacity}
-                    filter={p.glow ? `url(#${particleGlowFilter})` : undefined}
-                    className={TwinkleClass[p.twinkleSlot]}
-                  />
-                ))}
-              </g>
-            </g>
+                {/* Outer Stardust Layer A — slow clockwise orbit + gentle radial dispersion */}
+                <g className={styles.stardustDriftOuter} data-layer="stardust-drift-outer">
+                  <g className={styles.stardustOrbitCw} data-layer="stardust-orbit-cw">
+                    {PARTICLE_LAYERS.stardustOuterCw.map((p, idx) => (
+                      <circle
+                        key={`sdocw-${idx}`}
+                        cx={p.cx}
+                        cy={p.cy}
+                        r={p.r}
+                        fill={p.color}
+                        opacity={p.opacity}
+                        filter={p.glow ? `url(#${particleGlowFilter})` : undefined}
+                        className={TwinkleClass[p.twinkleSlot]}
+                      />
+                    ))}
+                  </g>
+                </g>
 
-            {/* Outer Stardust Layer B — slow counter-clockwise orbit + inner drift */}
-            <g className={styles.stardustDriftInner} data-layer="stardust-drift-inner">
-              <circle cx="0" cy="0" r="198" fill="transparent" />
-              <g className={styles.stardustOrbitCcw} data-layer="stardust-orbit-ccw">
-                <circle cx="0" cy="0" r="198" fill="transparent" />
-                {PARTICLE_LAYERS.stardustOuterCcw.map((p, idx) => (
-                  <circle
-                    key={`sdoccw-${idx}`}
-                    cx={p.cx}
-                    cy={p.cy}
-                    r={p.r}
-                    fill={p.color}
-                    opacity={p.opacity}
-                    filter={p.glow ? `url(#${particleGlowFilter})` : undefined}
-                    className={TwinkleClass[p.twinkleSlot]}
-                  />
-                ))}
-              </g>
-            </g>
+                {/* Outer Stardust Layer B — slow counter-clockwise orbit + inner drift */}
+                <g className={styles.stardustDriftInner} data-layer="stardust-drift-inner">
+                  <g className={styles.stardustOrbitCcw} data-layer="stardust-orbit-ccw">
+                    {PARTICLE_LAYERS.stardustOuterCcw.map((p, idx) => (
+                      <circle
+                        key={`sdoccw-${idx}`}
+                        cx={p.cx}
+                        cy={p.cy}
+                        r={p.r}
+                        fill={p.color}
+                        opacity={p.opacity}
+                        filter={p.glow ? `url(#${particleGlowFilter})` : undefined}
+                        className={TwinkleClass[p.twinkleSlot]}
+                      />
+                    ))}
+                  </g>
+                </g>
 
-            {/* Mid-Halo Stardust Layer C & D — independent faster counter-orbits for depth */}
-            <g className={styles.stardustOrbitMidCw} data-layer="stardust-mid-cw">
-              <circle cx="0" cy="0" r="198" fill="transparent" />
-              {PARTICLE_LAYERS.stardustMidCw.map((p, idx) => (
-                <circle
-                  key={`sdmcw-${idx}`}
-                  cx={p.cx}
-                  cy={p.cy}
-                  r={p.r}
-                  fill={p.color}
-                  opacity={p.opacity}
-                  filter={p.glow ? `url(#${particleGlowFilter})` : undefined}
-                  className={TwinkleClass[p.twinkleSlot]}
-                />
-              ))}
-            </g>
+                {/* Mid-Halo Stardust Layer C & D — independent faster counter-orbits for depth */}
+                <g className={styles.stardustOrbitMidCw} data-layer="stardust-mid-cw">
+                  {PARTICLE_LAYERS.stardustMidCw.map((p, idx) => (
+                    <circle
+                      key={`sdmcw-${idx}`}
+                      cx={p.cx}
+                      cy={p.cy}
+                      r={p.r}
+                      fill={p.color}
+                      opacity={p.opacity}
+                      filter={p.glow ? `url(#${particleGlowFilter})` : undefined}
+                      className={TwinkleClass[p.twinkleSlot]}
+                    />
+                  ))}
+                </g>
 
-            <g className={styles.stardustOrbitMidCcw} data-layer="stardust-mid-ccw">
-              <circle cx="0" cy="0" r="198" fill="transparent" />
-              {PARTICLE_LAYERS.stardustMidCcw.map((p, idx) => (
-                <circle
-                  key={`sdmccw-${idx}`}
-                  cx={p.cx}
-                  cy={p.cy}
-                  r={p.r}
-                  fill={p.color}
-                  opacity={p.opacity}
-                  filter={p.glow ? `url(#${particleGlowFilter})` : undefined}
-                  className={TwinkleClass[p.twinkleSlot]}
-                />
-              ))}
-            </g>
+                <g className={styles.stardustOrbitMidCcw} data-layer="stardust-mid-ccw">
+                  {PARTICLE_LAYERS.stardustMidCcw.map((p, idx) => (
+                    <circle
+                      key={`sdmccw-${idx}`}
+                      cx={p.cx}
+                      cy={p.cy}
+                      r={p.r}
+                      fill={p.color}
+                      opacity={p.opacity}
+                      filter={p.glow ? `url(#${particleGlowFilter})` : undefined}
+                      className={TwinkleClass[p.twinkleSlot]}
+                    />
+                  ))}
+                </g>
+              </>
+            )}
 
             {/* ================= 2. ANIMATED COSMIC IRIS (CONTRACTS, DILATES & ROTATES) ================= */}
             <g className={styles.irisDilationGroup} data-layer="iris-dilation">
-              <circle cx="0" cy="0" r="198" fill="transparent" />
-
               {/* Annular volumetric base of the iris */}
               <circle cx="0" cy="0" r="158" fill={`url(#${irisBaseGrad})`} />
               <circle
@@ -657,81 +657,11 @@ export function CrystalSphere({
               />
 
               {/* --- Layer 2A: Deep Cobalt & Violet Stroma Filaments + Sector Wisps (rotates CW) --- */}
-              <g className={styles.irisLayerDeepCw} data-layer="iris-deep-cw">
-                <circle cx="0" cy="0" r="198" fill="transparent" />
-                {FILAMENTS.deep.map((fil, idx) => (
-                  <path
-                    key={`fdeep-${idx}`}
-                    d={fil.d}
-                    fill="none"
-                    stroke={fil.color}
-                    strokeOpacity={fil.opacity}
-                    strokeWidth={fil.width}
-                    strokeLinecap="round"
-                    filter={fil.glow ? `url(#${filamentGlowFilter})` : undefined}
-                  />
-                ))}
-                {FILAMENTS.arcWispsCw.map((wisp, idx) => (
-                  <path
-                    key={`wisp-cw-${idx}`}
-                    d={wisp.d}
-                    fill="none"
-                    stroke={wisp.color}
-                    strokeOpacity={wisp.opacity}
-                    strokeWidth={wisp.width}
-                    strokeLinecap="round"
-                  />
-                ))}
-              </g>
-
-              {/* --- Layer 2B: Electric-Blue Fibrous Stroma + Mid Particles (rotates CCW) --- */}
-              <g className={styles.irisLayerElectricCcw} data-layer="iris-electric-ccw">
-                <circle cx="0" cy="0" r="198" fill="transparent" />
-                {FILAMENTS.electric.map((fil, idx) => (
-                  <path
-                    key={`felec-${idx}`}
-                    d={fil.d}
-                    fill="none"
-                    stroke={fil.color}
-                    strokeOpacity={fil.opacity}
-                    strokeWidth={fil.width}
-                    strokeLinecap="round"
-                    filter={fil.glow ? `url(#${filamentGlowFilter})` : undefined}
-                  />
-                ))}
-                {FILAMENTS.arcWispsCcw.map((wisp, idx) => (
-                  <path
-                    key={`wisp-ccw-${idx}`}
-                    d={wisp.d}
-                    fill="none"
-                    stroke={wisp.color}
-                    strokeOpacity={wisp.opacity}
-                    strokeWidth={wisp.width}
-                    strokeLinecap="round"
-                  />
-                ))}
-                {PARTICLE_LAYERS.midParticles.map((p, idx) => (
-                  <circle
-                    key={`pmid-${idx}`}
-                    cx={p.cx}
-                    cy={p.cy}
-                    r={p.r}
-                    fill={p.color}
-                    opacity={p.opacity}
-                    filter={p.glow ? `url(#${particleGlowFilter})` : undefined}
-                    className={TwinkleClass[p.twinkleSlot]}
-                  />
-                ))}
-              </g>
-
-              {/* --- Layer 2C: Inner Cyan Corona Filaments & Collarette Sparks (secondary contraction + CW rotation) --- */}
-              <g className={styles.irisInnerCollarettePulse} data-layer="iris-collarette-pulse">
-                <circle cx="0" cy="0" r="198" fill="transparent" />
-                <g className={styles.irisLayerCyanCw} data-layer="iris-cyan-cw">
-                  <circle cx="0" cy="0" r="198" fill="transparent" />
-                  {FILAMENTS.cyan.map((fil, idx) => (
+              {!isCompact && (
+                <g className={styles.irisLayerDeepCw} data-layer="iris-deep-cw">
+                  {FILAMENTS.deep.map((fil, idx) => (
                     <path
-                      key={`fcyan-${idx}`}
+                      key={`fdeep-${idx}`}
                       d={fil.d}
                       fill="none"
                       stroke={fil.color}
@@ -741,6 +671,77 @@ export function CrystalSphere({
                       filter={fil.glow ? `url(#${filamentGlowFilter})` : undefined}
                     />
                   ))}
+                  {FILAMENTS.arcWispsCw.map((wisp, idx) => (
+                    <path
+                      key={`wisp-cw-${idx}`}
+                      d={wisp.d}
+                      fill="none"
+                      stroke={wisp.color}
+                      strokeOpacity={wisp.opacity}
+                      strokeWidth={wisp.width}
+                      strokeLinecap="round"
+                    />
+                  ))}
+                </g>
+              )}
+
+              {/* --- Layer 2B: Electric-Blue Fibrous Stroma + Mid Particles (rotates CCW) --- */}
+              {!isCompact && (
+                <g className={styles.irisLayerElectricCcw} data-layer="iris-electric-ccw">
+                  {FILAMENTS.electric.map((fil, idx) => (
+                    <path
+                      key={`felec-${idx}`}
+                      d={fil.d}
+                      fill="none"
+                      stroke={fil.color}
+                      strokeOpacity={fil.opacity}
+                      strokeWidth={fil.width}
+                      strokeLinecap="round"
+                      filter={fil.glow ? `url(#${filamentGlowFilter})` : undefined}
+                    />
+                  ))}
+                  {FILAMENTS.arcWispsCcw.map((wisp, idx) => (
+                    <path
+                      key={`wisp-ccw-${idx}`}
+                      d={wisp.d}
+                      fill="none"
+                      stroke={wisp.color}
+                      strokeOpacity={wisp.opacity}
+                      strokeWidth={wisp.width}
+                      strokeLinecap="round"
+                    />
+                  ))}
+                  {PARTICLE_LAYERS.midParticles.map((p, idx) => (
+                    <circle
+                      key={`pmid-${idx}`}
+                      cx={p.cx}
+                      cy={p.cy}
+                      r={p.r}
+                      fill={p.color}
+                      opacity={p.opacity}
+                      filter={p.glow ? `url(#${particleGlowFilter})` : undefined}
+                      className={TwinkleClass[p.twinkleSlot]}
+                    />
+                  ))}
+                </g>
+              )}
+
+              {/* --- Layer 2C: Inner Cyan Corona Filaments & Collarette Sparks (secondary contraction + CW rotation) --- */}
+              <g className={styles.irisInnerCollarettePulse} data-layer="iris-collarette-pulse">
+                <g className={styles.irisLayerCyanCw} data-layer="iris-cyan-cw">
+                  {!isCompact &&
+                    FILAMENTS.cyan.map((fil, idx) => (
+                      <path
+                        key={`fcyan-${idx}`}
+                        d={fil.d}
+                        fill="none"
+                        stroke={fil.color}
+                        strokeOpacity={fil.opacity}
+                        strokeWidth={fil.width}
+                        strokeLinecap="round"
+                        filter={fil.glow ? `url(#${filamentGlowFilter})` : undefined}
+                      />
+                    ))}
                   {/* Irregular Inner Collarette Rings surrounding the pupil */}
                   <path
                     d={INNER_COLLARETTE_PATH_A}
@@ -756,24 +757,24 @@ export function CrystalSphere({
                     strokeWidth="0.8"
                     strokeOpacity="0.56"
                   />
-                  {PARTICLE_LAYERS.innerParticles.map((p, idx) => (
-                    <circle
-                      key={`pinner-${idx}`}
-                      cx={p.cx}
-                      cy={p.cy}
-                      r={p.r}
-                      fill={p.color}
-                      opacity={p.opacity}
-                      filter={p.glow ? `url(#${particleGlowFilter})` : undefined}
-                      className={TwinkleClass[p.twinkleSlot]}
-                    />
-                  ))}
+                  {!isCompact &&
+                    PARTICLE_LAYERS.innerParticles.map((p, idx) => (
+                      <circle
+                        key={`pinner-${idx}`}
+                        cx={p.cx}
+                        cy={p.cy}
+                        r={p.r}
+                        fill={p.color}
+                        opacity={p.opacity}
+                        filter={p.glow ? `url(#${particleGlowFilter})` : undefined}
+                        className={TwinkleClass[p.twinkleSlot]}
+                      />
+                    ))}
                 </g>
               </g>
 
               {/* --- Layer 2D: Irregular Luminous Outer Limbus Rings (delimiting the iris) --- */}
               <g className={styles.limbusRingCw} data-layer="limbus-ring-cw">
-                <circle cx="0" cy="0" r="198" fill="transparent" />
                 <path
                   className={styles.limbusGlowPath}
                   d={OUTER_LIMBUS_PATH_A}
@@ -788,22 +789,22 @@ export function CrystalSphere({
                   strokeOpacity="0.52"
                   strokeWidth="1.2"
                 />
-                {PARTICLE_LAYERS.limbusParticles.map((p, idx) => (
-                  <circle
-                    key={`plimb-${idx}`}
-                    cx={p.cx}
-                    cy={p.cy}
-                    r={p.r}
-                    fill={p.color}
-                    opacity={p.opacity}
-                    filter={p.glow ? `url(#${particleGlowFilter})` : undefined}
-                    className={TwinkleClass[p.twinkleSlot]}
-                  />
-                ))}
+                {!isCompact &&
+                  PARTICLE_LAYERS.limbusParticles.map((p, idx) => (
+                    <circle
+                      key={`plimb-${idx}`}
+                      cx={p.cx}
+                      cy={p.cy}
+                      r={p.r}
+                      fill={p.color}
+                      opacity={p.opacity}
+                      filter={p.glow ? `url(#${particleGlowFilter})` : undefined}
+                      className={TwinkleClass[p.twinkleSlot]}
+                    />
+                  ))}
               </g>
 
               <g className={styles.limbusRingCcw} data-layer="limbus-ring-ccw">
-                <circle cx="0" cy="0" r="198" fill="transparent" />
                 <path
                   className={styles.limbusSecondaryPath}
                   d={OUTER_LIMBUS_PATH_B}
@@ -839,13 +840,15 @@ export function CrystalSphere({
         </svg>
 
         {/* Measurements: a quiet instrument readout, not decoration */}
-        <div className={styles.readout}>
-          <span className={styles.readoutLine} />
-          <span className={`${styles.readoutText} mono`}>
-            {(state === 'thinking' ? 'READING' : 'SYNCED')} · ORB-01 · 40.7128°N 74.0060°W
-          </span>
-          <span className={styles.readoutLine} />
-        </div>
+        {!isCompact && (
+          <div className={styles.readout}>
+            <span className={styles.readoutLine} />
+            <span className={`${styles.readoutText} mono`}>
+              {(state === 'thinking' ? 'READING' : 'SYNCED')} · ORB-01 · 40.7128°N 74.0060°W
+            </span>
+            <span className={styles.readoutLine} />
+          </div>
+        )}
       </div>
     </div>
   );
