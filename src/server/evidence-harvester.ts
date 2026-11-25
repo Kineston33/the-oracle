@@ -445,19 +445,44 @@ function extractEmbeddedIpv4OctetsFromHextets(
 }
 
 /**
- * True when an 8-hextet IPv6 address falls within any non-public range
- * (unspecified, loopback, link-local, unique-local, site-local, multicast,
- * documentation, benchmarking, discard-only) OR embeds a private/reserved IPv4
- * address (IPv4-mapped `::ffff:0:0/96`, IPv4-compatible `::/96`, IPv4-translated
- * `::ffff:0:0:0/96`, NAT64 `64:ff9b::/96`, 6to4 `2002::/16`, or Teredo `2001::/32`).
+ * True when an 8-hextet IPv6 address is non-public, reserved, or non-globally-routable
+ * according to the IANA IPv6 Global Unicast (`2000::/3`) & IANA IPv6 Special-Purpose
+ * Address Registries (RFC 4291, RFC 6890, RFC 7343, RFC 9374, RFC 9602, RFC 9637).
+ *
+ * Policy:
+ *   1. Explicitly evaluate IPv4-embedding transition prefixes outside `2000::/3`
+ *      (`::ffff:0:0/96` IPv4-mapped, `::/96` IPv4-compatible excluding `::/128`
+ *      and `::1/128`, `::ffff:0:0:0/96` IPv4-translated, and `64:ff9b::/96`
+ *      Well-Known NAT64) by validating their embedded 32-bit IPv4 address against
+ *      `isPrivateOrReservedIpv4Octets`.
+ *   2. Enforce a positive Global Unicast allowlist (`2000::/3`, i.e.,
+ *      `(h[0] & 0xe000) === 0x2000`, `2000::`–`3fff:ffff:...`). Every other
+ *      prefix outside `2000::/3` (including `::/128`, `::1/128`, `100::/64`
+ *      Discard-Only, `64:ff9b:1::/48` Local NAT64, `5f00::/16` SRv6 SIDs,
+ *      `fc00::/7` Unique-Local, `fe80::/10` Link-Local, `fec0::/10` Site-Local,
+ *      `ff00::/8` Multicast, and all IETF reserved/unallocated blocks such as
+ *      `0200::/7`, `0400::/6`, `4000::/3`, `8000::/3`, `c000::/3`, `e000::/4`)
+ *      is rejected.
+ *   3. Within `2000::/3`, reject all IANA Special-Purpose Address Registry
+ *      exceptions and non-routable ranges:
+ *        - `2001:0000::/32` (Teredo, RFC 4380): validate both the XOR-obfuscated
+ *          client IPv4 (`h[6] ^ 0xffff, h[7] ^ 0xffff`) and server IPv4 (`h[2], h[3]`).
+ *        - `2001:0000::/23` (`2001:0001::`–`2001:01ff:ffff:...`, IETF Protocol
+ *          Assignments, RFC 2928): includes PCP/TURN/SRP Anycast (`2001:1::/32`),
+ *          Benchmarking (`2001:2::/48`, RFC 5180), AMT (`2001:3::/32`, RFC 7450),
+ *          AS112-v6 (`2001:4:112::/48`, RFC 7535), Deprecated ORCHID
+ *          (`2001:10::/28`, RFC 4843), ORCHIDv2 (`2001:20::/28`, RFC 7343), and
+ *          DRIP DETs (`2001:30::/28`, RFC 9374).
+ *        - `2001:db8::/32` (Documentation, RFC 3849).
+ *        - `2002::/16` (6to4, RFC 3056): validate the embedded IPv4 in `h[1], h[2]`.
+ *        - `2620:4f:8000::/48` (Direct Delegation AS112 Service, RFC 7534).
+ *        - `3fff::/20` (Documentation, RFC 9637).
  */
 function isPrivateOrReservedIpv6Hextets(h: readonly number[]): boolean {
   if (h.length !== 8) return true;
 
-  // 1. Unspecified ::/128
+  // 1. Unspecified ::/128 & Loopback ::1/128
   if (h.every((group) => group === 0)) return true;
-
-  // 2. Loopback ::1/128
   if (
     h[0] === 0 &&
     h[1] === 0 &&
@@ -471,7 +496,7 @@ function isPrivateOrReservedIpv6Hextets(h: readonly number[]): boolean {
     return true;
   }
 
-  // 3. IPv4-mapped IPv6 ::ffff:0:0/96 (e.g. ::ffff:172.16.0.1 or ::ffff:ac10:1)
+  // 2. IPv4-mapped IPv6 ::ffff:0:0/96 (RFC 4291)
   if (
     h[0] === 0 &&
     h[1] === 0 &&
@@ -484,7 +509,7 @@ function isPrivateOrReservedIpv6Hextets(h: readonly number[]): boolean {
     return isPrivateOrReservedIpv4Octets(octets);
   }
 
-  // 4. IPv4-compatible IPv6 ::/96 (deprecated RFC 4291, e.g. ::127.0.0.1)
+  // 3. IPv4-compatible IPv6 ::/96 (deprecated RFC 4291, e.g. ::127.0.0.1)
   if (
     h[0] === 0 &&
     h[1] === 0 &&
@@ -498,7 +523,7 @@ function isPrivateOrReservedIpv6Hextets(h: readonly number[]): boolean {
     return isPrivateOrReservedIpv4Octets(octets);
   }
 
-  // 5. IPv4-translated IPv6 ::ffff:0:0:0/96 (RFC 2765)
+  // 4. IPv4-translated IPv6 ::ffff:0:0:0/96 (RFC 2765)
   if (
     h[0] === 0 &&
     h[1] === 0 &&
@@ -511,50 +536,75 @@ function isPrivateOrReservedIpv6Hextets(h: readonly number[]): boolean {
     return isPrivateOrReservedIpv4Octets(octets);
   }
 
-  // 6. NAT64 Well-Known Prefix 64:ff9b::/96 (RFC 6052) & Local-Use 64:ff9b:1::/48 (RFC 8215)
-  if (h[0] === 0x0064 && h[1] === 0xff9b) {
-    if (h[2] === 0x0001) return true;
-    if (h[2] === 0 && h[3] === 0 && h[4] === 0 && h[5] === 0) {
-      const octets = extractEmbeddedIpv4OctetsFromHextets(h[6], h[7]);
-      return isPrivateOrReservedIpv4Octets(octets);
-    }
+  // 5. NAT64 Well-Known Prefix 64:ff9b::/96 (RFC 6052)
+  //    Note: Local-Use NAT64 64:ff9b:1::/48 (RFC 8215) falls through and is rejected.
+  if (
+    h[0] === 0x0064 &&
+    h[1] === 0xff9b &&
+    h[2] === 0 &&
+    h[3] === 0 &&
+    h[4] === 0 &&
+    h[5] === 0
+  ) {
+    const octets = extractEmbeddedIpv4OctetsFromHextets(h[6], h[7]);
+    return isPrivateOrReservedIpv4Octets(octets);
   }
 
-  // 7. 6to4 2002::/16 (RFC 3056) — embeds IPv4 in h[1] and h[2]
+  // 6. Positive allowlist: require IANA Global Unicast 2000::/3 (0x2000..0x3fff)
+  if ((h[0] & 0xe000) !== 0x2000) {
+    return true;
+  }
+
+  // 7. Special-Purpose exceptions inside 2000::/3:
+
+  // 7a. IETF Protocol Assignments 2001:0000::/23 (h[0] === 0x2001 && h[1] in 0x0000..0x01ff)
+  if (h[0] === 0x2001 && (h[1] & 0xfe00) === 0x0000) {
+    // Teredo 2001:0000::/32 (RFC 4380): embeds server IPv4 in h[2..3] and
+    // XOR-obfuscated client IPv4 in h[6..7].
+    if (h[1] === 0x0000) {
+      const clientOctets = extractEmbeddedIpv4OctetsFromHextets(
+        h[6] ^ 0xffff,
+        h[7] ^ 0xffff,
+      );
+      if (isPrivateOrReservedIpv4Octets(clientOctets)) {
+        return true;
+      }
+      if (h[2] !== 0 || h[3] !== 0) {
+        const serverOctets = extractEmbeddedIpv4OctetsFromHextets(h[2], h[3]);
+        if (isPrivateOrReservedIpv4Octets(serverOctets)) {
+          return true;
+        }
+      }
+      return false;
+    }
+
+    // All other sub-allocations in 2001:0000::/23 (0x0001..0x01ff) — including
+    // Anycast 2001:1::/32, Benchmarking 2001:2::/48, AMT 2001:3::/32,
+    // AS112-v6 2001:4:112::/48, ORCHID 2001:10::/28, ORCHIDv2 2001:20::/28,
+    // and DRIP DETs 2001:30::/28 — are non-routable / special-purpose:
+    return true;
+  }
+
+  // 7b. Documentation 2001:db8::/32 (RFC 3849)
+  if (h[0] === 0x2001 && h[1] === 0x0db8) {
+    return true;
+  }
+
+  // 7c. 6to4 2002::/16 (RFC 3056) — embeds IPv4 in h[1] and h[2]
   if (h[0] === 0x2002) {
     const octets = extractEmbeddedIpv4OctetsFromHextets(h[1], h[2]);
     return isPrivateOrReservedIpv4Octets(octets);
   }
 
-  // 8. Teredo 2001:0000::/32 (RFC 4380) — embeds XOR-obfuscated client IPv4 in h[6], h[7]
-  if (h[0] === 0x2001 && h[1] === 0x0000) {
-    const octets = extractEmbeddedIpv4OctetsFromHextets(
-      h[6] ^ 0xffff,
-      h[7] ^ 0xffff,
-    );
-    return isPrivateOrReservedIpv4Octets(octets);
+  // 7d. Direct Delegation AS112 Service 2620:4f:8000::/48 (RFC 7534)
+  if (h[0] === 0x2620 && h[1] === 0x004f && h[2] === 0x8000) {
+    return true;
   }
 
-  // 9. Benchmarking 2001:2::/48 (RFC 5180)
-  if (h[0] === 0x2001 && h[1] === 0x0002 && h[2] === 0x0000) return true;
-
-  // 10. Documentation 2001:db8::/32 (RFC 3849)
-  if (h[0] === 0x2001 && h[1] === 0x0db8) return true;
-
-  // 11. Discard-Only 100::/64 (RFC 6666)
-  if (h[0] === 0x0100 && h[1] === 0 && h[2] === 0 && h[3] === 0) return true;
-
-  // 12. Unique Local fc00::/7 (RFC 4193): fc00:: through fdff:ffff:...
-  if ((h[0] & 0xfe00) === 0xfc00) return true;
-
-  // 13. Link-Local fe80::/10 (RFC 4291): fe80:: through febf:ffff:...
-  if ((h[0] & 0xffc0) === 0xfe80) return true;
-
-  // 14. Site-Local fec0::/10 (deprecated RFC 3879): fec0:: through feff:ffff:...
-  if ((h[0] & 0xffc0) === 0xfec0) return true;
-
-  // 15. Multicast ff00::/8 (RFC 4291)
-  if ((h[0] & 0xff00) === 0xff00) return true;
+  // 7e. Documentation 3fff::/20 (RFC 9637)
+  if (h[0] === 0x3fff && (h[1] & 0xf000) === 0x0000) {
+    return true;
+  }
 
   return false;
 }

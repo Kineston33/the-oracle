@@ -571,7 +571,7 @@ describe('EvidenceHarvester — Stage 1', () => {
       expect(validateAndNormalizeEvidenceUrl('https://[fc00::1]/test')).toBeNull();
       expect(validateAndNormalizeEvidenceUrl('https://[fd12:3456:789a::1]/test')).toBeNull();
 
-      // IPv4-mapped IPv6 (::ffff:0:0/96), IPv4-compatible, NAT64, and 6to4 with private IPv4
+      // IPv4-mapped IPv6 (::ffff:0:0/96), IPv4-compatible, NAT64, 6to4, and Teredo with private IPv4
       expect(isPrivateOrLocalHostname('::ffff:127.0.0.1')).toBe(true);
       expect(isPrivateOrLocalHostname('::ffff:10.0.0.1')).toBe(true);
       expect(isPrivateOrLocalHostname('::ffff:172.16.0.1')).toBe(true);
@@ -580,7 +580,19 @@ describe('EvidenceHarvester — Stage 1', () => {
       expect(isPrivateOrLocalHostname('::ffff:169.254.169.254')).toBe(true);
       expect(isPrivateOrLocalHostname('::127.0.0.1')).toBe(true);
       expect(isPrivateOrLocalHostname('64:ff9b::10.0.0.1')).toBe(true);
-      expect(isPrivateOrLocalHostname('2002:ac10:1::1')).toBe(true); // 2002::/16 with 172.16.0.1
+      expect(isPrivateOrLocalHostname('64:ff9b::172.16.0.1')).toBe(true);
+      expect(isPrivateOrLocalHostname('64:ff9b:1::1')).toBe(true); // RFC 8215 Local-Use NAT64
+      expect(isPrivateOrLocalHostname('2002:ac10:1::1')).toBe(true); // 6to4 with 172.16.0.1
+      expect(isPrivateOrLocalHostname('2002:c0a8:101::1')).toBe(true); // 6to4 with 192.168.1.1
+      // Teredo (2001:0000::/32): client IPv4 is XORed with 0xffff in last 32 bits:
+      // 127.0.0.1 (0x7f00:0x0001) XOR 0xffff = 0x80ff:0xfffe
+      expect(isPrivateOrLocalHostname('2001:0:4136:e378:8000:63bf:80ff:fffe')).toBe(
+        true,
+      );
+      // Teredo with private server IPv4 10.0.0.1 (0x0a00:0x0001) even if client IPv4 is public
+      expect(isPrivateOrLocalHostname('2001:0:0a00:0001:8000:63bf:a247:27dd')).toBe(
+        true,
+      );
 
       expect(validateAndNormalizeEvidenceUrl('http://[::ffff:127.0.0.1]/test')).toBeNull();
       expect(validateAndNormalizeEvidenceUrl('http://[::ffff:10.0.0.1]/test')).toBeNull();
@@ -589,23 +601,100 @@ describe('EvidenceHarvester — Stage 1', () => {
       expect(validateAndNormalizeEvidenceUrl('http://[::ffff:192.168.1.1]/test')).toBeNull();
       expect(validateAndNormalizeEvidenceUrl('http://[::ffff:169.254.169.254]/test')).toBeNull();
 
-      // IPv4-mapped IPv6 with PUBLIC IPv4 addresses must be allowed
+      // IANA IPv6 Special-Purpose Address Registry: ORCHID, ORCHIDv2, DRIP DETs, IETF Protocol Assignments, Documentation, AS112, SRv6, Discard-Only, and Reserved blocks
+      // Deprecated ORCHID 2001:10::/28 (RFC 4843)
+      expect(isPrivateOrLocalHostname('2001:10::1')).toBe(true);
+      expect(isPrivateOrLocalHostname('2001:1f:ffff:ffff:ffff:ffff:ffff:ffff')).toBe(
+        true,
+      );
+      expect(validateAndNormalizeEvidenceUrl('https://[2001:10::1]/test')).toBeNull();
+      expect(validateAndNormalizeEvidenceUrl('https://[2001:1a::beef]/test')).toBeNull();
+
+      // ORCHIDv2 2001:20::/28 (RFC 7343)
+      expect(isPrivateOrLocalHostname('2001:20::1')).toBe(true);
+      expect(isPrivateOrLocalHostname('2001:2f:ffff:ffff:ffff:ffff:ffff:ffff')).toBe(
+        true,
+      );
+      expect(validateAndNormalizeEvidenceUrl('https://[2001:20::1]/test')).toBeNull();
+      expect(validateAndNormalizeEvidenceUrl('https://[2001:28::cafe]/test')).toBeNull();
+
+      // DRIP DETs 2001:30::/28 (RFC 9374) & other IETF Protocol Assignments in 2001::/23
+      expect(isPrivateOrLocalHostname('2001:30::1')).toBe(true);
+      expect(isPrivateOrLocalHostname('2001:3f:ffff::1')).toBe(true);
+      expect(isPrivateOrLocalHostname('2001:1::1')).toBe(true); // PCP Anycast
+      expect(isPrivateOrLocalHostname('2001:1::2')).toBe(true); // TURN Anycast
+      expect(isPrivateOrLocalHostname('2001:1::3')).toBe(true); // DNS-SD SRP Anycast
+      expect(isPrivateOrLocalHostname('2001:2::1')).toBe(true); // Benchmarking 2001:2::/48
+      expect(isPrivateOrLocalHostname('2001:3::1')).toBe(true); // AMT 2001:3::/32
+      expect(isPrivateOrLocalHostname('2001:4:112::1')).toBe(true); // AS112-v6 2001:4:112::/48
+      expect(isPrivateOrLocalHostname('2001:1ff:ffff::1')).toBe(true); // End of 2001::/23
+      expect(validateAndNormalizeEvidenceUrl('https://[2001:30::1]/test')).toBeNull();
+      expect(validateAndNormalizeEvidenceUrl('https://[2001:2::1]/test')).toBeNull();
+      expect(validateAndNormalizeEvidenceUrl('https://[2001:3::1]/test')).toBeNull();
+      expect(validateAndNormalizeEvidenceUrl('https://[2001:4:112::1]/test')).toBeNull();
+
+      // Documentation prefixes: 2001:db8::/32 (RFC 3849) & 3fff::/20 (RFC 9637)
+      expect(isPrivateOrLocalHostname('2001:db8::1')).toBe(true);
+      expect(isPrivateOrLocalHostname('2001:db8:ffff::1')).toBe(true);
+      expect(isPrivateOrLocalHostname('3fff::1')).toBe(true);
+      expect(isPrivateOrLocalHostname('3fff:fff:ffff:ffff:ffff:ffff:ffff:ffff')).toBe(
+        true,
+      );
+      expect(validateAndNormalizeEvidenceUrl('https://[2001:db8::1]/doc')).toBeNull();
+      expect(validateAndNormalizeEvidenceUrl('https://[3fff::1]/doc')).toBeNull();
+
+      // Direct Delegation AS112 Service 2620:4f:8000::/48 (RFC 7534)
+      expect(isPrivateOrLocalHostname('2620:4f:8000::1')).toBe(true);
+      expect(
+        validateAndNormalizeEvidenceUrl('https://[2620:4f:8000::1]/as112'),
+      ).toBeNull();
+
+      // Discard-Only 100::/64 (RFC 6666), SRv6 SIDs 5f00::/16 (RFC 9602), and unallocated non-2000::/3 blocks
+      expect(isPrivateOrLocalHostname('100::1')).toBe(true);
+      expect(isPrivateOrLocalHostname('5f00::1')).toBe(true);
+      expect(isPrivateOrLocalHostname('0200::1')).toBe(true);
+      expect(isPrivateOrLocalHostname('0400::1')).toBe(true);
+      expect(isPrivateOrLocalHostname('4000::1')).toBe(true);
+      expect(isPrivateOrLocalHostname('8000::1')).toBe(true);
+      expect(isPrivateOrLocalHostname('c000::1')).toBe(true);
+      expect(isPrivateOrLocalHostname('e000::1')).toBe(true);
+      expect(validateAndNormalizeEvidenceUrl('https://[100::1]/discard')).toBeNull();
+      expect(validateAndNormalizeEvidenceUrl('https://[5f00::1]/srv6')).toBeNull();
+      expect(validateAndNormalizeEvidenceUrl('https://[4000::1]/reserved')).toBeNull();
+
+      // IPv4-mapped, NAT64, 6to4, and Teredo with PUBLIC IPv4 addresses must be allowed
       expect(isPrivateOrLocalHostname('::ffff:93.184.216.34')).toBe(false);
       expect(isPrivateOrLocalHostname('::ffff:172.15.255.255')).toBe(false);
       expect(isPrivateOrLocalHostname('::ffff:172.32.0.1')).toBe(false);
+      expect(isPrivateOrLocalHostname('64:ff9b::93.184.216.34')).toBe(false);
+      expect(isPrivateOrLocalHostname('2002:5db8:d822::1')).toBe(false); // 6to4 with 93.184.216.34
+      // Teredo with public server 65.54.227.120 (0x4136:0xe378) and public client 93.184.216.34 (0x5db8:0xd822 XOR 0xffff = 0xa247:0x27dd)
+      expect(
+        isPrivateOrLocalHostname('2001:0:4136:e378:8000:63bf:a247:27dd'),
+      ).toBe(false);
       expect(
         validateAndNormalizeEvidenceUrl('https://[::ffff:93.184.216.34]/public'),
       ).toBe('https://[::ffff:5db8:d822]/public');
 
-      // Global unicast public IPv6 addresses must be allowed
+      // Global unicast public IPv6 addresses across RIR allocations must be allowed
       expect(
         isPrivateOrLocalHostname('2606:2800:220:1:248:1893:25c8:1946'),
       ).toBe(false);
+      expect(isPrivateOrLocalHostname('2001:4860:4860::8888')).toBe(false);
+      expect(isPrivateOrLocalHostname('2606:4700:4700::1111')).toBe(false);
+      expect(isPrivateOrLocalHostname('2a00:1450:4001:81b::200e')).toBe(false);
+      expect(isPrivateOrLocalHostname('2400:cb00:2048:1::c629:d7a2')).toBe(false);
+      expect(isPrivateOrLocalHostname('2800:3f0:4002:800::200e')).toBe(false);
+      expect(isPrivateOrLocalHostname('2c0f:fb50:4002:800::200e')).toBe(false);
+      expect(isPrivateOrLocalHostname('2620:4f:8001::1')).toBe(false); // Outside 2620:4f:8000::/48 AS112
       expect(
         validateAndNormalizeEvidenceUrl(
           'https://[2606:2800:220:1:248:1893:25c8:1946]/report',
         ),
       ).toBe('https://[2606:2800:220:1:248:1893:25c8:1946]/report');
+      expect(
+        validateAndNormalizeEvidenceUrl('https://[2001:4860:4860::8888]/dns'),
+      ).toBe('https://[2001:4860:4860::8888]/dns');
 
       // Public domains that start with numbers or IP-like substrings must NOT trigger false positives
       expect(isPrivateOrLocalHostname('172.example.com')).toBe(false);
