@@ -362,6 +362,8 @@ describe('accessibility basics', () => {
     expect(heroSphere.querySelector('[data-layer="stardust-orbit-cw"]')).not.toBeNull();
     expect(heroSphere.querySelector('[data-layer="stardust-drift-inner"]')).not.toBeNull();
     expect(heroSphere.querySelector('[data-layer="stardust-orbit-ccw"]')).not.toBeNull();
+    expect(heroSphere.querySelector('[data-layer="stardust-mid-cw"]')).not.toBeNull();
+    expect(heroSphere.querySelector('[data-layer="stardust-mid-ccw"]')).not.toBeNull();
 
     // Stationary deep black central pupil is outside the rotating/scaling iris group
     const pupilFixed = heroSphere.querySelector('[data-layer="pupil-fixed"]');
@@ -369,8 +371,8 @@ describe('accessibility basics', () => {
     expect(pupilFixed).not.toBeNull();
     expect(dilationGroup!.contains(pupilFixed)).toBe(false);
     expect(pupilCore).toHaveAttribute('fill', '#000000');
-    expect(pupilCore).toHaveAttribute('cx', '200');
-    expect(pupilCore).toHaveAttribute('cy', '200');
+    expect(pupilCore).toHaveAttribute('cx', '0');
+    expect(pupilCore).toHaveAttribute('cy', '0');
   });
 
   it('announces search result counts politely', () => {
