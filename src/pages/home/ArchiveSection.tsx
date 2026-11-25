@@ -1,7 +1,10 @@
+import { useEffect, useMemo, useState } from 'react';
 import { Link } from 'react-router-dom';
 import { ArrowUpRight, LockKeyhole } from 'lucide-react';
 import { deriveLifecycle } from '@/data/lifecycle';
 import { predictionRecords, summarizeArchive } from '@/data/records';
+import type { PredictionRecord } from '@/data/types';
+import { fetchArchivePredictions } from '@/lib/api-client';
 import { formatDate, formatPercent } from '@/lib/format';
 import { SectionHeader } from '@/components/ui/SectionHeader';
 import { Callout } from '@/components/ui/Callout';
@@ -12,10 +15,36 @@ import styles from './ArchiveSection.module.css';
  * what a record *is* rather than how it looks in a marketing card.
  */
 export function ArchiveSection() {
-  const records = [...predictionRecords]
-    .sort((a, b) => Date.parse(b.publishedAt) - Date.parse(a.publishedAt))
-    .slice(0, 5);
-  const summary = summarizeArchive(predictionRecords);
+  const [officialRecords, setOfficialRecords] = useState<PredictionRecord[]>([]);
+
+  useEffect(() => {
+    let cancelled = false;
+    fetchArchivePredictions({ includeDemo: false })
+      .then((res) => {
+        if (!cancelled && res.source === 'ledger-api') {
+          setOfficialRecords(res.predictions.filter((r) => !r.demo));
+        }
+      })
+      .catch(() => {
+        // Keep local preview fallback
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  const combinedPool = useMemo(
+    () => [...officialRecords, ...predictionRecords],
+    [officialRecords],
+  );
+  const records = useMemo(
+    () =>
+      [...combinedPool]
+        .sort((a, b) => Date.parse(b.publishedAt) - Date.parse(a.publishedAt))
+        .slice(0, 5),
+    [combinedPool],
+  );
+  const summary = useMemo(() => summarizeArchive(combinedPool), [combinedPool]);
 
   return (
     <section className={styles.section} aria-labelledby="archive-title">

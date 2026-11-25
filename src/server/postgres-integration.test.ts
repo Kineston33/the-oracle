@@ -9,7 +9,7 @@
 
 import { spawn } from 'node:child_process';
 import { EventEmitter } from 'node:events';
-import { readFileSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import pg from 'pg';
@@ -3247,6 +3247,545 @@ describe('Real PostgreSQL 16+ Integration Suite — Official Publication Protoco
       } else {
         process.env.NEON_API_KEY = savedApiKey;
       }
+    }
+  });
+
+  it('19. serves unified SPA + /v1 API, resolves canonical questions with abstention and deduplication, and supports token-authenticated official publication and append-only resolution events', async () => {
+    const pubToken = 'OracleTrustedPubToken_2026_HighEntropy_99!';
+    const distDir = resolve(process.cwd(), 'dist');
+
+    const running = await startOracleServer({
+      databaseUrl: cluster.appConnectionString,
+      port: 0,
+      host: '127.0.0.1',
+      publicationToken: pubToken,
+      staticDir: existsSync(resolve(distDir, 'index.html')) ? distDir : null,
+    });
+
+    const baseUrl = `http://127.0.0.1:${running.port}`;
+
+    try {
+      // 1. GET /v1/health (same-origin by default: no wildcard Access-Control-Allow-Origin)
+      const healthRes = await fetch(`${baseUrl}/v1/health`);
+      expect(healthRes.status).toBe(200);
+      expect(healthRes.headers.get('access-control-allow-origin')).toBeNull();
+      const healthBody = (await healthRes.json()) as {
+        status: string;
+        service: string;
+        protocolVersion: string;
+        runtimeRole: string;
+      };
+      expect(healthBody.status).toBe('ok');
+      expect(healthBody.service).toBe('the-oracle');
+      expect(healthBody.protocolVersion).toBe('1.10');
+      expect(healthBody.runtimeRole).toBe('oracle_app');
+
+      // 2. Centralized canonical question resolution & abstention on vague or uncalibrated questions
+      const vagueRes = await fetch(
+        `${baseUrl}/v1/questions/resolve?q=${encodeURIComponent('Will AI change the economy soon?')}`,
+      );
+      expect(vagueRes.status).toBe(200);
+      const vagueBody = (await vagueRes.json()) as {
+        identityComplete: boolean;
+        autonomousDecision: string;
+        unresolvedComponents: string[];
+        abstentionReasons: string[];
+      };
+      expect(vagueBody.identityComplete).toBe(false);
+      expect(vagueBody.autonomousDecision).toBe('abstain');
+      expect(vagueBody.unresolvedComponents.length).toBeGreaterThan(0);
+
+      // Equivalent phrasings resolve to the exact same canonical identityDigest
+      const eq1Res = await fetch(
+        `${baseUrl}/v1/questions/resolve?q=${encodeURIComponent('Will global battery storage exceed 1,200 GW in 2028 according to the IEA?')}`,
+      );
+      const eq2Res = await fetch(`${baseUrl}/v1/questions/resolve`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          question:
+            'According to the International Energy Agency, will worldwide grid battery storage pass 1200 gigawatts by 2028?',
+        }),
+      });
+      expect(eq1Res.status).toBe(200);
+      expect(eq2Res.status).toBe(200);
+      const eq1Body = (await eq1Res.json()) as {
+        identityComplete: boolean;
+        identityDigest: string;
+        identity: unknown;
+      };
+      const eq2Body = (await eq2Res.json()) as {
+        identityComplete: boolean;
+        identityDigest: string;
+        identity: unknown;
+      };
+      expect(eq1Body.identityComplete).toBe(true);
+      expect(eq2Body.identityComplete).toBe(true);
+      expect(eq1Body.identityDigest).toBe(eq2Body.identityDigest);
+      expect(eq1Body.identity).toEqual(eq2Body.identity);
+
+      // 3. Unauthenticated or wrong-token write attempts still fail closed with 403 trusted_server_only
+      const unauthPub = await fetch(`${baseUrl}/v1/publications`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({}),
+      });
+      expect(unauthPub.status).toBe(403);
+
+      const wrongTokenPub = await fetch(`${baseUrl}/v1/publications`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: 'Bearer wrong-token-value-1234567890',
+        },
+        body: JSON.stringify({}),
+      });
+      expect(wrongTokenPub.status).toBe(403);
+
+      // 4. Authenticated POST /v1/publications abstains (422) when candidate is missing evidence or probability
+      const baseCandidate = buildDraftCandidate('api-e2e-1', {
+        condition: { namespace: 'threshold', id: 'below-18-percent-api-test' },
+      });
+      const incompleteCandidate = {
+        ...baseCandidate,
+        probability: null,
+        evidence: [],
+      };
+      const abstainedPub = await fetch(`${baseUrl}/v1/publications`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${pubToken}`,
+        },
+        body: JSON.stringify({
+          candidate: incompleteCandidate,
+          idempotencyKey: 'idem-abstain-api-001',
+        }),
+      });
+      expect(abstainedPub.status).toBe(422);
+      const abstainedBody = (await abstainedPub.json()) as {
+        status: string;
+        error: string;
+        abstentionReasons: string[];
+      };
+      expect(abstainedBody.status).toBe('abstained');
+      expect(abstainedBody.error).toBe('publication_abstained');
+      expect(abstainedBody.abstentionReasons.join(' ')).toMatch(
+        /probability-in-range|recorded-evidence/,
+      );
+
+      // 5. Authenticated POST /v1/publications commits a valid official prediction (201 Created)
+      //    with server-assigned publishedAt, recordedAt, and predictionId
+      const beforePubMs = Date.now();
+      const validPubRes = await fetch(`${baseUrl}/v1/publications`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${pubToken}`,
+        },
+        body: JSON.stringify({
+          candidate: baseCandidate,
+          idempotencyKey: 'idem-valid-api-001',
+        }),
+      });
+      const afterPubMs = Date.now();
+      expect(validPubRes.status).toBe(201);
+      const validPubBody = (await validPubRes.json()) as {
+        status: string;
+        outcome: {
+          kind: string;
+          predictionId: string;
+          identityDigest: string;
+          record: {
+            id: string;
+            demo: boolean;
+            probability: number;
+            publishedAt: string;
+            events: Array<{ seq: string; occurredAt: string; recordedAt: string }>;
+          };
+        };
+        provenance: {
+          officialPublishedAt: string;
+          officialRecordedAt: string;
+        };
+      };
+      expect(validPubBody.status).toBe('created');
+      expect(validPubBody.outcome.record.demo).toBe(false);
+      const createdId = validPubBody.outcome.predictionId;
+      const originalProbability = validPubBody.outcome.record.probability;
+      const e0 = validPubBody.outcome.record.events[0]!;
+      expect(Date.parse(validPubBody.outcome.record.publishedAt)).toBeGreaterThanOrEqual(
+        beforePubMs - 50,
+      );
+      expect(Date.parse(e0.recordedAt)).toBeLessThanOrEqual(afterPubMs + 50);
+      expect(Date.parse(e0.recordedAt)).toBeGreaterThan(
+        Date.parse(validPubBody.outcome.record.publishedAt),
+      );
+
+      // 6. Submitting another candidate with the same canonical proposition identity deduplicates to 'existing' (200 OK)
+      const duplicateCandidate = {
+        ...baseCandidate,
+        candidateId: 'cand-api-e2e-duplicate',
+      };
+      const dupPubRes = await fetch(`${baseUrl}/v1/publications`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${pubToken}`,
+        },
+        body: JSON.stringify({
+          candidate: duplicateCandidate,
+          idempotencyKey: 'idem-dup-api-002',
+        }),
+      });
+      expect(dupPubRes.status).toBe(200);
+      const dupPubBody = (await dupPubRes.json()) as {
+        status: string;
+        outcome: { kind: string; predictionId: string };
+      };
+      expect(dupPubBody.status).toBe('existing');
+      expect(dupPubBody.outcome.predictionId).toBe(createdId);
+
+      // 7. Authenticated POST /v1/predictions/:id/events appends a separate terminal resolution event
+      //    with server-authoritative recordedAt while keeping the published prediction and its original probability immutable
+      const resolveEventRes = await fetch(
+        `${baseUrl}/v1/predictions/${encodeURIComponent(createdId)}/events`,
+        {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${pubToken}`,
+          },
+          body: JSON.stringify({
+            type: 'resolved',
+            occurredAt: e0.recordedAt,
+            outcome: 'yes',
+            basis: 'IEA Electricity Market Report confirmed cumulative grid storage exceeded 1,800 GW.',
+            note: 'Verified against primary IEA table 4.2.',
+            sourceUrls: ['https://example.org/iea-storage'],
+          }),
+        },
+      );
+      expect(resolveEventRes.status).toBe(201);
+      const resolveEventBody = (await resolveEventRes.json()) as {
+        predictionId: string;
+        event: { seq: string; kind: string; occurredAt: string; recordedAt: string };
+        prediction: { probability: number; demo: boolean };
+        lifecycle: { status: string; resolution?: { outcome: string } };
+      };
+      expect(resolveEventBody.event.seq).toBe('e1');
+      expect(resolveEventBody.event.kind).toBe('resolved');
+      expect(Date.parse(resolveEventBody.event.recordedAt)).toBeGreaterThan(
+        Date.parse(resolveEventBody.event.occurredAt),
+      );
+      expect(resolveEventBody.prediction.probability).toBe(originalProbability);
+      expect(resolveEventBody.lifecycle.status).toBe('resolved');
+      expect(resolveEventBody.lifecycle.resolution?.outcome).toBe('yes');
+
+      // Second terminal event on the same prediction is rejected with 409
+      const secondResolveRes = await fetch(
+        `${baseUrl}/v1/predictions/${encodeURIComponent(createdId)}/events`,
+        {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${pubToken}`,
+          },
+          body: JSON.stringify({
+            type: 'resolved',
+            occurredAt: resolveEventBody.event.recordedAt,
+            outcome: 'no',
+            basis: 'Attempted second resolution.',
+            note: 'Should fail.',
+          }),
+        },
+      );
+      expect(secondResolveRes.status).toBe(409);
+
+      // 8. If dist/index.html is built, verify unified static SPA serving on /, /predictions, /explore
+      if (existsSync(resolve(distDir, 'index.html'))) {
+        for (const spaRoute of ['/', '/predictions', '/explore', '/trends', '/about']) {
+          const spaRes = await fetch(`${baseUrl}${spaRoute}`);
+          expect(spaRes.status).toBe(200);
+          expect(spaRes.headers.get('content-type')).toContain('text/html');
+          const html = await spaRes.text();
+          expect(html).toContain('<div id="root">');
+        }
+      }
+    } finally {
+      await running.close();
+    }
+  });
+
+  it('20. enforces server-authoritative timestamps and predictionId, rejects retroactive or client-controlled publishedAt/recordedAt/predictionId, prevents requestedAt from altering official chronology, omits wildcard CORS by default, and remains fail-closed when ORACLE_PUBLICATION_TOKEN is unset', async () => {
+    // Part A: When ORACLE_PUBLICATION_TOKEN is unset, write routes are unconditionally closed (403)
+    const prevPubToken = process.env.ORACLE_PUBLICATION_TOKEN;
+    const prevCorsOrigin = process.env.ORACLE_CORS_ORIGIN;
+    delete process.env.ORACLE_PUBLICATION_TOKEN;
+    delete process.env.ORACLE_CORS_ORIGIN;
+
+    const closedServer = await startOracleServer({
+      databaseUrl: cluster.appConnectionString,
+      port: 0,
+      host: '127.0.0.1',
+    });
+    const closedBaseUrl = `http://127.0.0.1:${closedServer.port}`;
+
+    try {
+      const closedPubRes = await fetch(`${closedBaseUrl}/v1/publications`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: 'Bearer AnyTokenWhenUnconfigured_1234567890!',
+        },
+        body: JSON.stringify({}),
+      });
+      expect(closedPubRes.status).toBe(403);
+      const closedPubBody = (await closedPubRes.json()) as { error: string };
+      expect(closedPubBody.error).toBe('trusted_server_only');
+      expect(closedPubRes.headers.get('access-control-allow-origin')).toBeNull();
+
+      const closedEventRes = await fetch(
+        `${closedBaseUrl}/v1/predictions/ORC-2026-0001/events`,
+        {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: 'Bearer AnyTokenWhenUnconfigured_1234567890!',
+          },
+          body: JSON.stringify({}),
+        },
+      );
+      expect(closedEventRes.status).toBe(403);
+      const closedEventBody = (await closedEventRes.json()) as { error: string };
+      expect(closedEventBody.error).toBe('trusted_server_only');
+    } finally {
+      await closedServer.close();
+      if (prevPubToken !== undefined) {
+        process.env.ORACLE_PUBLICATION_TOKEN = prevPubToken;
+      }
+      if (prevCorsOrigin !== undefined) {
+        process.env.ORACLE_CORS_ORIGIN = prevCorsOrigin;
+      }
+    }
+
+    // Part B: With ORACLE_PUBLICATION_TOKEN configured, verify strict server-authoritative
+    //         controls on publishedAt, recordedAt, requestedAt, predictionId, and CORS
+    const pubToken = 'OracleTrustedPubToken_2026_ServerAuth_88!';
+    let serverClockTick = 0;
+    const deterministicServerNow = (): string => {
+      serverClockTick += 1;
+      // Authoritative server clock fixed at 2026-11-22T15:00:00.000Z + serverClockTick seconds
+      return new Date(
+        Date.UTC(2026, 10, 22, 15, 0, 0, 0) + serverClockTick * 1000,
+      ).toISOString();
+    };
+
+    const running = await startOracleServer({
+      databaseUrl: cluster.appConnectionString,
+      port: 0,
+      host: '127.0.0.1',
+      publicationToken: pubToken,
+      corsOrigin: '*', // Wildcard must still be refused
+      now: deterministicServerNow,
+    });
+    const baseUrl = `http://127.0.0.1:${running.port}`;
+
+    try {
+      // 1. Even if corsOrigin: '*' is passed, wildcard CORS is never emitted
+      const healthRes = await fetch(`${baseUrl}/v1/health`);
+      expect(healthRes.status).toBe(200);
+      expect(healthRes.headers.get('access-control-allow-origin')).toBeNull();
+
+      const candidateForAuthTest = buildDraftCandidate('server-auth-test-1', {
+        condition: { namespace: 'threshold', id: 'below-14-percent-server-auth' },
+      });
+
+      // 2. Client cannot supply retroactive or custom `publishedAt`
+      const retroactivePubRes = await fetch(`${baseUrl}/v1/publications`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${pubToken}`,
+        },
+        body: JSON.stringify({
+          candidate: candidateForAuthTest,
+          idempotencyKey: 'idem-retro-pub-001',
+          publishedAt: '2020-01-01T00:00:00.000Z',
+        }),
+      });
+      expect(retroactivePubRes.status).toBe(400);
+      expect(
+        ((await retroactivePubRes.json()) as { error: string }).error,
+      ).toBe('server_authoritative_timestamp');
+
+      // 3. Client cannot supply or alter `recordedAt` on publication
+      const customRecordedPubRes = await fetch(`${baseUrl}/v1/publications`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${pubToken}`,
+        },
+        body: JSON.stringify({
+          candidate: candidateForAuthTest,
+          idempotencyKey: 'idem-custom-rec-001',
+          recordedAt: '2020-01-01T00:00:05.000Z',
+        }),
+      });
+      expect(customRecordedPubRes.status).toBe(400);
+      expect(
+        ((await customRecordedPubRes.json()) as { error: string }).error,
+      ).toBe('server_authoritative_timestamp');
+
+      // 4. Client cannot choose an arbitrary official `predictionId` or `id`
+      for (const forbiddenPayload of [
+        {
+          candidate: candidateForAuthTest,
+          idempotencyKey: 'idem-custom-id-001',
+          predictionId: 'ORC-1999-9999',
+        },
+        {
+          candidate: candidateForAuthTest,
+          idempotencyKey: 'idem-custom-id-002',
+          id: 'ORC-1999-8888',
+        },
+        {
+          candidate: { ...candidateForAuthTest, id: 'ORC-1999-7777' },
+          idempotencyKey: 'idem-custom-id-003',
+        },
+      ]) {
+        const customIdRes = await fetch(`${baseUrl}/v1/publications`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${pubToken}`,
+          },
+          body: JSON.stringify(forbiddenPayload),
+        });
+        expect(customIdRes.status).toBe(400);
+        expect(((await customIdRes.json()) as { error: string }).error).toBe(
+          'server_authoritative_identifier',
+        );
+      }
+
+      // 5. Client cannot publish a retroactive prediction whose horizon already expired
+      //    relative to the server clock, even by passing a retroactive `requestedAt`
+      const expiredHorizonCandidate = buildDraftCandidate(
+        'expired-horizon-retro',
+        {
+          condition: { namespace: 'threshold', id: 'expired-horizon-2025-test' },
+          horizon: { namespace: 'period', id: 'calendar-year-2025' },
+          resolutionDate: '2026-01-15T00:00:00.000Z',
+        },
+        {
+          horizon: {
+            startsAt: '2025-01-01T00:00:00.000Z',
+            endsAt: '2025-12-31T23:59:59.000Z',
+            label: 'Calendar Year 2025',
+          },
+          resolutionCriteria: {
+            rule: 'Official INDEC December 2025 release.',
+            authority: 'INDEC',
+            resolveOn: '2026-01-15T00:00:00.000Z',
+            edgeCases: ['First official release applies.'],
+          },
+        },
+      );
+      const expiredHorizonRes = await fetch(`${baseUrl}/v1/publications`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${pubToken}`,
+        },
+        body: JSON.stringify({
+          candidate: expiredHorizonCandidate,
+          idempotencyKey: 'idem-expired-horizon-001',
+          requestedAt: '2025-02-01T00:00:00.000Z',
+        }),
+      });
+      expect(expiredHorizonRes.status).toBe(422);
+      const expiredHorizonBody = (await expiredHorizonRes.json()) as {
+        error: string;
+        abstentionReasons: string[];
+      };
+      expect(expiredHorizonBody.error).toBe('publication_abstained');
+      expect(expiredHorizonBody.abstentionReasons.join(' ')).toMatch(
+        /fixed-horizon/,
+      );
+
+      // 6. Passing an external `requestedAt` on a valid candidate never alters official
+      //    chronology (`publishedAt` / `recordedAt`) and is stored only as separate provenance
+      const validWithExternalReqRes = await fetch(`${baseUrl}/v1/publications`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${pubToken}`,
+        },
+        body: JSON.stringify({
+          candidate: candidateForAuthTest,
+          idempotencyKey: 'idem-server-auth-valid-001',
+          requestedAt: '2020-01-01T00:00:00.000Z',
+        }),
+      });
+      expect(validWithExternalReqRes.status).toBe(201);
+      const validWithExternalReqBody = (await validWithExternalReqRes.json()) as {
+        status: string;
+        outcome: {
+          predictionId: string;
+          record: {
+            id: string;
+            publishedAt: string;
+            events: Array<{ seq: string; occurredAt: string; recordedAt: string }>;
+          };
+        };
+        provenance: {
+          officialPublishedAt: string;
+          officialRecordedAt: string;
+          externalRequestedAt?: string;
+        };
+      };
+      const serverAssignedId = validWithExternalReqBody.outcome.predictionId;
+      expect(serverAssignedId).toMatch(/^ORC-2026-\d{4}$/);
+      expect(serverAssignedId).not.toBe('ORC-1999-9999');
+      expect(validWithExternalReqBody.outcome.record.publishedAt).toBe(
+        '2026-11-22T15:00:03.000Z',
+      );
+      expect(
+        validWithExternalReqBody.outcome.record.events[0]!.occurredAt,
+      ).toBe('2026-11-22T15:00:03.000Z');
+      expect(
+        validWithExternalReqBody.outcome.record.events[0]!.recordedAt,
+      ).toBe('2026-11-22T15:00:04.000Z');
+      expect(validWithExternalReqBody.provenance).toEqual({
+        officialPublishedAt: '2026-11-22T15:00:03.000Z',
+        officialRecordedAt: '2026-11-22T15:00:04.000Z',
+        externalRequestedAt: '2020-01-01T00:00:00.000Z',
+      });
+
+      // 7. Client cannot supply or alter `recordedAt` on terminal event resolution either
+      const customEventRecordedRes = await fetch(
+        `${baseUrl}/v1/predictions/${encodeURIComponent(serverAssignedId)}/events`,
+        {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${pubToken}`,
+          },
+          body: JSON.stringify({
+            type: 'resolved',
+            occurredAt: '2026-11-22T15:00:04.000Z',
+            recordedAt: '2020-01-01T00:00:00.000Z',
+            outcome: 'yes',
+            basis: 'Official INDEC report.',
+          }),
+        },
+      );
+      expect(customEventRecordedRes.status).toBe(400);
+      expect(
+        ((await customEventRecordedRes.json()) as { error: string }).error,
+      ).toBe('server_authoritative_timestamp');
+    } finally {
+      await running.close();
     }
   });
 });

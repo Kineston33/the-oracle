@@ -5,7 +5,7 @@
  * source files or exposed to browser bundles.
  */
 
-import { realpathSync } from 'node:fs';
+import { existsSync, realpathSync } from 'node:fs';
 import type { Server } from 'node:http';
 import { basename, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -13,7 +13,18 @@ import pg from 'pg';
 import { createOracleApiServer } from './api.ts';
 import { PostgresPublicationRegistry } from './postgres-registry.ts';
 
-export { createOracleApiServer, handleOracleApiRequest } from './api.ts';
+export {
+  createOracleApiServer,
+  handleOracleApiRequest,
+  type OracleApiServerDeps,
+} from './api.ts';
+export {
+  DEFAULT_ALIAS_ENTRIES,
+  DEFAULT_ALIAS_TABLE,
+  resolveCanonicalQuestion,
+  type CanonicalQuestionResolution,
+  type ResolveCanonicalQuestionOptions,
+} from '../data/question-resolver.ts';
 export {
   AUDIT_V1_10_PATH,
   MIGRATION_0001_PATH,
@@ -71,6 +82,29 @@ export interface StartOracleServerOptions {
   port?: number;
   /** Host interface to bind. Defaults to `'0.0.0.0'`. */
   host?: string;
+  /**
+   * Optional high-entropy bearer token (`ORACLE_PUBLICATION_TOKEN`) authorizing
+   * trusted server-side calls to `POST /v1/publications` and
+   * `POST /v1/predictions/:id/events`.
+   */
+  publicationToken?: string;
+  /**
+   * Directory containing compiled frontend assets (`dist/`). Defaults to
+   * `resolve(process.cwd(), 'dist')` if `dist/index.html` exists. Pass `null`
+   * to disable static SPA serving.
+   */
+  staticDir?: string | null;
+  /**
+   * Optional explicit CORS origin (defaults to same-origin only; no
+   * `Access-Control-Allow-Origin` header is emitted unless a specific
+   * non-wildcard origin is configured via `corsOrigin` or `ORACLE_CORS_ORIGIN`).
+   */
+  corsOrigin?: string;
+  /**
+   * Optional trusted server-side clock provider returning UTC ISO-8601 timestamps.
+   * Defaults to the monotonic system wall clock on the server.
+   */
+  now?: () => string;
 }
 
 export interface RunningOracleServer {
@@ -257,8 +291,22 @@ export async function startOracleServer(
   try {
     await verifyRuntimeDatabaseRole(pool);
 
+    const defaultDistDir = resolve(process.cwd(), 'dist');
+    const resolvedStaticDir =
+      options?.staticDir !== undefined
+        ? options.staticDir
+        : existsSync(resolve(defaultDistDir, 'index.html'))
+          ? defaultDistDir
+          : null;
+
     const registry = new PostgresPublicationRegistry({ pool });
-    const server = createOracleApiServer({ registry });
+    const server = createOracleApiServer({
+      registry,
+      publicationToken: options?.publicationToken,
+      staticDir: resolvedStaticDir,
+      corsOrigin: options?.corsOrigin,
+      now: options?.now,
+    });
     const host = options?.host ?? process.env.HOST ?? '0.0.0.0';
     const requestedPort = options?.port ?? Number(process.env.PORT ?? 3001);
     if (
