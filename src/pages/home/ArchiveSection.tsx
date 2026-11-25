@@ -49,14 +49,14 @@ export function ArchiveSection() {
     <section className={styles.section} aria-labelledby="archive-title">
       <div className={styles.inner}>
         <SectionHeader
-          index="02"
-          eyebrow="The official archive"
-          title={<span id="archive-title">Published once. Read forever.</span>}
+          index="01"
+          eyebrow="The public ledger"
+          title={<span id="archive-title">Structured once. Auditable over time.</span>}
           description={
             <>
-              Every official prediction is a permanent public record: a canonical
-              question, a probability fixed at publication, the test that will
-              decide it, and the evidence it rested on.
+              The archive is designed so each registered entry forms a permanent
+              public record: a formal proposition, a timestamped publication
+              seal, explicit evaluation conditions, and its supporting context.
             </>
           }
           action={{ to: '/predictions', label: 'Enter the archive' }}
@@ -113,9 +113,9 @@ export function ArchiveSection() {
                   No official predictions have been published yet
                 </p>
                 <p className={styles.emptyLedgerBody}>
-                  The immutable ledger is initialized and ready to seal canonical
-                  records under the Official Publication Protocol. Published
-                  predictions will appear here as soon as they are sealed.
+                  The ledger schema and publication protocol are defined, and no
+                  official predictions have been published to the public archive
+                  yet.
                 </p>
                 <div className={styles.emptyLedgerActions}>
                   <Link to="/predictions" className={styles.ledgerLink}>
@@ -131,27 +131,29 @@ export function ArchiveSection() {
               <span className={styles.integrityIcon}>
                 <LockKeyhole size={16} strokeWidth={1.6} aria-hidden="true" />
               </span>
-              <h3 className={styles.integrityTitle}>Cryptographic verification</h3>
+              <h3 className={styles.integrityTitle}>Record verification design</h3>
               <ul className={styles.integrityList}>
                 <li>
-                  <strong>Sealed payload digest.</strong> Each record&rsquo;s exact
-                  payload hashes to a deterministic SHA-256 digest stored with it.
+                  <strong>Payload digest specification.</strong> The record schema
+                  pairs each serialized payload with a deterministic SHA-256 digest.
                 </li>
                 <li>
-                  <strong>Verifiable locally.</strong> The digest is recomputed in your
-                  browser when you open a record, so any modification is detected.
+                  <strong>Client-side consistency check.</strong> When inspecting a
+                  record, your browser recomputes the digest locally to verify payload
+                  integrity.
                 </li>
                 <li>
-                  <strong>Append-only event chain.</strong> Publication, resolution, and
-                  annulment events are linked by cryptographic hash pointers.
+                  <strong>Event-chain architecture.</strong> Lifecycle events are
+                  structured as hash-linked entries; external third-party anchoring is
+                  planned for future phases.
                 </li>
               </ul>
             </div>
 
             <Callout tone="integrity" title="Integrity is not the same as accuracy">
-              A sealed record proves what was said and when. It does not prove the
-              forecast was right. Resolution status is tracked separately, and losing
-              forecasts stay in the archive.
+              A sealed digest verifies internal payload consistency. It does not
+              generate forecasts or attest real-world outcomes, which remain
+              governed by explicit evaluation rules.
             </Callout>
 
             {hasOfficialResolvedStats ? (

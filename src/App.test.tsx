@@ -115,11 +115,13 @@ describe('homepage question input', () => {
     ).toBeTruthy();
   });
 
-  it('presents a clean institutional homepage without DEMO/Illustrative labels, fake sphere coordinates, demo statistics, or fictional records masquerading as official predictions', () => {
+  it('presents a clean institutional homepage without DEMO/Illustrative labels, fake sphere coordinates, demo statistics, fictional trends, or fictional records masquerading as official predictions', () => {
     renderApp('/');
 
     const main = screen.getByRole('main');
     const mainText = main.textContent ?? '';
+    const footer = screen.getByRole('contentinfo');
+    const footerText = footer.textContent ?? '';
 
     // No DEMO / Illustrative / Demonstration / Fabricated labels on the public homepage
     expect(mainText).not.toMatch(/\b(demo|demonstration|illustrative|fabricated)\b/i);
@@ -130,6 +132,18 @@ describe('homepage question input', () => {
     // No statistics panel or fictional ORC-2025 demo records shown as official predictions when no official predictions exist
     expect(within(main).queryByLabelText(/archive summary/i)).toBeNull();
     expect(within(main).queryAllByText(/^ORC-\d{4}-\d{4}$/)).toHaveLength(0);
+    // Fictional TrendsSection is hidden on the homepage until verifiable signals exist
+    expect(within(main).queryByText(/fastest moving signal/i)).toBeNull();
+    expect(within(main).queryByText(/index pts \/ 90d/i)).toBeNull();
+    // PrincipleSection states architectural/protocol specifications rather than claiming full operational status
+    expect(within(main).getAllByText(/protocol specification/i).length).toBeGreaterThan(0);
+    expect(within(main).getByText(/ledger specification/i)).toBeInTheDocument();
+    expect(within(main).getByText(/local digest · anchoring planned/i)).toBeInTheDocument();
+    expect(within(main).getAllByText(/architectural objective/i).length).toBeGreaterThan(0);
+    // Footer does not overclaim autonomous forecasting intelligence
+    expect(footerText).not.toMatch(/public forecasting intelligence/i);
+    expect(footerText).not.toMatch(/transparent resolution criteria/i);
+    expect(footerText).toMatch(/platform in active development/i);
     // Suggested explorations remain available as question proposals
     expect(within(main).getByText(/suggested explorations/i)).toBeInTheDocument();
   });

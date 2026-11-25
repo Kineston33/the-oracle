@@ -40,7 +40,8 @@ export function Footer() {
           <p className={styles.brand}>THE ORACLE</p>
           <p className={styles.tagline}>See what&apos;s coming.</p>
           <p className={styles.statement}>
-            One question. One official prediction. The same answer for everyone.
+            A structured architecture for verifiable future questions and
+            auditable public records.
           </p>
           <Link to="/explore" className={styles.cta}>
             Ask a question
@@ -68,12 +69,12 @@ export function Footer() {
 
       <div className={styles.bottom}>
         <p className={styles.fine}>
-          © {year} THE ORACLE. Public forecasting intelligence and verifiable
-          prediction ledger.
+          © {year} THE ORACLE. Architecture and protocol for structured future
+          questions and verifiable public records.
         </p>
         <p className={styles.fine}>
-          Structured propositions, cryptographic payload sealing, and transparent
-          resolution criteria.
+          Platform in active development — designed for proposition formalization
+          and cryptographic payload verification.
         </p>
       </div>
     </footer>

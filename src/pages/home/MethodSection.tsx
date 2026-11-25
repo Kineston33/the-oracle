@@ -6,22 +6,22 @@ const STEPS = [
   {
     step: '01',
     title: 'Canonicalize',
-    body: 'A question is reduced to one unambiguous phrasing with a fixed threshold, a named deciding authority, and a resolution date. Equivalent phrasings point to the same record.',
+    body: 'A question is structured into one unambiguous proposition with a defined threshold, a named reference source, and a target horizon.',
   },
   {
     step: '02',
     title: 'Seal',
-    body: 'The record is published with its probability, evidence bundle and resolution rule, then hashed. From that moment the figure is historical fact, not a live opinion.',
+    body: 'Under the protocol specification, the proposition, supporting context, and evaluation criteria are serialized and paired with a SHA-256 digest.',
   },
   {
     step: '03',
     title: 'Observe',
-    body: 'The horizon runs. Evidence continues to accumulate in public, but it cannot alter the sealed record. Updates become new records with their own identifiers.',
+    body: 'While the horizon remains open, the registered payload is designed to stay immutable. Any subsequent revision must be recorded as a separate linked entry.',
   },
   {
     step: '04',
-    title: 'Resolve',
-    body: 'On the resolution date the stated rule is applied mechanically. The outcome is recorded against the original probability, and the miss stays in the archive.',
+    title: 'Evaluate',
+    body: 'When the horizon closes, the pre-registered criteria define how the outcome is documented alongside the original entry for public audit.',
   },
 ];
 
@@ -31,13 +31,14 @@ export function MethodSection() {
       <div className={styles.inner}>
         <div className={styles.layout}>
           <div className={styles.head}>
-            <p className="eyebrow eyebrow--violet">The contract</p>
+            <p className="eyebrow eyebrow--violet">Protocol methodology</p>
             <h2 id="method-title" className={`display ${styles.title}`}>
-              Four steps, and none of them can be skipped.
+              Four stages of a verifiable record.
             </h2>
             <p className={styles.lede}>
-              Most forecasting products are judged on whether they were interesting.
-              THE ORACLE is designed to be judged on whether it was falsifiable.
+              THE ORACLE is architected around a four-stage lifecycle designed to
+              make future-oriented propositions structured, auditable, and
+              falsifiable.
             </p>
             <Link to="/about" className={styles.link}>
               Read the full methodology
@@ -60,9 +61,9 @@ export function MethodSection() {
 
         <div className={styles.closing}>
           <div className={styles.closingGlow} aria-hidden="true" />
-          <p className={styles.closingEyebrow}>One question. One official prediction.</p>
+          <p className={styles.closingEyebrow}>Architectural objective</p>
           <h2 className={`display ${styles.closingTitle}`}>
-            The same answer <em>for everyone.</em>
+            One structured record <em>for every reader.</em>
           </h2>
           <div className={styles.closingActions}>
             <Link to="/explore" className={styles.primaryCta}>

@@ -40,7 +40,7 @@ export function Hero() {
         <header className={styles.lead}>
           <p className={styles.eyebrow}>
             <span className={styles.eyebrowDot} aria-hidden="true" />
-            <span>Public forecasting intelligence</span>
+            <span>Structured foresight architecture</span>
             <span className={styles.eyebrowRule} aria-hidden="true" />
             <span className={styles.eyebrowMeta}>EST. 2026</span>
           </p>
