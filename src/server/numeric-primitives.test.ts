@@ -10,6 +10,7 @@ import {
   LN_ROUND_TO_ZERO_THRESHOLD_BINARY64,
   LN_SATURATED_TO_ONE_THRESHOLD_BINARY64,
   LN_SWITCH_LOG1MEXP,
+  MAX_CERTIFIED_ERFCX_DIFF_ARG,
   NumericConvergenceError,
   classifyBinary64Probability,
   computeStudentT4InverseIntermediates,
@@ -45,6 +46,11 @@ import {
   ulpBinary64,
   ulpDistanceBinary64,
   validateComplementaryLogPair,
+  validateDualChannelProbability,
+  validateExhaustiveDistribution,
+  validateForecastDistributionContract,
+  validateOutcomeSpaceDescriptor,
+  validateParametricIntervalField,
 } from './numeric-primitives.ts';
 
 function expectRelativeErrorWithin(actual: number, expected: number, maxRelError: number): void {
@@ -437,6 +443,35 @@ describe('Stage 2A-1 — Numeric Primitives & Forecast Contracts (v4.4.3)', () =
         5.6410496919549989106e-11,
         1e-13,
       );
+
+      // Exact upper domain boundary MAX_CERTIFIED_ERFCX_DIFF_ARG = 1e150:
+      // Verifies logarithmic Peano-Markov remainder evaluation without uLeft**18 or actualH**17
+      // overflow/underflow or Infinity * 0 = NaN, achieving relative error <= 1e-13:
+      const upperA = MAX_CERTIFIED_ERFCX_DIFF_ARG * (1 - 1e-6);
+      const upperB = MAX_CERTIFIED_ERFCX_DIFF_ARG;
+      const upperVal = erfcxDiffPositive(upperA, upperB);
+      expect(Number.isNaN(upperVal)).toBe(false);
+      expect(Number.isFinite(upperVal)).toBe(true);
+      expectRelativeErrorWithin(upperVal, 5.6419014770520466e-157, 1e-13);
+
+      // Infinite upper bound at the exact upper limit a = MAX_CERTIFIED_ERFCX_DIFF_ARG
+      expect(
+        erfcxDiffPositive(MAX_CERTIFIED_ERFCX_DIFF_ARG, Number.POSITIVE_INFINITY),
+      ).toBe(erfcx(MAX_CERTIFIED_ERFCX_DIFF_ARG));
+
+      // First representable binary64 float strictly above MAX_CERTIFIED_ERFCX_DIFF_ARG is rejected:
+      const firstRejectedAboveMax =
+        MAX_CERTIFIED_ERFCX_DIFF_ARG + ulpBinary64(MAX_CERTIFIED_ERFCX_DIFF_ARG);
+      expect(firstRejectedAboveMax).toBeGreaterThan(MAX_CERTIFIED_ERFCX_DIFF_ARG);
+      expect(() =>
+        erfcxDiffPositive(MAX_CERTIFIED_ERFCX_DIFF_ARG, firstRejectedAboveMax),
+      ).toThrow(RangeError);
+      expect(() =>
+        erfcxDiffPositive(firstRejectedAboveMax, firstRejectedAboveMax),
+      ).toThrow(RangeError);
+      expect(() =>
+        erfcxDiffPositive(firstRejectedAboveMax, Number.POSITIVE_INFINITY),
+      ).toThrow(RangeError);
 
       // Also verify against the decimal-ideal references of v4.4.3 within the exact binary64 input-rounding bound
       expectRelativeErrorWithin(
@@ -869,6 +904,395 @@ describe('Stage 2A-1 — Numeric Primitives & Forecast Contracts (v4.4.3)', () =
       expect(entropyDecomp.normalizedDisagreementIndex).toBeGreaterThan(0);
       expect(entropyDecomp.normalizedDisagreementIndex).toBeLessThanOrEqual(1);
       expect(entropyDecomp.closureResidualNats).toBeLessThanOrEqual(1e-15);
+
+      // Also works identically when ensembleDistribution is omitted (computed from mixture)
+      const autoDecomp = decomposeEnsembleEntropy([dist1, dist2], weights);
+      expect(autoDecomp.totalPredictiveEntropyNats).toBeCloseTo(
+        entropyDecomp.totalPredictiveEntropyNats,
+        15,
+      );
+      expect(autoDecomp.jensenShannonDivergenceNats).toBeCloseTo(
+        entropyDecomp.jensenShannonDivergenceNats,
+        15,
+      );
+      expect(autoDecomp.closureResidualNats).toBeLessThanOrEqual(1e-15);
+    });
+
+    it('normalizes weights once up front in decomposeCategoryUncertainty and rejects negative, non-unit-sum, or invalid inputs', () => {
+      const m1 = createDualChannelProbability(0.2);
+      const m2 = createDualChannelProbability(0.8);
+      const m3 = createDualChannelProbability(0.5);
+      const validInterval = {
+        kind: 'omitted' as const,
+        reason: 'method-produces-point-estimate-only' as const,
+        explanation: 'Point-estimate ensemble test',
+      };
+
+      // Weights within 1e-12 of 1 (e.g., 1/3 + 1/3 + 1/3 + 5e-13) are normalized once up front
+      // so both logarithmic channels and variance components use identical normalized weights:
+      const slightDriftWeights = [1 / 3, 1 / 3, 1 / 3 + 5e-13];
+      const decomp = decomposeCategoryUncertainty(
+        0,
+        'outcome-yes',
+        [
+          {
+            methodId: 'beta-binomial-conjugate',
+            weight: slightDriftWeights[0]!,
+            predictiveProbability: m1,
+            parametricVariance: 0.01,
+          },
+          {
+            methodId: 'poisson-gamma-hazard',
+            weight: slightDriftWeights[1]!,
+            predictiveProbability: m2,
+            parametricVariance: 0.01,
+          },
+          {
+            methodId: 'structural-uniform-baseline',
+            weight: slightDriftWeights[2]!,
+            predictiveProbability: m3,
+            parametricVariance: 0.01,
+          },
+        ],
+        validInterval,
+      );
+      expect(decomp.closureResidual).toBeLessThanOrEqual(1e-15);
+
+      // Reject negative weights, weights > 1, and weights not summing to 1
+      expect(() =>
+        decomposeCategoryUncertainty(
+          0,
+          'outcome-yes',
+          [
+            {
+              methodId: 'beta-binomial-conjugate',
+              weight: -0.2,
+              predictiveProbability: m1,
+              parametricVariance: 0,
+            },
+            {
+              methodId: 'poisson-gamma-hazard',
+              weight: 1.2,
+              predictiveProbability: m2,
+              parametricVariance: 0,
+            },
+          ],
+          validInterval,
+        ),
+      ).toThrow(RangeError);
+
+      expect(() =>
+        decomposeCategoryUncertainty(
+          0,
+          'outcome-yes',
+          [
+            {
+              methodId: 'beta-binomial-conjugate',
+              weight: 0.4,
+              predictiveProbability: m1,
+              parametricVariance: 0,
+            },
+            {
+              methodId: 'poisson-gamma-hazard',
+              weight: 0.4,
+              predictiveProbability: m2,
+              parametricVariance: 0,
+            },
+          ],
+          validInterval,
+        ),
+      ).toThrow(RangeError);
+
+      expect(() =>
+        decomposeCategoryUncertainty(
+          0,
+          'outcome-yes',
+          [
+            {
+              methodId: 'beta-binomial-conjugate',
+              weight: Number.NaN,
+              predictiveProbability: m1,
+              parametricVariance: 0,
+            },
+          ],
+          validInterval,
+        ),
+      ).toThrow(RangeError);
+    });
+
+    it('rejects negative weights, non-unit-sum weights, invalid distributions, and incompatible mixtures in decomposeEnsembleEntropy', () => {
+      const dist1 = [
+        createDualChannelProbability(0.7),
+        createDualChannelProbability(0.2),
+        createDualChannelProbability(0.1),
+      ];
+      const dist2 = [
+        createDualChannelProbability(0.2),
+        createDualChannelProbability(0.5),
+        createDualChannelProbability(0.3),
+      ];
+      const validEnsemble = [
+        createDualChannelProbability(0.6 * 0.7 + 0.4 * 0.2),
+        createDualChannelProbability(0.6 * 0.2 + 0.4 * 0.5),
+        createDualChannelProbability(0.6 * 0.1 + 0.4 * 0.3),
+      ];
+
+      // 1. Negative weight or weight > 1
+      expect(() =>
+        decomposeEnsembleEntropy([dist1, dist2], [-0.1, 1.1], validEnsemble),
+      ).toThrow(RangeError);
+      expect(() =>
+        decomposeEnsembleEntropy([dist1, dist2], [1.5, -0.5], validEnsemble),
+      ).toThrow(RangeError);
+
+      // 2. Weights that do not sum to 1
+      expect(() =>
+        decomposeEnsembleEntropy([dist1, dist2], [0.3, 0.3], validEnsemble),
+      ).toThrow(RangeError);
+      expect(() =>
+        decomposeEnsembleEntropy([dist1, dist2], [0.6, 0.4 + 1e-6], validEnsemble),
+      ).toThrow(RangeError);
+
+      // 3. Incompatible ensembleDistribution (not matching weighted mixture of methodDistributions)
+      const incompatibleEnsemble = [
+        createDualChannelProbability(0.5),
+        createDualChannelProbability(0.3),
+        createDualChannelProbability(0.2),
+      ];
+      expect(() =>
+        decomposeEnsembleEntropy([dist1, dist2], [0.6, 0.4], incompatibleEnsemble),
+      ).toThrow(RangeError);
+
+      // 4. Unnormalized method distribution (categories do not sum to 1)
+      const unnormalizedDist = [
+        createDualChannelProbability(0.5),
+        createDualChannelProbability(0.2),
+        createDualChannelProbability(0.1),
+      ];
+      expect(() =>
+        decomposeEnsembleEntropy([unnormalizedDist, dist2], [0.6, 0.4]),
+      ).toThrow(RangeError);
+
+      // 5. Mismatched category counts between methods
+      const binaryDist = [
+        createDualChannelProbability(0.6),
+        createDualChannelProbability(0.4),
+      ];
+      expect(() =>
+        decomposeEnsembleEntropy([dist1, binaryDist], [0.6, 0.4]),
+      ).toThrow(RangeError);
+    });
+
+    it('enforces runtime contract validation for OutcomeSpaceDescriptor, DualChannelProbability, ExhaustiveDistribution, ParametricIntervalField, and ForecastDistributionOutput', () => {
+      // 1. validateOutcomeSpaceDescriptor
+      const validBinarySpace = validateOutcomeSpaceDescriptor({
+        kind: 'binary',
+        outcomeLabels: ['Yes', 'No'],
+        horizonStartsAt: '2026-01-01T00:00:00Z',
+        horizonEndsAt: '2026-12-31T23:59:59Z',
+        eventDefinitionHash: 'sha256:735acb14oracle2a1',
+      });
+      expect(validBinarySpace.outcomeLabels).toHaveLength(2);
+
+      const validPartitionSpace = validateOutcomeSpaceDescriptor({
+        kind: 'discretized-continuous-partition',
+        outcomeLabels: ['(-inf, 2.0)', '[2.0, 4.0)', '[4.0, +inf)'],
+        horizonStartsAt: '2026-01-01T00:00:00Z',
+        horizonEndsAt: '2026-12-31T23:59:59Z',
+        eventDefinitionHash: 'sha256:cpi-bins-2026',
+        partitionThresholds: [2.0, 4.0],
+      });
+      expect(validPartitionSpace.outcomeLabels).toHaveLength(3);
+
+      // Reject invalid outcome spaces (wrong binary count, duplicate labels, non-monotonic partitionThresholds, inverted horizon)
+      expect(() =>
+        validateOutcomeSpaceDescriptor({
+          kind: 'binary',
+          outcomeLabels: ['A', 'B', 'C'],
+          horizonStartsAt: '2026-01-01T00:00:00Z',
+          horizonEndsAt: '2026-12-31T23:59:59Z',
+          eventDefinitionHash: 'sha256:bad-binary',
+        }),
+      ).toThrow(RangeError);
+
+      expect(() =>
+        validateOutcomeSpaceDescriptor({
+          kind: 'categorical-exhaustive',
+          outcomeLabels: ['Same', 'Same'],
+          horizonStartsAt: '2026-01-01T00:00:00Z',
+          horizonEndsAt: '2026-12-31T23:59:59Z',
+          eventDefinitionHash: 'sha256:dup-labels',
+        }),
+      ).toThrow(RangeError);
+
+      expect(() =>
+        validateOutcomeSpaceDescriptor({
+          kind: 'discretized-continuous-partition',
+          outcomeLabels: ['Low', 'Mid', 'High'],
+          horizonStartsAt: '2026-01-01T00:00:00Z',
+          horizonEndsAt: '2026-12-31T23:59:59Z',
+          eventDefinitionHash: 'sha256:bad-thresholds',
+          partitionThresholds: [5.0, 2.0], // non-increasing
+        }),
+      ).toThrow(RangeError);
+
+      expect(() =>
+        validateOutcomeSpaceDescriptor({
+          kind: 'binary',
+          outcomeLabels: ['Yes', 'No'],
+          horizonStartsAt: '2026-12-31T23:59:59Z',
+          horizonEndsAt: '2026-01-01T00:00:00Z', // inverted horizon
+          eventDefinitionHash: 'sha256:bad-horizon',
+        }),
+      ).toThrow(RangeError);
+
+      // 2. validateDualChannelProbability & validateExhaustiveDistribution
+      const pYes = createDualChannelProbability(0.65);
+      const pNo = createDualChannelProbability(0.35);
+      expect(validateDualChannelProbability(pYes)).toEqual(pYes);
+      expect(validateExhaustiveDistribution([pYes, pNo], 2)).toHaveLength(2);
+
+      // Tampered status or incoherent linear/log channels must be rejected
+      expect(() =>
+        validateDualChannelProbability({
+          ...pYes,
+          status: 'saturated-to-one',
+        }),
+      ).toThrow(RangeError);
+
+      expect(() =>
+        validateDualChannelProbability({
+          ...pYes,
+          probability: 0.9,
+        }),
+      ).toThrow(RangeError);
+
+      expect(() => validateExhaustiveDistribution([pYes, pYes], 2)).toThrow(RangeError);
+
+      // 3. validateParametricIntervalField coherence with DualChannelProbability status
+      const pExactZero = createDualChannelProbability(0);
+      expect(() =>
+        validateParametricIntervalField(
+          {
+            kind: 'available',
+            interval: {
+              level: 0.9,
+              lower: 0,
+              upper: 0.1,
+              median: 0.02,
+              parameterName: 'theta',
+              interpretation: 'epistemic-parameter-uncertainty-not-outcome-frequency',
+            },
+          },
+          pExactZero,
+        ),
+      ).toThrow(RangeError);
+
+      // Zero-width available interval on interior-normal probability is rejected (must use kind: 'omitted')
+      expect(() =>
+        validateParametricIntervalField(
+          {
+            kind: 'available',
+            interval: {
+              level: 0.9,
+              lower: 0.65,
+              upper: 0.65,
+              median: 0.65,
+              parameterName: 'theta',
+              interpretation: 'epistemic-parameter-uncertainty-not-outcome-frequency',
+            },
+          },
+          pYes,
+        ),
+      ).toThrow(RangeError);
+
+      expect(
+        validateParametricIntervalField(
+          {
+            kind: 'omitted',
+            reason: 'point-mass-structural-baseline',
+            explanation: 'Uniform structural baseline has no concentration parameter',
+          },
+          pYes,
+        ).kind,
+      ).toBe('omitted');
+
+      // 4. validateForecastDistributionContract end-to-end
+      const decompYes = decomposeCategoryUncertainty(
+        0,
+        'Yes',
+        [
+          {
+            methodId: 'beta-binomial-conjugate',
+            weight: 1,
+            predictiveProbability: pYes,
+            parametricVariance: 0.01,
+          },
+        ],
+        {
+          kind: 'available',
+          interval: {
+            level: 0.9,
+            lower: 0.5,
+            upper: 0.8,
+            median: 0.65,
+            parameterName: 'p_yes',
+            interpretation: 'epistemic-parameter-uncertainty-not-outcome-frequency',
+          },
+        },
+      );
+      const decompNo = decomposeCategoryUncertainty(
+        1,
+        'No',
+        [
+          {
+            methodId: 'beta-binomial-conjugate',
+            weight: 1,
+            predictiveProbability: pNo,
+            parametricVariance: 0.01,
+          },
+        ],
+        {
+          kind: 'available',
+          interval: {
+            level: 0.9,
+            lower: 0.2,
+            upper: 0.5,
+            median: 0.35,
+            parameterName: 'p_no',
+            interpretation: 'epistemic-parameter-uncertainty-not-outcome-frequency',
+          },
+        },
+      );
+      const entropyDecomp = decomposeEnsembleEntropy([[pYes, pNo]], [1]);
+
+      const validForecastContract = validateForecastDistributionContract({
+        questionCategory: 'geopolitics',
+        outcomeSpace: validBinarySpace,
+        footingTier: 'methodologically-sound-moderate-evidence',
+        calibrationStatus: 'unverified-no-out-of-sample-evaluation',
+        outcomes: [pYes, pNo],
+        contrastReport: {
+          executedMethodIds: ['beta-binomial-conjugate'],
+          discardedMethods: [],
+          weightsByMethod: { 'beta-binomial-conjugate': 1 },
+          effectiveIndependentMethodCount: 1,
+          entropyDecomposition: entropyDecomp,
+          categoryDecompositions: [decompYes, decompNo],
+        },
+        epistemologicalClaims: [],
+        methodologicalLimitations: [],
+      });
+      expect(validForecastContract.outcomes).toHaveLength(2);
+
+      // Reject forecast contract that falsely claims empirical calibration without out-of-sample verification
+      expect(() =>
+        validateForecastDistributionContract({
+          ...validForecastContract,
+          footingTier: 'empirically-calibrated-high-evidence',
+          calibrationStatus: 'unverified-no-out-of-sample-evaluation',
+        }),
+      ).toThrow(RangeError);
     });
   });
 });

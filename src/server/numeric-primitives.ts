@@ -8,16 +8,28 @@
  * Zero external npm dependencies; runs natively on Node.js / V8 IEEE 754 `binary64`.
  */
 
-import type {
-  Binary64ProbabilityStatus,
-  CategoryUncertaintyDecomposition,
-  ComplementaryLogCoherenceResult,
-  DualChannelProbability,
-  EntropyDecomposition,
-  MethodCategoryContribution,
-  NumericEvaluationOptions,
-  ParametricIntervalField,
+import {
+  assertCalibrationHonesty,
+  validateOutcomeSpaceDescriptor,
+  validateParametricIntervalField,
+  type Binary64ProbabilityStatus,
+  type CalibrationVerificationStatus,
+  type CategoryUncertaintyDecomposition,
+  type ComplementaryLogCoherenceResult,
+  type DualChannelProbability,
+  type EntropyDecomposition,
+  type EvidentialFootingTier,
+  type ForecastDistributionOutput,
+  type MethodCategoryContribution,
+  type NumericEvaluationOptions,
+  type ParametricIntervalField,
 } from './forecast-types.ts';
+
+export {
+  assertCalibrationHonesty,
+  validateOutcomeSpaceDescriptor,
+  validateParametricIntervalField,
+};
 
 /* -------------------------------------------------------------------------
    1. IEEE 754 `binary64` Constants & Error Classes
@@ -766,6 +778,9 @@ const GL8_POSITIVE_WEIGHTS = [
 const PEANO_CONSTANT_GL8 = 1.6973620789167867e-23;
 const ERFCX_DERIV17_AT_ZERO = 2.981642466727535e9;
 const ERFCX_DERIV17_ASYMPTOTIC_PREFACTOR = 2.006810485081986e14;
+const LN_PEANO_CONSTANT_GL8 = Math.log(PEANO_CONSTANT_GL8);
+const LN_ERFCX_DERIV17_AT_ZERO = Math.log(ERFCX_DERIV17_AT_ZERO);
+const LN_ERFCX_DERIV17_ASYMPTOTIC_PREFACTOR = Math.log(ERFCX_DERIV17_ASYMPTOTIC_PREFACTOR);
 
 function integrateGL8SingleInterval(
   uLeft: number,
@@ -786,31 +801,65 @@ function integrateGL8SingleInterval(
   return halfH * subSum;
 }
 
-function computeLocalPeanoRemainderBound(uLeft: number, actualH: number): number {
-  const deriv17Bound =
+/**
+ * Computes `ln(B_{GL,8}(uLeft, uRight))` in logarithmic space to avoid direct
+ * `actualH ** 17` or `uLeft ** 18` overflow/underflow in `binary64` [ANC].
+ */
+function computeLogPeanoRemainderBound(uLeft: number, actualH: number): number {
+  if (!(actualH > 0) || !Number.isFinite(actualH) || !Number.isFinite(uLeft) || uLeft < 0) {
+    return Number.NaN;
+  }
+  const logDeriv17Bound =
     uLeft <= 1.25
-      ? ERFCX_DERIV17_AT_ZERO
+      ? LN_ERFCX_DERIV17_AT_ZERO
       : Math.min(
-          ERFCX_DERIV17_AT_ZERO,
-          ERFCX_DERIV17_ASYMPTOTIC_PREFACTOR / uLeft ** 18,
+          LN_ERFCX_DERIV17_AT_ZERO,
+          LN_ERFCX_DERIV17_ASYMPTOTIC_PREFACTOR - 18 * Math.log(uLeft),
         );
-  return PEANO_CONSTANT_GL8 * actualH ** 17 * deriv17Bound;
+  const logBound = LN_PEANO_CONSTANT_GL8 + 17 * Math.log(actualH) + logDeriv17Bound;
+  if (Number.isNaN(logBound) || logBound === Number.POSITIVE_INFINITY) {
+    return Number.NaN;
+  }
+  return logBound;
+}
+
+function computeRelativePeanoRemainderBound(
+  uLeft: number,
+  actualH: number,
+  subIntegral: number,
+): number {
+  if (!(subIntegral > 0) || !Number.isFinite(subIntegral)) {
+    return Number.NaN;
+  }
+  const logBound = computeLogPeanoRemainderBound(uLeft, actualH);
+  if (Number.isNaN(logBound)) {
+    return Number.NaN;
+  }
+  const rel = Math.exp(logBound - Math.log(subIntegral));
+  if (Number.isNaN(rel) || !Number.isFinite(rel)) {
+    return Number.NaN;
+  }
+  return rel;
 }
 
 /**
- * Evaluates `erfcx(a) - erfcx(b) >= 0` for `0 <= a <= b <= +Infinity` without
+ * Evaluates `erfcx(a) - erfcx(b) >= 0` for `0 <= a <= b <= MAX_CERTIFIED_ERFCX_DIFF_ARG`
+ * (or `b === +Infinity` with `0 <= a <= MAX_CERTIFIED_ERFCX_DIFF_ARG`) without
  * catastrophic cancellation when `a` and `b` are close [IME / ANC].
  *
- * Error bounds:
- *   1. Branch 1 (`erfcx(b) <= 0.75 * erfcx(a)`): direct subtraction has amplification
- *      `(1 + r) / (1 - r) <= 7`, giving relative error `<= 3.52e-14 < 1e-13`.
- *   2. Branch 2 (`erfcx(b) > 0.75 * erfcx(a)`): subdivides `[a, b]` into initial
- *      subintervals of step `h_m <= 0.05 * max(1, a)` (`h_m <= 0.075` on `[0, 1.5]`),
- *      and applies adaptive 8-point Gauss-Legendre quadrature (verifying both the
- *      two-half refinement indicator `|I_half - I_coarse|` and the local Peano-Markov
- *      remainder bound `B_{GL,8}` on each subinterval) within a strict subdivision
- *      budget. Throws `NumericConvergenceError` if convergence is not reached.
- *      Global relative tolerance `<= 1e-13` is certified on `0 <= a <= b <= 1e150`.
+ * Domain & Error Guarantees:
+ *   - Enforces `0 <= a <= MAX_CERTIFIED_ERFCX_DIFF_ARG` (`1e150`) and
+ *     `a <= b <= MAX_CERTIFIED_ERFCX_DIFF_ARG` (or `b === +Infinity`), throwing
+ *     `RangeError` outside this certified domain.
+ *   - Branch 1 (`erfcx(b) <= 0.75 * erfcx(a)`): direct subtraction has amplification
+ *     `(1 + r) / (1 - r) <= 7`, giving relative error `<= 3.52e-14 < 1e-13`.
+ *   - Branch 2 (`erfcx(b) > 0.75 * erfcx(a)`): subdivides `[a, b]` into initial
+ *     subintervals of step `h_m <= 0.05 * max(1, a)` (`h_m <= 0.075` on `[0, 1.5]`),
+ *     and applies adaptive 8-point Gauss-Legendre quadrature, verifying both the
+ *     two-half refinement indicator `|I_fine - I_coarse| / I_fine <= 1e-14` and the
+ *     logarithmically evaluated relative Peano-Markov remainder bound `<= 1e-14` on
+ *     each subinterval. Never accepts a subinterval whose integral or local bound is
+ *     `NaN` or infinite; throws `NumericConvergenceError` on non-convergence.
  */
 export function erfcxDiffPositive(
   a: number,
@@ -825,6 +874,14 @@ export function erfcxDiffPositive(
   if (a < 0 || b < a) {
     throw new RangeError(
       `erfcxDiffPositive requires 0 <= a <= b, received a = ${a}, b = ${b}`,
+    );
+  }
+  if (
+    a > MAX_CERTIFIED_ERFCX_DIFF_ARG ||
+    (b !== Number.POSITIVE_INFINITY && b > MAX_CERTIFIED_ERFCX_DIFF_ARG)
+  ) {
+    throw new RangeError(
+      `erfcxDiffPositive requires finite arguments <= MAX_CERTIFIED_ERFCX_DIFF_ARG (${MAX_CERTIFIED_ERFCX_DIFF_ARG}), received (${a}, ${b})`,
     );
   }
   if (a === b) {
@@ -857,27 +914,58 @@ export function erfcxDiffPositive(
   for (let m = initialSubintervals - 1; m >= 0; m--) {
     const uLeft = a + m * h;
     const uRight = m === initialSubintervals - 1 ? b : a + (m + 1) * h;
+    const coarse = integrateGL8SingleInterval(uLeft, uRight, options);
+    if (!Number.isFinite(coarse) || Number.isNaN(coarse) || coarse <= 0) {
+      throw new NumericConvergenceError(
+        'erfcxDiffPositive[AdaptiveGL8]',
+        m + 1,
+        Number.NaN,
+        1e-14,
+        `non-finite or non-positive initial quadrature on [${uLeft}, ${uRight}]`,
+      );
+    }
     stack.push({
       left: uLeft,
       right: uRight,
-      coarse: integrateGL8SingleInterval(uLeft, uRight, options),
+      coarse,
     });
   }
 
   let totalIntegral = 0;
   let compensation = 0;
-  let totalPeanoRemainderBound = 0;
+  let maxObservedRelPeano = 0;
   let evaluationsUsed = initialSubintervals;
 
   while (stack.length > 0) {
     const current = stack.pop()!;
     const actualH = current.right - current.left;
     const mid = 0.5 * (current.left + current.right);
-    const peanoBound = computeLocalPeanoRemainderBound(current.left, actualH);
+    const coarseRelPeano = computeRelativePeanoRemainderBound(
+      current.left,
+      actualH,
+      current.coarse,
+    );
+    if (!Number.isFinite(coarseRelPeano) || Number.isNaN(coarseRelPeano)) {
+      throw new NumericConvergenceError(
+        'erfcxDiffPositive[AdaptiveGL8]',
+        evaluationsUsed,
+        Number.NaN,
+        1e-14,
+        `local Peano remainder bound is NaN or infinite on [${current.left}, ${current.right}]`,
+      );
+    }
 
-    // Check if midpoint cannot split further in binary64 or if both Peano bound and
-    // two-half adaptive quadrature indicator are within 1e-14 relative tolerance
+    // If midpoint cannot split further in binary64, require coarseRelPeano <= 1e-14
     if (mid <= current.left || mid >= current.right) {
+      if (coarseRelPeano > 1e-14) {
+        throw new NumericConvergenceError(
+          'erfcxDiffPositive[AdaptiveGL8]',
+          evaluationsUsed,
+          coarseRelPeano,
+          1e-14,
+          'subinterval reached binary64 resolution limit before satisfying Peano bound',
+        );
+      }
       const next = totalIntegral + current.coarse;
       if (Math.abs(totalIntegral) >= Math.abs(current.coarse)) {
         compensation += totalIntegral - next + current.coarse;
@@ -885,7 +973,7 @@ export function erfcxDiffPositive(
         compensation += current.coarse - next + totalIntegral;
       }
       totalIntegral = next;
-      totalPeanoRemainderBound += peanoBound;
+      maxObservedRelPeano = Math.max(maxObservedRelPeano, coarseRelPeano);
       continue;
     }
 
@@ -893,7 +981,7 @@ export function erfcxDiffPositive(
       throw new NumericConvergenceError(
         'erfcxDiffPositive[AdaptiveGL8]',
         maxSubdivisionBudget,
-        peanoBound / Math.max(1e-300, current.coarse),
+        coarseRelPeano,
         1e-14,
         'adaptive quadrature subdivision budget exhausted',
       );
@@ -904,15 +992,50 @@ export function erfcxDiffPositive(
     evaluationsUsed += 2;
 
     const fineIntegral = leftIntegral + rightIntegral;
-    const indicatorDiff = Math.abs(fineIntegral - current.coarse);
-    const finePeano =
-      computeLocalPeanoRemainderBound(current.left, mid - current.left) +
-      computeLocalPeanoRemainderBound(mid, current.right - mid);
+    if (
+      !Number.isFinite(leftIntegral) ||
+      !Number.isFinite(rightIntegral) ||
+      !Number.isFinite(fineIntegral) ||
+      fineIntegral <= 0
+    ) {
+      throw new NumericConvergenceError(
+        'erfcxDiffPositive[AdaptiveGL8]',
+        evaluationsUsed,
+        Number.NaN,
+        1e-14,
+        `non-finite refined quadrature on [${current.left}, ${current.right}]`,
+      );
+    }
+
+    const indicatorRelDiff = Math.abs(fineIntegral - current.coarse) / fineIntegral;
+    const leftRelPeano = computeRelativePeanoRemainderBound(
+      current.left,
+      mid - current.left,
+      fineIntegral,
+    );
+    const rightRelPeano = computeRelativePeanoRemainderBound(
+      mid,
+      current.right - mid,
+      fineIntegral,
+    );
+    const fineRelPeano = leftRelPeano + rightRelPeano;
 
     if (
-      indicatorDiff <= 1e-14 * Math.max(1e-300, fineIntegral) &&
-      finePeano <= 1e-14 * Math.max(1e-300, fineIntegral)
+      !Number.isFinite(indicatorRelDiff) ||
+      !Number.isFinite(fineRelPeano) ||
+      Number.isNaN(indicatorRelDiff) ||
+      Number.isNaN(fineRelPeano)
     ) {
+      throw new NumericConvergenceError(
+        'erfcxDiffPositive[AdaptiveGL8]',
+        evaluationsUsed,
+        Number.NaN,
+        1e-14,
+        `non-finite convergence indicator or Peano bound on [${current.left}, ${current.right}]`,
+      );
+    }
+
+    if (indicatorRelDiff <= 1e-14 && fineRelPeano <= 1e-14) {
       const next = totalIntegral + fineIntegral;
       if (Math.abs(totalIntegral) >= Math.abs(fineIntegral)) {
         compensation += totalIntegral - next + fineIntegral;
@@ -920,19 +1043,19 @@ export function erfcxDiffPositive(
         compensation += fineIntegral - next + totalIntegral;
       }
       totalIntegral = next;
-      totalPeanoRemainderBound += finePeano;
+      maxObservedRelPeano = Math.max(maxObservedRelPeano, fineRelPeano);
     } else {
       stack.push({ left: mid, right: current.right, coarse: rightIntegral });
       stack.push({ left: current.left, right: mid, coarse: leftIntegral });
     }
   }
 
-  const result = Math.max(0, totalIntegral + compensation);
-  if (result > 0 && totalPeanoRemainderBound > 1e-14 * result) {
+  const result = totalIntegral + compensation;
+  if (!Number.isFinite(result) || result <= 0 || maxObservedRelPeano > 1e-14) {
     throw new NumericConvergenceError(
       'erfcxDiffPositive[GaussLegendre8]',
       evaluationsUsed,
-      totalPeanoRemainderBound / result,
+      maxObservedRelPeano,
       1e-14,
     );
   }
@@ -2245,14 +2368,170 @@ export function nonCentralStudentTCdf(
 }
 
 /* -------------------------------------------------------------------------
-   11. Orthogonal Variance & Entropy Decompositions (No Double-Counting)
+   11. Runtime Contract Validators & Orthogonal Variance/Entropy Decompositions
    ------------------------------------------------------------------------- */
+
+/**
+ * Validates at runtime that an object conforms to `DualChannelProbability`,
+ * checking channel finiteness/range, exact status classification via
+ * `classifyBinary64Probability(logProbability, logComplementProbability)`,
+ * and exact coherence between `(probability, complementProbability)` and
+ * `(exp(logProbability), exp(logComplementProbability))`.
+ */
+export function validateDualChannelProbability(value: unknown): DualChannelProbability {
+  if (typeof value !== 'object' || value === null) {
+    throw new RangeError('DualChannelProbability must be a non-null object');
+  }
+  const cand = value as Record<string, unknown>;
+  const probability = cand.probability;
+  const complementProbability = cand.complementProbability;
+  const logProbability = cand.logProbability;
+  const logComplementProbability = cand.logComplementProbability;
+  const status = cand.status;
+
+  if (
+    typeof probability !== 'number' ||
+    typeof complementProbability !== 'number' ||
+    typeof logProbability !== 'number' ||
+    typeof logComplementProbability !== 'number' ||
+    Number.isNaN(probability) ||
+    Number.isNaN(complementProbability) ||
+    Number.isNaN(logProbability) ||
+    Number.isNaN(logComplementProbability) ||
+    probability < 0 ||
+    probability > 1 ||
+    complementProbability < 0 ||
+    complementProbability > 1
+  ) {
+    throw new RangeError('DualChannelProbability contains non-numeric or out-of-range fields');
+  }
+
+  const expectedStatus = classifyBinary64Probability(
+    logProbability,
+    logComplementProbability,
+  );
+  if (status !== expectedStatus) {
+    throw new RangeError(
+      `DualChannelProbability status '${String(status)}' does not match classified status '${expectedStatus}'`,
+    );
+  }
+
+  const reference = createDualChannelProbabilityFromPair(
+    logProbability,
+    logComplementProbability,
+  );
+  if (
+    Math.abs(probability - reference.probability) > 4 * Number.EPSILON ||
+    Math.abs(complementProbability - reference.complementProbability) > 4 * Number.EPSILON
+  ) {
+    throw new RangeError(
+      `DualChannelProbability linear channels (${probability}, ${complementProbability}) are incoherent with log channels (${logProbability}, ${logComplementProbability}) and status '${expectedStatus}'`,
+    );
+  }
+
+  return value as DualChannelProbability;
+}
+
+/**
+ * Validates at runtime that an array of `DualChannelProbability` entries forms
+ * a normalized, mutually exclusive, and collectively exhaustive distribution
+ * over `K >= 2` categories (`sum_k p_k = 1` and `logSumExp(logProb_k) = 0`).
+ */
+export function validateExhaustiveDistribution(
+  outcomes: unknown,
+  expectedCount?: number,
+): readonly DualChannelProbability[] {
+  if (!Array.isArray(outcomes) || outcomes.length < 2) {
+    throw new RangeError(
+      'Exhaustive distribution requires an array of at least 2 DualChannelProbability entries',
+    );
+  }
+  if (expectedCount !== undefined && outcomes.length !== expectedCount) {
+    throw new RangeError(
+      `Exhaustive distribution length ${outcomes.length} does not match expected outcome count ${expectedCount}`,
+    );
+  }
+
+  const validated: DualChannelProbability[] = [];
+  const linearProbs: number[] = [];
+  const logProbs: number[] = [];
+
+  for (let k = 0; k < outcomes.length; k++) {
+    const entry = validateDualChannelProbability(outcomes[k]);
+    validated.push(entry);
+    linearProbs.push(entry.probability);
+    logProbs.push(entry.logProbability);
+  }
+
+  const linearSum = kahanNeumaierSum(linearProbs);
+  if (!Number.isFinite(linearSum) || Math.abs(linearSum - 1) > 1e-12) {
+    throw new RangeError(
+      `Exhaustive distribution probabilities must sum to 1 within 1e-12, received ${linearSum}`,
+    );
+  }
+
+  const logTotal = logSumExp(logProbs);
+  if (!Number.isFinite(logTotal) || Math.abs(logTotal) > 1e-12) {
+    throw new RangeError(
+      `Exhaustive distribution log-probabilities must satisfy logSumExp = 0 within 1e-12, received ${logTotal}`,
+    );
+  }
+
+  // For binary (K = 2) distributions, enforce exact complement symmetry between outcomes 0 and 1
+  if (validated.length === 2) {
+    const o0 = validated[0]!;
+    const o1 = validated[1]!;
+    if (
+      Math.abs(o0.probability - o1.complementProbability) > 1e-12 ||
+      Math.abs(o1.probability - o0.complementProbability) > 1e-12
+    ) {
+      throw new RangeError(
+        'Binary exhaustive distribution outcomes must have mutually coherent probability and complementProbability channels',
+      );
+    }
+  }
+
+  return validated;
+}
+
+function validateAndNormalizeEnsembleWeights(
+  weights: readonly number[],
+  callerName: string,
+): number[] {
+  if (!Array.isArray(weights) || weights.length === 0) {
+    throw new RangeError(`${callerName} requires a non-empty weights array`);
+  }
+  for (let m = 0; m < weights.length; m++) {
+    const w = weights[m]!;
+    if (typeof w !== 'number' || !Number.isFinite(w) || Number.isNaN(w) || w < 0 || w > 1) {
+      throw new RangeError(
+        `${callerName}: invalid weight ${String(w)} at index ${m} (must be finite in [0, 1])`,
+      );
+    }
+  }
+  const weightSum = kahanNeumaierSum(weights);
+  if (!Number.isFinite(weightSum) || Math.abs(weightSum - 1) > 1e-12) {
+    throw new RangeError(
+      `${callerName}: weights must sum to 1 within 1e-12, received sum = ${weightSum}`,
+    );
+  }
+  const normalized = new Array<number>(weights.length);
+  for (let m = 0; m < weights.length; m++) {
+    normalized[m] = weights[m]! / weightSum;
+  }
+  return normalized;
+}
 
 /**
  * Computes the exact three-way orthogonal variance decomposition for outcome
  * category `k` across a weighted ensemble of methods [IME]:
  *
  *   `p_bar_k * (1 - p_bar_k) = sigma^2_{aleatoric,k} + sigma^2_{within,k} + sigma^2_{between,k}`
+ *
+ * Validates and normalizes the method weights once up front so that both the
+ * logarithmic mixture channels (`logPBar`, `logQBar`) and the three variance
+ * components (`aleatoric`, `within`, `between`) use the exact same normalized
+ * weights `w_m`.
  */
 export function decomposeCategoryUncertainty(
   outcomeIndex: number,
@@ -2260,44 +2539,61 @@ export function decomposeCategoryUncertainty(
   contributions: readonly MethodCategoryContribution[],
   parametricInterval: ParametricIntervalField,
 ): CategoryUncertaintyDecomposition {
+  if (!Number.isInteger(outcomeIndex) || outcomeIndex < 0) {
+    throw new RangeError(
+      `decomposeCategoryUncertainty requires a non-negative integer outcomeIndex, received ${String(outcomeIndex)}`,
+    );
+  }
+  if (typeof outcomeLabel !== 'string' || outcomeLabel.trim().length === 0) {
+    throw new RangeError('decomposeCategoryUncertainty requires a non-empty outcomeLabel');
+  }
   if (!Array.isArray(contributions) || contributions.length === 0) {
     throw new RangeError('decomposeCategoryUncertainty requires at least one method contribution');
   }
 
-  const weights = contributions.map((c) => c.weight);
-  const weightSum = kahanNeumaierSum(weights);
-  if (Math.abs(weightSum - 1) > 1e-9) {
-    throw new RangeError(
-      `Method weights must sum to 1, received sum = ${weightSum}`,
-    );
-  }
+  const rawWeights = contributions.map((c) => c.weight);
+  const normalizedWeights = validateAndNormalizeEnsembleWeights(
+    rawWeights,
+    'decomposeCategoryUncertainty',
+  );
 
   const logWeightedProbs: number[] = [];
   const logWeightedComps: number[] = [];
 
   for (let m = 0; m < contributions.length; m++) {
     const c = contributions[m]!;
-    if (c.weight < 0 || c.weight > 1) {
-      throw new RangeError(`Invalid method weight ${c.weight} at index ${m}`);
+    if (typeof c.methodId !== 'string' || c.methodId.trim().length === 0) {
+      throw new RangeError(`Invalid methodId at index ${m}`);
     }
-    const p = c.predictiveProbability.probability;
-    const q = c.predictiveProbability.complementProbability;
+    const pred = validateDualChannelProbability(c.predictiveProbability);
+    const p = pred.probability;
+    const q = pred.complementProbability;
     const maxParamVar = p * q + 1e-15;
-    if (c.parametricVariance < 0 || c.parametricVariance > maxParamVar) {
+    if (
+      typeof c.parametricVariance !== 'number' ||
+      !Number.isFinite(c.parametricVariance) ||
+      Number.isNaN(c.parametricVariance) ||
+      c.parametricVariance < 0 ||
+      c.parametricVariance > maxParamVar
+    ) {
       throw new RangeError(
-        `Invalid parametricVariance ${c.parametricVariance} for method '${c.methodId}': must lie in [0, p*(1-p)]`,
+        `Invalid parametricVariance ${String(c.parametricVariance)} for method '${c.methodId}': must lie in [0, p*(1-p)]`,
       );
     }
-    if (c.weight > 0) {
-      const logW = Math.log(c.weight);
-      logWeightedProbs.push(logW + c.predictiveProbability.logProbability);
-      logWeightedComps.push(logW + c.predictiveProbability.logComplementProbability);
+
+    const w = normalizedWeights[m]!;
+    if (w > 0) {
+      const logW = Math.log(w);
+      logWeightedProbs.push(logW + pred.logProbability);
+      logWeightedComps.push(logW + pred.logComplementProbability);
     }
   }
 
   const logPBar = logSumExp(logWeightedProbs);
   const logQBar = logSumExp(logWeightedComps);
   const predictiveProbability = createDualChannelProbabilityFromPair(logPBar, logQBar);
+  validateParametricIntervalField(parametricInterval, predictiveProbability);
+
   const pBar = predictiveProbability.probability;
   const qBar = predictiveProbability.complementProbability;
   const totalBernoulliVariance = pBar * qBar;
@@ -2308,7 +2604,7 @@ export function decomposeCategoryUncertainty(
 
   for (let m = 0; m < contributions.length; m++) {
     const c = contributions[m]!;
-    const w = c.weight / weightSum;
+    const w = normalizedWeights[m]!;
     const pm = c.predictiveProbability.probability;
     const qm = c.predictiveProbability.complementProbability;
     const bernoulliM = pm * qm;
@@ -2354,46 +2650,116 @@ function shannonEntropyFromDistribution(outcomes: readonly DualChannelProbabilit
 
 /**
  * Computes the exact Shannon entropy and weighted Jensen-Shannon divergence
- * decomposition across `M` method distributions over `K` exhaustive outcomes [IME]:
+ * decomposition across `M` method distributions over `K >= 2` exhaustive outcomes [IME]:
  *
  *   `H(p_bar) = H_within + JSD_w`
+ *
+ * Validates that:
+ *   1. All weights are finite, non-negative, `<= 1`, and sum to `1` within `1e-12`.
+ *   2. Every method distribution has the same category count `K >= 2` and is a
+ *      valid, normalized exhaustive distribution (`validateExhaustiveDistribution`).
+ *   3. The exact log-space mixture `p_bar_k = sum_m w_m p_{m,k}` is computed from
+ *      `methodDistributions` and the normalized weights `w_m`, and if
+ *      `ensembleDistribution` is supplied, every category matches `p_bar_k`
+ *      within `1e-12` (never returning a JSD claimed to be exact when
+ *      `ensembleDistribution` is incompatible with the weighted mixture).
  */
 export function decomposeEnsembleEntropy(
   methodDistributions: readonly (readonly DualChannelProbability[])[],
   weights: readonly number[],
-  ensembleDistribution: readonly DualChannelProbability[],
+  ensembleDistribution?: readonly DualChannelProbability[],
 ): EntropyDecomposition {
   if (
+    !Array.isArray(methodDistributions) ||
     methodDistributions.length === 0 ||
-    methodDistributions.length !== weights.length ||
-    ensembleDistribution.length === 0
+    !Array.isArray(weights) ||
+    methodDistributions.length !== weights.length
   ) {
     throw new RangeError('Invalid arguments to decomposeEnsembleEntropy');
   }
-  const weightSum = kahanNeumaierSum(weights);
-  if (Math.abs(weightSum - 1) > 1e-9) {
-    throw new RangeError(`Weights must sum to 1, received ${weightSum}`);
+
+  const normalizedWeights = validateAndNormalizeEnsembleWeights(
+    weights,
+    'decomposeEnsembleEntropy',
+  );
+
+  const firstDist = validateExhaustiveDistribution(methodDistributions[0]);
+  const outcomeCount = firstDist.length;
+
+  const validatedMethods: Array<readonly DualChannelProbability[]> = [firstDist];
+  for (let m = 1; m < methodDistributions.length; m++) {
+    validatedMethods.push(
+      validateExhaustiveDistribution(methodDistributions[m], outcomeCount),
+    );
   }
 
-  const totalPredictiveEntropyNats = shannonEntropyFromDistribution(ensembleDistribution);
+  // Compute the exact log-space mixture distribution from the individual distributions and normalized weights
+  const computedMixture: DualChannelProbability[] = new Array<DualChannelProbability>(
+    outcomeCount,
+  );
+  for (let k = 0; k < outcomeCount; k++) {
+    const logProbsK: number[] = [];
+    const logCompsK: number[] = [];
+    for (let m = 0; m < validatedMethods.length; m++) {
+      const w = normalizedWeights[m]!;
+      if (w > 0) {
+        const logW = Math.log(w);
+        const entry = validatedMethods[m]![k]!;
+        logProbsK.push(logW + entry.logProbability);
+        logCompsK.push(logW + entry.logComplementProbability);
+      }
+    }
+    computedMixture[k] = createDualChannelProbabilityFromPair(
+      logSumExp(logProbsK),
+      logSumExp(logCompsK),
+    );
+  }
+
+  if (ensembleDistribution !== undefined) {
+    const validatedEnsemble = validateExhaustiveDistribution(
+      ensembleDistribution,
+      outcomeCount,
+    );
+    for (let k = 0; k < outcomeCount; k++) {
+      const provided = validatedEnsemble[k]!;
+      const expected = computedMixture[k]!;
+      const probDiff = Math.abs(provided.probability - expected.probability);
+      const compDiff = Math.abs(
+        provided.complementProbability - expected.complementProbability,
+      );
+      if (probDiff > 1e-12 || compDiff > 1e-12) {
+        throw new RangeError(
+          `decomposeEnsembleEntropy: ensembleDistribution[${k}] (p=${provided.probability}) is incompatible with weighted mixture of methodDistributions (expected p=${expected.probability}, diff=${probDiff})`,
+        );
+      }
+      if (
+        Number.isFinite(provided.logProbability) &&
+        Number.isFinite(expected.logProbability) &&
+        Math.abs(provided.logProbability - expected.logProbability) > 1e-11
+      ) {
+        throw new RangeError(
+          `decomposeEnsembleEntropy: ensembleDistribution[${k}] logProbability (${provided.logProbability}) is incompatible with weighted mixture (${expected.logProbability})`,
+        );
+      }
+    }
+  }
+
+  const totalPredictiveEntropyNats = shannonEntropyFromDistribution(computedMixture);
   const withinTerms: number[] = [];
   const jsdTerms: number[] = [];
 
-  for (let m = 0; m < methodDistributions.length; m++) {
-    const dist = methodDistributions[m]!;
-    if (dist.length !== ensembleDistribution.length) {
-      throw new RangeError('All method distributions must match ensemble outcome count');
-    }
-    const w = weights[m]! / weightSum;
+  for (let m = 0; m < validatedMethods.length; m++) {
+    const dist = validatedMethods[m]!;
+    const w = normalizedWeights[m]!;
     if (w <= 0) {
       continue;
     }
     withinTerms.push(w * shannonEntropyFromDistribution(dist));
 
     // KL(p_m || p_bar) = sum_k p_{m,k} * (ln p_{m,k} - ln p_bar_k)
-    for (let k = 0; k < dist.length; k++) {
+    for (let k = 0; k < outcomeCount; k++) {
       const pm = dist[k]!;
-      const pBar = ensembleDistribution[k]!;
+      const pBar = computedMixture[k]!;
       if (pm.probability > 0 && Number.isFinite(pm.logProbability)) {
         jsdTerms.push(w * pm.probability * (pm.logProbability - pBar.logProbability));
       }
@@ -2406,8 +2772,11 @@ export function decomposeEnsembleEntropy(
     jsdTerms.length === 0 ? 0 : kahanNeumaierSum(jsdTerms),
   );
   const normalizedDisagreementIndex =
-    methodDistributions.length >= 2
-      ? Math.min(1, Math.max(0, jensenShannonDivergenceNats / Math.log(methodDistributions.length)))
+    validatedMethods.length >= 2
+      ? Math.min(
+          1,
+          Math.max(0, jensenShannonDivergenceNats / Math.log(validatedMethods.length)),
+        )
       : 0;
   const closureResidualNats = Math.abs(
     totalPredictiveEntropyNats - (withinMethodExpectedEntropyNats + jensenShannonDivergenceNats),
@@ -2420,4 +2789,96 @@ export function decomposeEnsembleEntropy(
     normalizedDisagreementIndex,
     closureResidualNats,
   });
+}
+
+/**
+ * Validates a complete `ForecastDistributionOutput` object at runtime, verifying:
+ *   1. `outcomeSpace` via `validateOutcomeSpaceDescriptor`
+ *   2. `outcomes` via `validateExhaustiveDistribution(outcomes, outcomeSpace.outcomeLabels.length)`
+ *   3. `footingTier` and `calibrationStatus` via `assertCalibrationHonesty`
+ *   4. Coherence of every `contrastReport.categoryDecompositions[k]` and its `parametricInterval`
+ *   5. Coherence of `contrastReport.entropyDecomposition` (`H(p_bar) = H_within + JSD_w` within `1e-12`)
+ */
+export function validateForecastDistributionContract(
+  value: unknown,
+): ForecastDistributionOutput {
+  if (typeof value !== 'object' || value === null) {
+    throw new RangeError('ForecastDistributionOutput must be a non-null object');
+  }
+  const cand = value as Record<string, unknown>;
+  const outcomeSpace = validateOutcomeSpaceDescriptor(cand.outcomeSpace);
+  const outcomeCount = outcomeSpace.outcomeLabels.length;
+  const outcomes = validateExhaustiveDistribution(cand.outcomes, outcomeCount);
+
+  const footingTier = cand.footingTier as EvidentialFootingTier;
+  const calibrationStatus = cand.calibrationStatus as CalibrationVerificationStatus;
+  assertCalibrationHonesty(footingTier, calibrationStatus);
+
+  const contrastReport = cand.contrastReport as Record<string, unknown> | undefined;
+  if (!contrastReport || typeof contrastReport !== 'object') {
+    throw new RangeError('ForecastDistributionOutput.contrastReport must be a non-null object');
+  }
+
+  const categoryDecompositions = contrastReport.categoryDecompositions as
+    | readonly CategoryUncertaintyDecomposition[]
+    | undefined;
+  if (
+    !Array.isArray(categoryDecompositions) ||
+    categoryDecompositions.length !== outcomeCount
+  ) {
+    throw new RangeError(
+      'ForecastDistributionOutput.contrastReport.categoryDecompositions must match outcomeSpace.outcomeLabels.length',
+    );
+  }
+
+  for (let k = 0; k < outcomeCount; k++) {
+    const decomp = categoryDecompositions[k];
+    if (!decomp || typeof decomp !== 'object') {
+      throw new RangeError(`Missing categoryDecomposition at index ${k}`);
+    }
+    if (
+      decomp.outcomeIndex !== k ||
+      decomp.outcomeLabel !== outcomeSpace.outcomeLabels[k]
+    ) {
+      throw new RangeError(
+        `categoryDecompositions[${k}] outcomeIndex/outcomeLabel mismatch with outcomeSpace`,
+      );
+    }
+    const pred = validateDualChannelProbability(decomp.predictiveProbability);
+    const outK = outcomes[k]!;
+    if (
+      Math.abs(pred.probability - outK.probability) > 1e-12 ||
+      Math.abs(pred.complementProbability - outK.complementProbability) > 1e-12
+    ) {
+      throw new RangeError(
+        `categoryDecompositions[${k}].predictiveProbability does not match outcomes[${k}]`,
+      );
+    }
+    validateParametricIntervalField(decomp.parametricInterval, pred);
+    if (
+      !Number.isFinite(decomp.closureResidual) ||
+      decomp.closureResidual > 1e-12
+    ) {
+      throw new RangeError(
+        `categoryDecompositions[${k}].closureResidual (${decomp.closureResidual}) exceeds 1e-12`,
+      );
+    }
+  }
+
+  const entropy = contrastReport.entropyDecomposition as EntropyDecomposition | undefined;
+  if (
+    !entropy ||
+    typeof entropy !== 'object' ||
+    !Number.isFinite(entropy.totalPredictiveEntropyNats) ||
+    !Number.isFinite(entropy.withinMethodExpectedEntropyNats) ||
+    !Number.isFinite(entropy.jensenShannonDivergenceNats) ||
+    !Number.isFinite(entropy.closureResidualNats) ||
+    entropy.closureResidualNats > 1e-12
+  ) {
+    throw new RangeError(
+      'ForecastDistributionOutput.contrastReport.entropyDecomposition is missing or violates closure residual <= 1e-12',
+    );
+  }
+
+  return value as ForecastDistributionOutput;
 }
