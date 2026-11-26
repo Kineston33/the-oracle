@@ -767,6 +767,36 @@ const PEANO_CONSTANT_GL8 = 1.6973620789167867e-23;
 const ERFCX_DERIV17_AT_ZERO = 2.981642466727535e9;
 const ERFCX_DERIV17_ASYMPTOTIC_PREFACTOR = 2.006810485081986e14;
 
+function integrateGL8SingleInterval(
+  uLeft: number,
+  uRight: number,
+  options?: NumericEvaluationOptions,
+): number {
+  const actualH = uRight - uLeft;
+  const mid = 0.5 * (uLeft + uRight);
+  const halfH = 0.5 * actualH;
+  let subSum = 0;
+  for (let i = 0; i < 4; i++) {
+    const offset = halfH * GL8_POSITIVE_NODES[i]!;
+    const weight = GL8_POSITIVE_WEIGHTS[i]!;
+    const dMinus = erfcxDerivativePositive(mid - offset, options);
+    const dPlus = erfcxDerivativePositive(mid + offset, options);
+    subSum += weight * (dMinus + dPlus);
+  }
+  return halfH * subSum;
+}
+
+function computeLocalPeanoRemainderBound(uLeft: number, actualH: number): number {
+  const deriv17Bound =
+    uLeft <= 1.25
+      ? ERFCX_DERIV17_AT_ZERO
+      : Math.min(
+          ERFCX_DERIV17_AT_ZERO,
+          ERFCX_DERIV17_ASYMPTOTIC_PREFACTOR / uLeft ** 18,
+        );
+  return PEANO_CONSTANT_GL8 * actualH ** 17 * deriv17Bound;
+}
+
 /**
  * Evaluates `erfcx(a) - erfcx(b) >= 0` for `0 <= a <= b <= +Infinity` without
  * catastrophic cancellation when `a` and `b` are close [IME / ANC].
@@ -774,17 +804,13 @@ const ERFCX_DERIV17_ASYMPTOTIC_PREFACTOR = 2.006810485081986e14;
  * Error bounds:
  *   1. Branch 1 (`erfcx(b) <= 0.75 * erfcx(a)`): direct subtraction has amplification
  *      `(1 + r) / (1 - r) <= 7`, giving relative error `<= 3.52e-14 < 1e-13`.
- *   2. Branch 2 (`erfcx(b) > 0.75 * erfcx(a)`): subdivides `[a, b]` into
- *      `M_sub = max(1, ceil((b - a) / (0.05 * max(1, a))))` subintervals of actual
- *      step `h_m = u_m - u_{m-1} <= 0.05 * max(1, u_{m-1})` (`h_m <= 0.075` on
- *      `[0, 1.5]`), and integrates `D_erfcx(u) = -erfcx'(u) > 0` via 8-point
- *      Gauss-Legendre quadrature.
- *      By the Peano-Markov remainder theorem and complete monotonicity of `erfcx`:
- *        - On `[0, 1.5]` (where `h_m <= 0.075` near `1.5`), the local relative
- *          quadrature remainder is `<= 3.10e-31`.
- *        - On `[1.5, +Infinity)`, the local relative quadrature remainder is `<= 1.85e-29`.
- *      Global relative tolerance `<= 1e-13` is certified on `0 <= a <= b <= 1e150`
- *      where `D_erfcx(u)` remains a normal IEEE 754 `binary64` float.
+ *   2. Branch 2 (`erfcx(b) > 0.75 * erfcx(a)`): subdivides `[a, b]` into initial
+ *      subintervals of step `h_m <= 0.05 * max(1, a)` (`h_m <= 0.075` on `[0, 1.5]`),
+ *      and applies adaptive 8-point Gauss-Legendre quadrature (verifying both the
+ *      two-half refinement indicator `|I_half - I_coarse|` and the local Peano-Markov
+ *      remainder bound `B_{GL,8}` on each subinterval) within a strict subdivision
+ *      budget. Throws `NumericConvergenceError` if convergence is not reached.
+ *      Global relative tolerance `<= 1e-13` is certified on `0 <= a <= b <= 1e150`.
  */
 export function erfcxDiffPositive(
   a: number,
@@ -814,54 +840,98 @@ export function erfcxDiffPositive(
   }
 
   const maxStep = 0.05 * Math.max(1, a);
-  const numSubintervals = Math.max(1, Math.ceil((b - a) / maxStep));
-  const h = (b - a) / numSubintervals;
+  const initialSubintervals = Math.max(1, Math.ceil((b - a) / maxStep));
+  const maxSubdivisionBudget = options?.maxIterations ?? 120;
+  if (initialSubintervals > maxSubdivisionBudget) {
+    throw new NumericConvergenceError(
+      'erfcxDiffPositive[AdaptiveGL8]',
+      maxSubdivisionBudget,
+      initialSubintervals,
+      maxSubdivisionBudget,
+      'initial subdivision count exceeds maxIterations budget',
+    );
+  }
+
+  const h = (b - a) / initialSubintervals;
+  const stack: Array<{ readonly left: number; readonly right: number; readonly coarse: number }> = [];
+  for (let m = initialSubintervals - 1; m >= 0; m--) {
+    const uLeft = a + m * h;
+    const uRight = m === initialSubintervals - 1 ? b : a + (m + 1) * h;
+    stack.push({
+      left: uLeft,
+      right: uRight,
+      coarse: integrateGL8SingleInterval(uLeft, uRight, options),
+    });
+  }
 
   let totalIntegral = 0;
   let compensation = 0;
   let totalPeanoRemainderBound = 0;
+  let evaluationsUsed = initialSubintervals;
 
-  for (let m = 0; m < numSubintervals; m++) {
-    const uLeft = a + m * h;
-    const uRight = m === numSubintervals - 1 ? b : a + (m + 1) * h;
-    const actualH = uRight - uLeft;
-    const mid = 0.5 * (uLeft + uRight);
-    const halfH = 0.5 * actualH;
+  while (stack.length > 0) {
+    const current = stack.pop()!;
+    const actualH = current.right - current.left;
+    const mid = 0.5 * (current.left + current.right);
+    const peanoBound = computeLocalPeanoRemainderBound(current.left, actualH);
 
-    let subSum = 0;
-    for (let i = 0; i < 4; i++) {
-      const offset = halfH * GL8_POSITIVE_NODES[i]!;
-      const weight = GL8_POSITIVE_WEIGHTS[i]!;
-      const dMinus = erfcxDerivativePositive(mid - offset, options);
-      const dPlus = erfcxDerivativePositive(mid + offset, options);
-      subSum += weight * (dMinus + dPlus);
+    // Check if midpoint cannot split further in binary64 or if both Peano bound and
+    // two-half adaptive quadrature indicator are within 1e-14 relative tolerance
+    if (mid <= current.left || mid >= current.right) {
+      const next = totalIntegral + current.coarse;
+      if (Math.abs(totalIntegral) >= Math.abs(current.coarse)) {
+        compensation += totalIntegral - next + current.coarse;
+      } else {
+        compensation += current.coarse - next + totalIntegral;
+      }
+      totalIntegral = next;
+      totalPeanoRemainderBound += peanoBound;
+      continue;
     }
-    const subIntegral = halfH * subSum;
-    const next = totalIntegral + subIntegral;
-    if (Math.abs(totalIntegral) >= Math.abs(subIntegral)) {
-      compensation += totalIntegral - next + subIntegral;
+
+    if (evaluationsUsed + 2 > maxSubdivisionBudget) {
+      throw new NumericConvergenceError(
+        'erfcxDiffPositive[AdaptiveGL8]',
+        maxSubdivisionBudget,
+        peanoBound / Math.max(1e-300, current.coarse),
+        1e-14,
+        'adaptive quadrature subdivision budget exhausted',
+      );
+    }
+
+    const leftIntegral = integrateGL8SingleInterval(current.left, mid, options);
+    const rightIntegral = integrateGL8SingleInterval(mid, current.right, options);
+    evaluationsUsed += 2;
+
+    const fineIntegral = leftIntegral + rightIntegral;
+    const indicatorDiff = Math.abs(fineIntegral - current.coarse);
+    const finePeano =
+      computeLocalPeanoRemainderBound(current.left, mid - current.left) +
+      computeLocalPeanoRemainderBound(mid, current.right - mid);
+
+    if (
+      indicatorDiff <= 1e-14 * Math.max(1e-300, fineIntegral) &&
+      finePeano <= 1e-14 * Math.max(1e-300, fineIntegral)
+    ) {
+      const next = totalIntegral + fineIntegral;
+      if (Math.abs(totalIntegral) >= Math.abs(fineIntegral)) {
+        compensation += totalIntegral - next + fineIntegral;
+      } else {
+        compensation += fineIntegral - next + totalIntegral;
+      }
+      totalIntegral = next;
+      totalPeanoRemainderBound += finePeano;
     } else {
-      compensation += subIntegral - next + totalIntegral;
+      stack.push({ left: mid, right: current.right, coarse: rightIntegral });
+      stack.push({ left: current.left, right: mid, coarse: leftIntegral });
     }
-    totalIntegral = next;
-
-    // Local Peano-Markov remainder bound using actual subinterval step `actualH`
-    const deriv17Bound =
-      uLeft <= 1.25
-        ? ERFCX_DERIV17_AT_ZERO
-        : Math.min(
-            ERFCX_DERIV17_AT_ZERO,
-            ERFCX_DERIV17_ASYMPTOTIC_PREFACTOR / uLeft ** 18,
-          );
-    const localRemainder = PEANO_CONSTANT_GL8 * actualH ** 17 * deriv17Bound;
-    totalPeanoRemainderBound += localRemainder;
   }
 
   const result = Math.max(0, totalIntegral + compensation);
   if (result > 0 && totalPeanoRemainderBound > 1e-14 * result) {
     throw new NumericConvergenceError(
       'erfcxDiffPositive[GaussLegendre8]',
-      numSubintervals,
+      evaluationsUsed,
       totalPeanoRemainderBound / result,
       1e-14,
     );
@@ -1299,6 +1369,17 @@ export function normalCdf(z: number): number {
     return 0.5;
   }
   const u = Math.abs(z) / Math.SQRT2;
+  if (u <= 0.46875) {
+    const y = u * u;
+    let xnum = CODY_A[4] * y;
+    let xden = y;
+    for (let i = 0; i < 3; i++) {
+      xnum = (xnum + CODY_A[i]!) * y;
+      xden = (xden + CODY_B[i]!) * y;
+    }
+    const erfVal = (u * (xnum + CODY_A[3])) / (xden + CODY_B[3]);
+    return z < 0 ? 0.5 - 0.5 * erfVal : 0.5 + 0.5 * erfVal;
+  }
   const tail = 0.5 * Math.exp(-u * u) * erfcx(u);
   return z < 0 ? tail : 1 - tail;
 }
@@ -2051,15 +2132,26 @@ export function nonCentralStudentTCdf(
   const halfDf = 0.5 * df;
   const maxSteps = options?.maxIterations ?? 500;
 
-  const logP0 = -lambda + j0 * Math.log(lambda) - lnGamma(j0 + 1);
-  const logAbsQ0 =
-    Math.log(Math.abs(ncp) / Math.SQRT2) -
-    lambda +
-    j0 * Math.log(lambda) -
-    lnGamma(j0 + 1.5);
-
-  let pUp = Math.exp(logP0);
-  let absQUp = Math.exp(logAbsQ0);
+  // When j0 === 0 (i.e. |ncp| < sqrt(2)), lambda^0 === 1 identically even if lambda underflows
+  // to +0.0 in binary64 (e.g. |ncp| <= 1e-162). Avoid 0 * Math.log(0) = NaN and preserve
+  // the exact first-order noncentral weight q_0(delta) = delta * sqrt(2 / pi) * exp(-lambda).
+  let pUp: number;
+  let absQUp: number;
+  if (j0 === 0) {
+    const expNegLambda = Math.exp(-lambda);
+    pUp = expNegLambda;
+    absQUp = Math.abs(ncp) * Math.SQRT2 * ONE_OVER_SQRT_PI * expNegLambda;
+  } else {
+    const logLambda = Math.log(lambda);
+    const logP0 = -lambda + j0 * logLambda - lnGamma(j0 + 1);
+    const logAbsQ0 =
+      Math.log(Math.abs(ncp) / Math.SQRT2) -
+      lambda +
+      j0 * logLambda -
+      lnGamma(j0 + 1.5);
+    pUp = Math.exp(logP0);
+    absQUp = Math.exp(logAbsQ0);
+  }
   let pDown = pUp;
   let absQDown = absQUp;
 

@@ -382,6 +382,38 @@ describe('Stage 2A-1 — Numeric Primitives & Forecast Contracts (v4.4.3)', () =
         1e-13,
       );
 
+      // Branch transitions in erfcxDiffPositive:
+      // 1. Just inside quadrature branch (r = erfcx(1.5055)/erfcx(1.0) = 0.7500002488 > 0.75)
+      expectRelativeErrorWithin(
+        erfcxDiffPositive(1.0, 1.5055),
+        1.0689578764672721402e-1,
+        1e-13,
+      );
+      // 2. Just inside direct subtraction branch (r = erfcx(1.5056)/erfcx(1.0) = 0.7499621789 <= 0.75)
+      expectRelativeErrorWithin(
+        erfcxDiffPositive(1.0, 1.5056),
+        1.0691206571424832271e-1,
+        1e-13,
+      );
+      // 3. Straddling derivative branch switch u = 1.5
+      expectRelativeErrorWithin(
+        erfcxDiffPositive(1.49, 1.51),
+        3.272524217491019279e-3,
+        1e-13,
+      );
+      // 4. Straddling derivative branch switch u = 60.0 (Stieltjes CF to asymptotic series)
+      expectRelativeErrorWithin(
+        erfcxDiffPositive(59.95, 60.05),
+        1.566541830279402072e-5,
+        1e-13,
+      );
+      // 5. Extreme large asymptotic u = 500
+      expectRelativeErrorWithin(
+        erfcxDiffPositive(500.0, 500.001),
+        2.2567402802695787705e-9,
+        1e-13,
+      );
+
       // Subinterval crossing u = 1.5 (where local max step h_m <= 0.075 gives Peano bound <= 3.10e-31)
       expectRelativeErrorWithin(
         erfcxDiffPositive(1.4, 1.6),
@@ -424,8 +456,11 @@ describe('Stage 2A-1 — Numeric Primitives & Forecast Contracts (v4.4.3)', () =
       );
     });
 
-    it('throws NumericConvergenceError when Stieltjes CF iteration budget is insufficient and rejects invalid domains', () => {
+    it('throws NumericConvergenceError when Stieltjes CF or adaptive GL8 iteration budget is insufficient and rejects invalid domains', () => {
       expect(() => erfcxDiffPositive(2.0, 2.01, { maxIterations: 3 })).toThrow(
+        NumericConvergenceError,
+      );
+      expect(() => erfcxDiffPositive(1.0, 1.5055, { maxIterations: 2 })).toThrow(
         NumericConvergenceError,
       );
       expect(() => erfcxDerivativePositive(2.0, { maxIterations: 3 })).toThrow(RangeError);
@@ -705,15 +740,45 @@ describe('Stage 2A-1 — Numeric Primitives & Forecast Contracts (v4.4.3)', () =
       ).toBeLessThanOrEqual(1e-9);
     });
 
-    it('handles huge finite t (including +/-1e200) without Infinity/Infinity NaN and enforces +/-Infinity boundaries', () => {
+    it('handles huge finite t (including 1e200 with df = 20, ncp = 2) and tiny non-zero ncp whose square underflows', () => {
       expect(nonCentralStudentTCdf(Number.NEGATIVE_INFINITY, 10, 2.0)).toBe(0);
       expect(nonCentralStudentTCdf(Number.POSITIVE_INFINITY, 10, 2.0)).toBe(1);
+      expect(nonCentralStudentTCdf(1e200, 20, 2.0)).toBe(1);
+      expect(nonCentralStudentTCdf(-1e200, 20, 2.0)).toBe(0);
       expect(nonCentralStudentTCdf(1e200, 10, 2.0)).toBe(1);
       expect(nonCentralStudentTCdf(-1e200, 10, 2.0)).toBe(0);
       expect(nonCentralStudentTCdf(1e200, 10, -2.0)).toBe(1);
       expect(nonCentralStudentTCdf(-1e200, 10, -2.0)).toBe(0);
       expect(nonCentralStudentTCdf(1e200, 20, 50.0)).toBe(1);
       expect(nonCentralStudentTCdf(-1e200, 20, 50.0)).toBe(0);
+
+      // Tiny non-zero ncp where 0.5 * ncp^2 underflows to +0.0 in binary64 (must never produce 0 * ln(0) = NaN)
+      const centralRef = studentTCdf(1.5, 10);
+      for (const tinyNcp of [
+        1e-100,
+        -1e-100,
+        1e-162,
+        -1e-162,
+        1e-200,
+        -1e-200,
+        1e-300,
+        -1e-300,
+        Number.MIN_VALUE,
+        -Number.MIN_VALUE,
+      ]) {
+        const valPosT = nonCentralStudentTCdf(1.5, 10, tinyNcp);
+        const valNegT = nonCentralStudentTCdf(-1.5, 10, tinyNcp);
+        expect(Number.isNaN(valPosT)).toBe(false);
+        expect(Number.isNaN(valNegT)).toBe(false);
+        expect(Math.abs(valPosT - centralRef)).toBeLessThanOrEqual(1e-15);
+        expect(Math.abs(valNegT - (1 - centralRef))).toBeLessThanOrEqual(1e-15);
+      }
+
+      // Small non-underflowing ncp = +/-1e-8 shifts the CDF in the right direction relative to central t
+      const pPlusSmall = nonCentralStudentTCdf(1.0, 10, 1e-8);
+      const pMinusSmall = nonCentralStudentTCdf(1.0, 10, -1e-8);
+      expect(pPlusSmall).toBeLessThan(studentTCdf(1.0, 10));
+      expect(pMinusSmall).toBeGreaterThan(studentTCdf(1.0, 10));
     });
 
     it('throws NumericConvergenceError when truncation bound B_tail(S) <= 1e-12 is not reached within maxIterations', () => {
