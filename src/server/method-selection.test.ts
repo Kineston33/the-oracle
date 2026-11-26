@@ -131,19 +131,272 @@ describe('Stage 2A-2.1 — Applicability Planner (src/server/method-selection.ts
     expect(plan.deferredMethodIds).toEqual([]);
   });
 
-  it('identifies correlated method groups when multiple methods from the same family are applicable (Principle E)', () => {
+  it('identifies connected correlation components across shared correlationGroupId and explicit correlatedWithMethodIds, including binary Beta-Binomial / Dirichlet-Multinomial equivalence (Principle E)', () => {
     const input = createSyntheticBinaryGeopoliticsInput();
+    expect(input.availableEvidence.binaryTrialSuccesses).toBe(14);
+    expect(input.availableEvidence.binaryTrialFailures).toBe(26);
+    expect(input.availableEvidence.multinomialOutcomeCounts).toEqual([14, 26]);
+
     const plan = planMethodApplicability(input);
 
+    // Beta-Binomial, Weighted-Kish, and Dirichlet-Multinomial form a single
+    // deterministic connected component with zero duplicate/overlapping reports:
     expect(plan.correlatedMethodGroups).toHaveLength(1);
     const group = plan.correlatedMethodGroups[0]!;
     expect(group.correlationGroupId).toBe('bernoulli-frequency-family');
+    expect(group.correlationGroupIds).toEqual([
+      'bernoulli-frequency-family',
+      'dirichlet-categorical-family',
+    ]);
     expect(group.applicableMethodIds).toEqual([
       'beta-binomial-conjugate',
       'weighted-kish-effective-binomial',
+      'dirichlet-multinomial-symmetry',
+    ]);
+    expect(group.relationshipSources).toEqual([
+      'shared-correlation-group',
+      'explicit-correlated-method-declaration',
+      'binary-conjugate-simplex-reduction',
     ]);
     expect(group.sharedInformationChannels).toContain('binary-trial-counts');
+    expect(group.sharedInformationChannels).toContain(
+      'multinomial-category-counts',
+    );
+    expect(group.sharedAssumptions).toContain('stationary-success-probability');
+    expect(group.commonRequiredAssumptions).toContain(
+      'stationary-success-probability',
+    );
+    expect(group.treatAsIndependentVotes).toBe(false);
     expect(group.warning).toContain('bernoulli-frequency-family');
+    expect(group.warning).toContain('dirichlet-categorical-family');
+    expect(group.warning).toContain('never be counted as two independent votes');
+
+    // Pairwise edges within the component:
+    expect(group.pairwiseRelationships).toHaveLength(2);
+    expect(group.pairwiseRelationships[0]?.methodPair).toEqual([
+      'beta-binomial-conjugate',
+      'weighted-kish-effective-binomial',
+    ]);
+    expect(group.pairwiseRelationships[0]?.relationshipSources).toEqual([
+      'shared-correlation-group',
+      'explicit-correlated-method-declaration',
+    ]);
+    expect(group.pairwiseRelationships[1]?.methodPair).toEqual([
+      'beta-binomial-conjugate',
+      'dirichlet-multinomial-symmetry',
+    ]);
+    expect(group.pairwiseRelationships[1]?.relationshipSources).toEqual([
+      'explicit-correlated-method-declaration',
+      'binary-conjugate-simplex-reduction',
+    ]);
+
+    // Binary Beta-Binomial / Dirichlet-Multinomial equivalence diagnostic:
+    const eqDiag = group.binaryBetaDirichletEquivalence!;
+    expect(eqDiag).toBeDefined();
+    expect(plan.dependenceDiagnostics.binaryBetaDirichletEquivalence).toEqual(
+      eqDiag,
+    );
+    expect(eqDiag.methodPair).toEqual([
+      'beta-binomial-conjugate',
+      'dirichlet-multinomial-symmetry',
+    ]);
+    expect(eqDiag.outcomeSpaceIsBinary).toBe(true);
+    expect(eqDiag.observationAlignment).toBe(
+      'identical-binary-and-multinomial-counts',
+    );
+    expect(eqDiag.binaryObservationCounts).toEqual([14, 26]);
+    expect(eqDiag.multinomialObservationCounts).toEqual([14, 26]);
+    expect(eqDiag.observationsMatchExactly).toBe(true);
+    expect(eqDiag.treatAsIndependentVotes).toBe(false);
+    expect(eqDiag.predictiveEquivalenceCondition).toContain('Dirichlet');
+    expect(eqDiag.nonIdenticalCaveat).toContain(
+      'Do not assume numerical identity when prior hyperparameters, observation counts, or modeling assumptions differ',
+    );
+
+    // Unlinked evidence-driven method (poisson-gamma-hazard) is classified as
+    // 'unknown-not-established' rather than statistically independent:
+    expect(
+      plan.dependenceDiagnostics.unlinkedSelectedEvidenceMethodIds,
+    ).toEqual(['poisson-gamma-hazard']);
+    expect(plan.dependenceDiagnostics.epistemicIndependencePolicy).toBe(
+      'unknown-until-empirically-or-structurally-audited',
+    );
+    const betaPoissonPair = plan.dependenceDiagnostics.pairwiseAssessments.find(
+      (p) =>
+        p.methodPair[0] === 'beta-binomial-conjugate' &&
+        p.methodPair[1] === 'poisson-gamma-hazard',
+    )!;
+    expect(betaPoissonPair.classification).toBe('unknown-not-established');
+    expect(betaPoissonPair.inferredStatisticallyIndependent).toBe(false);
+    expect(betaPoissonPair.canCountAsIndependentVotes).toBe(false);
+  });
+
+  it('connects cross-group methods linked via correlatedWithMethodIds, distinguishes divergent binary vs. multinomial counts, and preserves Student-t / First-Passage dependence', () => {
+    const baseInput = createSyntheticBinaryGeopoliticsInput();
+
+    // 1. When only Beta-Binomial and Dirichlet-Multinomial have available data
+    // (different correlationGroupIds: 'bernoulli-frequency-family' vs 'dirichlet-categorical-family'),
+    // they are still grouped into a single connected component via explicit correlatedWithMethodIds:
+    const betaAndDirichletOnlyPlan = planMethodApplicability({
+      ...baseInput,
+      availableEvidence: {
+        availableChannels: ['binary-trial-counts', 'multinomial-category-counts'],
+        hasVerifiableEmpiricalData: true,
+        binaryTrialSuccesses: 14,
+        binaryTrialFailures: 26,
+        multinomialOutcomeCounts: [20, 20], // divergent counts
+      },
+    });
+    expect(
+      betaAndDirichletOnlyPlan.evidenceDrivenApplicableMethodIds,
+    ).toEqual(['beta-binomial-conjugate', 'dirichlet-multinomial-symmetry']);
+    expect(betaAndDirichletOnlyPlan.correlatedMethodGroups).toHaveLength(1);
+    const crossGroupComp = betaAndDirichletOnlyPlan.correlatedMethodGroups[0]!;
+    expect(crossGroupComp.applicableMethodIds).toEqual([
+      'beta-binomial-conjugate',
+      'dirichlet-multinomial-symmetry',
+    ]);
+    expect(crossGroupComp.correlationGroupIds).toEqual([
+      'bernoulli-frequency-family',
+      'dirichlet-categorical-family',
+    ]);
+    expect(crossGroupComp.relationshipSources).toEqual([
+      'explicit-correlated-method-declaration',
+      'binary-conjugate-simplex-reduction',
+    ]);
+    expect(
+      crossGroupComp.binaryBetaDirichletEquivalence?.observationAlignment,
+    ).toBe('permuted-or-divergent-counts');
+    expect(
+      crossGroupComp.binaryBetaDirichletEquivalence?.observationsMatchExactly,
+    ).toBe(false);
+    expect(
+      crossGroupComp.binaryBetaDirichletEquivalence?.treatAsIndependentVotes,
+    ).toBe(false);
+
+    // 2. When only Beta-Binomial and Weighted-Kish are applicable (without Dirichlet-Multinomial),
+    // the bernoulli-frequency-family component is preserved:
+    const betaAndKishOnlyPlan = planMethodApplicability({
+      ...baseInput,
+      availableEvidence: {
+        availableChannels: [
+          'binary-trial-counts',
+          'weighted-binary-trials',
+          'kish-effective-sample-size',
+        ],
+        hasVerifiableEmpiricalData: true,
+        binaryTrialSuccesses: 14,
+        binaryTrialFailures: 26,
+        weightedSampleSize: 40,
+        kishEffectiveSampleSize: 28.5,
+      },
+    });
+    expect(betaAndKishOnlyPlan.correlatedMethodGroups).toHaveLength(1);
+    expect(
+      betaAndKishOnlyPlan.correlatedMethodGroups[0]?.applicableMethodIds,
+    ).toEqual(['beta-binomial-conjugate', 'weighted-kish-effective-binomial']);
+    expect(
+      betaAndKishOnlyPlan.correlatedMethodGroups[0]
+        ?.binaryBetaDirichletEquivalence,
+    ).toBeUndefined();
+
+    // 3. Preserve Student-t / First-Passage relationship ('ito-continuous-diffusion-family')
+    // when both are simultaneously applicable in a custom registry scenario:
+    const studentTDesc = DEFAULT_SCIENTIFIC_METHOD_REGISTRY.getOrThrow(
+      'student-t-terminal-diffusion',
+    );
+    const firstPassageDesc = DEFAULT_SCIENTIFIC_METHOD_REGISTRY.getOrThrow(
+      'first-passage-barrier-diffusion',
+    );
+    const barrierCompatibleStudentT = validateScientificMethodDescriptor({
+      ...studentTDesc,
+      domain: {
+        ...studentTDesc.domain,
+        applicableSubdomains: [
+          ...studentTDesc.domain.applicableSubdomains,
+          'climate-anomaly-threshold-exceedance',
+        ],
+      },
+      outcomeSpaceCompatibility: {
+        ...studentTDesc.outcomeSpaceCompatibility,
+        supportedKinds: [
+          'binary',
+          'discretized-continuous-partition',
+          'first-passage-before-horizon',
+        ],
+        requiresPartitionThresholds: false,
+      },
+    });
+    const diffusionRegistry = createScientificMethodRegistry([
+      barrierCompatibleStudentT,
+      firstPassageDesc,
+    ]);
+    const diffusionPlan = planMethodApplicability(
+      {
+        questionId: 'SYNTH-DIFF-2026-004',
+        questionCategory: 'climate',
+        subdomain: 'climate-anomaly-threshold-exceedance',
+        outcomeSpace: {
+          kind: 'first-passage-before-horizon',
+          outcomeLabels: ['Crosses +1.7C barrier', 'Remains below +1.7C'],
+          barrierLevel: 1.7,
+          barrierDirection: 'up-and-in',
+          horizonStartsAt: '2026-01-01T00:00:00.000Z',
+          horizonEndsAt: '2026-12-31T23:59:59.000Z',
+          eventDefinitionHash: 'synth_diff_004',
+        },
+        horizon: {
+          startsAt: '2026-01-01T00:00:00.000Z',
+          endsAt: '2026-12-31T23:59:59.000Z',
+        },
+        availableEvidence: {
+          availableChannels: [
+            'continuous-state-trajectory',
+            'drift-and-scale-estimates',
+            'tail-degrees-of-freedom',
+            'absorbing-barrier-specification',
+          ],
+          hasVerifiableEmpiricalData: true,
+          continuousTrajectoryObservations: 60,
+          estimatedDrift: 0.03,
+          estimatedScaleOrVolatility: 0.12,
+          degreesOfFreedom: 8,
+          initialStateLevel: 1.42,
+        },
+        assumptions: {
+          verifiedAssumptions: [
+            'stationary-heavy-tailed-increments',
+            'student-t-terminal-innovation-law',
+            'continuous-sample-path-no-jump-overshoot',
+            'constant-drift-and-volatility-to-horizon',
+            'reflection-principle-absorbing-barrier',
+          ],
+        },
+        computationalCapabilities: {
+          maxAllowedCostTier: 'high',
+          allowIterativeSpecialFunctions: true,
+        },
+      },
+      diffusionRegistry,
+    );
+    expect(diffusionPlan.correlatedMethodGroups).toHaveLength(1);
+    const diffComp = diffusionPlan.correlatedMethodGroups[0]!;
+    expect(diffComp.correlationGroupId).toBe('ito-continuous-diffusion-family');
+    expect(diffComp.applicableMethodIds).toEqual([
+      'student-t-terminal-diffusion',
+      'first-passage-barrier-diffusion',
+    ]);
+    expect(diffComp.relationshipSources).toEqual([
+      'shared-correlation-group',
+      'explicit-correlated-method-declaration',
+    ]);
+    expect(diffComp.sharedInformationChannels).toEqual([
+      'continuous-state-trajectory',
+      'drift-and-scale-estimates',
+    ]);
+    expect(diffComp.commonRequiredAssumptions).toEqual([
+      'constant-drift-and-volatility-to-horizon',
+    ]);
   });
 
   it('evaluates discretized continuous partition scenarios (synthetic economy/climate scenario) where both Student-t terminal diffusion and Dirichlet-Multinomial are simultaneously applicable', () => {
@@ -723,7 +976,7 @@ describe('Stage 2A-2.1 — Applicability Planner (src/server/method-selection.ts
       },
       dependenceProfile: {
         ...baseDesc.dependenceProfile,
-        correlatedWithMethodIds: ['beta-binomial-conjugate'],
+        correlatedWithMethodIds: [],
       },
     });
 

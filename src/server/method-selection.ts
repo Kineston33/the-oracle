@@ -236,11 +236,101 @@ export interface MethodEvaluationRecord {
   readonly contractResult: MethodApplicabilityResult;
 }
 
+export type CorrelationRelationshipSource =
+  | 'shared-correlation-group'
+  | 'explicit-correlated-method-declaration'
+  | 'binary-conjugate-simplex-reduction';
+
+export type BinaryBetaDirichletObservationAlignment =
+  | 'identical-binary-and-multinomial-counts'
+  | 'permuted-or-divergent-counts'
+  | 'counts-not-simultaneously-observed';
+
+export interface BinaryBetaDirichletEquivalenceDiagnostic {
+  readonly methodPair: readonly [
+    'beta-binomial-conjugate',
+    'dirichlet-multinomial-symmetry',
+  ];
+  readonly outcomeSpaceIsBinary: true;
+  readonly observationAlignment: BinaryBetaDirichletObservationAlignment;
+  readonly binaryObservationCounts?: readonly [number, number];
+  readonly multinomialObservationCounts?: readonly [number, number];
+  /**
+   * True when `multinomialOutcomeCounts` equals `[binaryTrialSuccesses, binaryTrialFailures]`.
+   * Even when `true`, numerical identity of posterior predictive distributions
+   * remains conditional on compatible prior hyperparameters `(alpha_1, alpha_2) = (alpha_0, beta_0)`
+   * and shared modeling assumptions.
+   */
+  readonly observationsMatchExactly: boolean;
+  readonly predictiveEquivalenceCondition: string;
+  readonly nonIdenticalCaveat: string;
+  readonly treatAsIndependentVotes: false;
+}
+
+export interface CorrelatedMethodPairDiagnostic {
+  readonly methodPair: readonly [ScientificMethodId, ScientificMethodId];
+  readonly relationshipSources: readonly CorrelationRelationshipSource[];
+  readonly correlationGroupIds: readonly string[];
+  readonly sharedInformationChannels: readonly MethodDataChannelId[];
+  readonly sharedAssumptions: readonly MethodAssumptionId[];
+  readonly binaryBetaDirichletEquivalence?: BinaryBetaDirichletEquivalenceDiagnostic;
+  readonly explanation: string;
+}
+
 export interface CorrelatedMethodGroupDiagnostic {
   readonly correlationGroupId: string;
+  readonly correlationGroupIds: readonly string[];
   readonly applicableMethodIds: readonly ScientificMethodId[];
+  readonly relationshipSources: readonly CorrelationRelationshipSource[];
+  readonly pairwiseRelationships: readonly CorrelatedMethodPairDiagnostic[];
   readonly sharedInformationChannels: readonly MethodDataChannelId[];
+  readonly sharedAssumptions: readonly MethodAssumptionId[];
+  readonly commonRequiredAssumptions: readonly MethodAssumptionId[];
+  readonly binaryBetaDirichletEquivalence?: BinaryBetaDirichletEquivalenceDiagnostic;
+  readonly treatAsIndependentVotes: false;
   readonly warning: string;
+}
+
+export type PairwiseDependenceClassification =
+  | 'declared-correlated'
+  | 'binary-conjugate-simplex-equivalence-candidate'
+  | 'structural-baseline-non-evidential'
+  | 'unknown-not-established';
+
+export interface MethodPairDependenceAssessment {
+  readonly methodPair: readonly [ScientificMethodId, ScientificMethodId];
+  readonly classification: PairwiseDependenceClassification;
+  /**
+   * Stage 2A-2.1 never infers statistical independence merely because two
+   * methods have different identifiers or correlationGroupIds. Always `false`.
+   */
+  readonly inferredStatisticallyIndependent: false;
+  readonly canCountAsIndependentVotes: false;
+  readonly relationshipSources: readonly CorrelationRelationshipSource[];
+  readonly sharedInformationChannels: readonly MethodDataChannelId[];
+  readonly sharedAssumptions: readonly MethodAssumptionId[];
+  readonly explanation: string;
+}
+
+export interface MethodDependenceDiagnostics {
+  readonly connectedComponents: readonly CorrelatedMethodGroupDiagnostic[];
+  /**
+   * Selected evidence-driven methods that have no declared correlation edges
+   * with any other selected evidence-driven method. Their dependence with
+   * other selected methods is classified as `'unknown-not-established'`,
+   * never as verified statistical independence.
+   */
+  readonly unlinkedSelectedEvidenceMethodIds: readonly ScientificMethodId[];
+  readonly pairwiseAssessments: readonly MethodPairDependenceAssessment[];
+  readonly binaryBetaDirichletEquivalence?: BinaryBetaDirichletEquivalenceDiagnostic;
+  /**
+   * Count of connected components among selected evidence-driven methods.
+   * Represents the number of declared correlation clusters, NOT a certified
+   * count of statistically independent evidence sources.
+   */
+  readonly evidenceConnectedComponentCount: number;
+  readonly epistemicIndependencePolicy: 'unknown-until-empirically-or-structurally-audited';
+  readonly summaryWarning: string;
 }
 
 export interface MethodApplicabilityPlan {
@@ -262,6 +352,7 @@ export interface MethodApplicabilityPlan {
   readonly deferredMethodIds: readonly ScientificMethodId[];
   readonly inapplicableMethodIds: readonly ScientificMethodId[];
   readonly correlatedMethodGroups: readonly CorrelatedMethodGroupDiagnostic[];
+  readonly dependenceDiagnostics: MethodDependenceDiagnostics;
   readonly missingDataByMethod: Readonly<Record<string, readonly string[]>>;
   readonly unverifiedAssumptionsByMethod: Readonly<
     Record<string, readonly MethodAssumptionId[]>
@@ -1587,7 +1678,405 @@ function evaluateComputationalGate(
 }
 
 /* -------------------------------------------------------------------------
-   5. Deterministic Registry-Wide Applicability Planner
+   5. Deterministic Correlation Graph & Dependence Diagnostics
+   ------------------------------------------------------------------------- */
+
+const RELATIONSHIP_SOURCE_ORDER: readonly CorrelationRelationshipSource[] = Object.freeze([
+  'shared-correlation-group',
+  'explicit-correlated-method-declaration',
+  'binary-conjugate-simplex-reduction',
+]);
+
+function buildBinaryBetaDirichletEquivalenceDiagnostic(
+  input: MethodApplicabilityPlanningInput,
+): BinaryBetaDirichletEquivalenceDiagnostic {
+  const ev = input.availableEvidence;
+  const hasBinaryCounts =
+    ev.binaryTrialSuccesses !== undefined && ev.binaryTrialFailures !== undefined;
+  const hasMultinomialCounts =
+    Array.isArray(ev.multinomialOutcomeCounts) &&
+    ev.multinomialOutcomeCounts.length === 2;
+
+  let observationAlignment: BinaryBetaDirichletObservationAlignment =
+    'counts-not-simultaneously-observed';
+  let observationsMatchExactly = false;
+
+  if (hasBinaryCounts && hasMultinomialCounts) {
+    const k = ev.binaryTrialSuccesses!;
+    const f = ev.binaryTrialFailures!;
+    const n1 = ev.multinomialOutcomeCounts![0]!;
+    const n2 = ev.multinomialOutcomeCounts![1]!;
+    if (n1 === k && n2 === f) {
+      observationAlignment = 'identical-binary-and-multinomial-counts';
+      observationsMatchExactly = true;
+    } else {
+      observationAlignment = 'permuted-or-divergent-counts';
+      observationsMatchExactly = false;
+    }
+  }
+
+  return Object.freeze({
+    methodPair: Object.freeze([
+      'beta-binomial-conjugate',
+      'dirichlet-multinomial-symmetry',
+    ] as const),
+    outcomeSpaceIsBinary: true,
+    observationAlignment,
+    ...(hasBinaryCounts
+      ? {
+          binaryObservationCounts: Object.freeze([
+            ev.binaryTrialSuccesses!,
+            ev.binaryTrialFailures!,
+          ] as const),
+        }
+      : {}),
+    ...(hasMultinomialCounts
+      ? {
+          multinomialObservationCounts: Object.freeze([
+            ev.multinomialOutcomeCounts![0]!,
+            ev.multinomialOutcomeCounts![1]!,
+          ] as const),
+        }
+      : {}),
+    observationsMatchExactly,
+    predictiveEquivalenceCondition:
+      'On a binary outcome space (K = 2), the two-category Dirichlet(alpha_1, alpha_2)-Multinomial(n_1, n_2) model is algebraically related to the Beta(alpha_0, beta_0)-Binomial(k, n - k) model and yields an equivalent predictive distribution when [n_1, n_2] = [k, n - k] under compatible prior parameters (alpha_1, alpha_2) = (alpha_0, beta_0).',
+    nonIdenticalCaveat:
+      'Do not assume numerical identity when prior hyperparameters, observation counts, or modeling assumptions differ; however, both methods remain structurally dependent and must never be counted as two independent votes.',
+    treatAsIndependentVotes: false,
+  });
+}
+
+function buildDependenceDiagnostics(
+  applicableMethods: readonly MethodEvaluationRecord[],
+  descriptorById: ReadonlyMap<ScientificMethodId, ScientificMethodDescriptor>,
+  input: MethodApplicabilityPlanningInput,
+): MethodDependenceDiagnostics {
+  const m = applicableMethods.length;
+  const adj: number[][] = Array.from({ length: m }, () => []);
+  const edgeByPairKey = new Map<string, CorrelatedMethodPairDiagnostic>();
+  const pairwiseAssessments: MethodPairDependenceAssessment[] = [];
+
+  const applicableIdSet = new Set(applicableMethods.map((r) => r.methodId));
+  const isBinaryOutcomeSpace =
+    input.outcomeSpace.kind === 'binary' &&
+    input.outcomeSpace.outcomeLabels.length === 2;
+  const hasBinaryBetaAndDirichlet =
+    isBinaryOutcomeSpace &&
+    applicableIdSet.has('beta-binomial-conjugate') &&
+    applicableIdSet.has('dirichlet-multinomial-symmetry');
+
+  const binaryBetaDirichletEquivalence = hasBinaryBetaAndDirichlet
+    ? buildBinaryBetaDirichletEquivalenceDiagnostic(input)
+    : undefined;
+
+  for (let i = 0; i < m; i++) {
+    const recA = applicableMethods[i]!;
+    const descA = descriptorById.get(recA.methodId)!;
+    const channelsA = new Set<MethodDataChannelId>([
+      ...descA.dependenceProfile.sharedInformationChannels,
+      ...descA.requiredData.requiredInputChannels,
+    ]);
+    const assumptionsA = new Set<MethodAssumptionId>([
+      ...descA.dependenceProfile.sharedLatentAssumptions,
+      ...descA.requiredAssumptions.map((a) => a.id),
+    ]);
+
+    for (let j = i + 1; j < m; j++) {
+      const recB = applicableMethods[j]!;
+      const descB = descriptorById.get(recB.methodId)!;
+      const channelsB = new Set<MethodDataChannelId>([
+        ...descB.dependenceProfile.sharedInformationChannels,
+        ...descB.requiredData.requiredInputChannels,
+      ]);
+      const assumptionsB = new Set<MethodAssumptionId>([
+        ...descB.dependenceProfile.sharedLatentAssumptions,
+        ...descB.requiredAssumptions.map((a) => a.id),
+      ]);
+
+      const sameGroup =
+        descA.dependenceProfile.correlationGroupId ===
+        descB.dependenceProfile.correlationGroupId;
+      const explicitLink =
+        descA.dependenceProfile.correlatedWithMethodIds.includes(recB.methodId) ||
+        descB.dependenceProfile.correlatedWithMethodIds.includes(recA.methodId);
+      const isBinaryBetaDirichletPair =
+        binaryBetaDirichletEquivalence !== undefined &&
+        ((recA.methodId === 'beta-binomial-conjugate' &&
+          recB.methodId === 'dirichlet-multinomial-symmetry') ||
+          (recA.methodId === 'dirichlet-multinomial-symmetry' &&
+            recB.methodId === 'beta-binomial-conjugate'));
+
+      const relationshipSources: CorrelationRelationshipSource[] = [];
+      if (sameGroup) {
+        relationshipSources.push('shared-correlation-group');
+      }
+      if (explicitLink) {
+        relationshipSources.push('explicit-correlated-method-declaration');
+      }
+      if (isBinaryBetaDirichletPair) {
+        relationshipSources.push('binary-conjugate-simplex-reduction');
+      }
+      const frozenSources = Object.freeze(relationshipSources);
+
+      const intersectingChannels = [...channelsA].filter((ch) =>
+        channelsB.has(ch),
+      );
+      const intersectingAssumptions = [...assumptionsA].filter((a) =>
+        assumptionsB.has(a),
+      );
+
+      if (frozenSources.length > 0) {
+        adj[i]!.push(j);
+        adj[j]!.push(i);
+
+        const pairSharedChannels = Object.freeze(
+          intersectingChannels.length > 0
+            ? intersectingChannels
+            : Array.from(
+                new Set<MethodDataChannelId>([
+                  ...descA.dependenceProfile.sharedInformationChannels,
+                  ...descB.dependenceProfile.sharedInformationChannels,
+                ]),
+              ),
+        );
+        const pairSharedAssumptions = Object.freeze(
+          intersectingAssumptions.length > 0
+            ? intersectingAssumptions
+            : Array.from(
+                new Set<MethodAssumptionId>([
+                  ...descA.dependenceProfile.sharedLatentAssumptions,
+                  ...descB.dependenceProfile.sharedLatentAssumptions,
+                ]),
+              ),
+        );
+        const pairGroupIds = Object.freeze(
+          Array.from(
+            new Set([
+              descA.dependenceProfile.correlationGroupId,
+              descB.dependenceProfile.correlationGroupId,
+            ]),
+          ),
+        );
+
+        const explanation = isBinaryBetaDirichletPair
+          ? `Methods '${recA.methodId}' and '${recB.methodId}' are linked via [${frozenSources.join(', ')}] on a binary outcome space (K = 2; observationAlignment = '${binaryBetaDirichletEquivalence.observationAlignment}', observationsMatchExactly = ${String(binaryBetaDirichletEquivalence.observationsMatchExactly)}); they must never be treated as two independent votes.`
+          : `Methods '${recA.methodId}' and '${recB.methodId}' are linked via [${frozenSources.join(', ')}] (correlationGroupIds: [${pairGroupIds.join(', ')}], sharedInformationChannels: [${pairSharedChannels.join(', ')}]).`;
+
+        const pairDiag: CorrelatedMethodPairDiagnostic = Object.freeze({
+          methodPair: Object.freeze([recA.methodId, recB.methodId] as const),
+          relationshipSources: frozenSources,
+          correlationGroupIds: pairGroupIds,
+          sharedInformationChannels: pairSharedChannels,
+          sharedAssumptions: pairSharedAssumptions,
+          ...(isBinaryBetaDirichletPair
+            ? { binaryBetaDirichletEquivalence }
+            : {}),
+          explanation,
+        });
+        edgeByPairKey.set(`${i}:${j}`, pairDiag);
+
+        pairwiseAssessments.push(
+          Object.freeze({
+            methodPair: Object.freeze([recA.methodId, recB.methodId] as const),
+            classification: isBinaryBetaDirichletPair
+              ? 'binary-conjugate-simplex-equivalence-candidate'
+              : 'declared-correlated',
+            inferredStatisticallyIndependent: false,
+            canCountAsIndependentVotes: false,
+            relationshipSources: frozenSources,
+            sharedInformationChannels: pairSharedChannels,
+            sharedAssumptions: pairSharedAssumptions,
+            explanation,
+          }),
+        );
+      } else if (
+        recA.role === 'structural-symmetry-baseline' ||
+        recB.role === 'structural-symmetry-baseline'
+      ) {
+        pairwiseAssessments.push(
+          Object.freeze({
+            methodPair: Object.freeze([recA.methodId, recB.methodId] as const),
+            classification: 'structural-baseline-non-evidential',
+            inferredStatisticallyIndependent: false,
+            canCountAsIndependentVotes: false,
+            relationshipSources: Object.freeze([]),
+            sharedInformationChannels: Object.freeze(intersectingChannels),
+            sharedAssumptions: Object.freeze(intersectingAssumptions),
+            explanation: `One of ['${recA.methodId}', '${recB.methodId}'] is a non-evidential structural symmetry baseline (effectiveSampleSize = 0) and does not represent an independent empirical forecast.`,
+          }),
+        );
+      } else {
+        pairwiseAssessments.push(
+          Object.freeze({
+            methodPair: Object.freeze([recA.methodId, recB.methodId] as const),
+            classification: 'unknown-not-established',
+            inferredStatisticallyIndependent: false,
+            canCountAsIndependentVotes: false,
+            relationshipSources: Object.freeze([]),
+            sharedInformationChannels: Object.freeze(intersectingChannels),
+            sharedAssumptions: Object.freeze(intersectingAssumptions),
+            explanation: `Statistical dependence between '${recA.methodId}' (${descA.dependenceProfile.correlationGroupId}) and '${recB.methodId}' (${descB.dependenceProfile.correlationGroupId}) cannot be established from declared registry metadata alone and is classified as unknown rather than statistically independent.`,
+          }),
+        );
+      }
+    }
+  }
+
+  // Deterministic connected components over 0 .. m - 1:
+  const visited = new Array<boolean>(m).fill(false);
+  const connectedComponents: CorrelatedMethodGroupDiagnostic[] = [];
+  const unlinkedSelectedEvidenceMethodIds: ScientificMethodId[] = [];
+  let evidenceConnectedComponentCount = 0;
+
+  for (let start = 0; start < m; start++) {
+    if (visited[start]) continue;
+    const queue: number[] = [start];
+    visited[start] = true;
+    const compIndices: number[] = [];
+
+    while (queue.length > 0) {
+      const curr = queue.shift()!;
+      compIndices.push(curr);
+      for (const next of adj[curr]!) {
+        if (!visited[next]) {
+          visited[next] = true;
+          queue.push(next);
+        }
+      }
+    }
+
+    compIndices.sort((a, b) => a - b);
+    const compRecords = compIndices.map((idx) => applicableMethods[idx]!);
+    const hasEvidenceDrivenMember = compRecords.some(
+      (r) => r.role === 'evidence-driven-model',
+    );
+    if (hasEvidenceDrivenMember) {
+      evidenceConnectedComponentCount += 1;
+    }
+
+    if (compIndices.length === 1) {
+      const singleRec = compRecords[0]!;
+      if (singleRec.role === 'evidence-driven-model') {
+        unlinkedSelectedEvidenceMethodIds.push(singleRec.methodId);
+      }
+      continue;
+    }
+
+    const compMethodIds = Object.freeze(compRecords.map((r) => r.methodId));
+    const compGroupIds = Object.freeze(
+      Array.from(new Set(compRecords.map((r) => r.correlationGroupId))),
+    );
+    const primaryGroupId = compGroupIds[0]!;
+
+    const compPairs: CorrelatedMethodPairDiagnostic[] = [];
+    const compSourceSet = new Set<CorrelationRelationshipSource>();
+    for (let aIdx = 0; aIdx < compIndices.length; aIdx++) {
+      for (let bIdx = aIdx + 1; bIdx < compIndices.length; bIdx++) {
+        const u = compIndices[aIdx]!;
+        const v = compIndices[bIdx]!;
+        const pairDiag = edgeByPairKey.get(`${u}:${v}`);
+        if (pairDiag !== undefined) {
+          compPairs.push(pairDiag);
+          for (const src of pairDiag.relationshipSources) {
+            compSourceSet.add(src);
+          }
+        }
+      }
+    }
+
+    const orderedRelationshipSources = Object.freeze(
+      RELATIONSHIP_SOURCE_ORDER.filter((src) => compSourceSet.has(src)),
+    );
+
+    const sharedChannelsSet = new Set<MethodDataChannelId>();
+    const sharedAssumptionsSet = new Set<MethodAssumptionId>();
+    const requiredAssumptionCounts = new Map<MethodAssumptionId, number>();
+
+    for (const r of compRecords) {
+      const desc = descriptorById.get(r.methodId)!;
+      for (const ch of desc.dependenceProfile.sharedInformationChannels) {
+        sharedChannelsSet.add(ch);
+      }
+      for (const a of desc.dependenceProfile.sharedLatentAssumptions) {
+        sharedAssumptionsSet.add(a);
+      }
+      for (const reqA of desc.requiredAssumptions) {
+        requiredAssumptionCounts.set(
+          reqA.id,
+          (requiredAssumptionCounts.get(reqA.id) ?? 0) + 1,
+        );
+      }
+    }
+
+    const commonRequiredAssumptions: MethodAssumptionId[] = [];
+    for (const [assumptionId, count] of requiredAssumptionCounts.entries()) {
+      if (count >= 2) {
+        commonRequiredAssumptions.push(assumptionId);
+        sharedAssumptionsSet.add(assumptionId);
+      }
+    }
+
+    const compHasBinaryBetaDirichlet =
+      binaryBetaDirichletEquivalence !== undefined &&
+      compMethodIds.includes('beta-binomial-conjugate') &&
+      compMethodIds.includes('dirichlet-multinomial-symmetry');
+
+    const warningParts: string[] = [
+      `Methods [${compMethodIds.join(', ')}] form a connected dependence component across correlation group(s) [${compGroupIds.join(', ')}] via [${orderedRelationshipSources.join(', ')}], sharing information channels [${[...sharedChannelsSet].join(', ')}] and assumptions [${[...sharedAssumptionsSet].join(', ')}].`,
+    ];
+    if (compHasBinaryBetaDirichlet) {
+      warningParts.push(
+        `On this binary outcome space (K = 2), 'beta-binomial-conjugate' and 'dirichlet-multinomial-symmetry' are algebraically related (observationAlignment: '${binaryBetaDirichletEquivalence.observationAlignment}', observationsMatchExactly: ${String(binaryBetaDirichletEquivalence.observationsMatchExactly)}) and must never be counted as two independent votes.`,
+      );
+    } else {
+      warningParts.push(
+        'Downstream synthesis must account for their statistical dependence and must not treat them as independent votes.',
+      );
+    }
+
+    connectedComponents.push(
+      Object.freeze({
+        correlationGroupId: primaryGroupId,
+        correlationGroupIds: compGroupIds,
+        applicableMethodIds: compMethodIds,
+        relationshipSources: orderedRelationshipSources,
+        pairwiseRelationships: Object.freeze(compPairs),
+        sharedInformationChannels: Object.freeze([...sharedChannelsSet]),
+        sharedAssumptions: Object.freeze([...sharedAssumptionsSet]),
+        commonRequiredAssumptions: Object.freeze(commonRequiredAssumptions),
+        ...(compHasBinaryBetaDirichlet
+          ? { binaryBetaDirichletEquivalence }
+          : {}),
+        treatAsIndependentVotes: false,
+        warning: warningParts.join(' '),
+      }),
+    );
+  }
+
+  const summaryWarning =
+    connectedComponents.length > 0
+      ? `Detected ${connectedComponents.length} correlated method component(s) among selected methods; cross-component pairs with no declared correlation edge remain classified as 'unknown-not-established' rather than statistically independent.`
+      : `No multi-method declared correlation components among selected methods; any pair of selected evidence-driven methods without a declared correlation edge is classified as 'unknown-not-established' rather than statistically independent.`;
+
+  return Object.freeze({
+    connectedComponents: Object.freeze(connectedComponents),
+    unlinkedSelectedEvidenceMethodIds: Object.freeze(
+      unlinkedSelectedEvidenceMethodIds,
+    ),
+    pairwiseAssessments: Object.freeze(pairwiseAssessments),
+    ...(binaryBetaDirichletEquivalence !== undefined
+      ? { binaryBetaDirichletEquivalence }
+      : {}),
+    evidenceConnectedComponentCount,
+    epistemicIndependencePolicy:
+      'unknown-until-empirically-or-structurally-audited',
+    summaryWarning,
+  });
+}
+
+/* -------------------------------------------------------------------------
+   6. Deterministic Registry-Wide Applicability Planner
    ------------------------------------------------------------------------- */
 
 /**
@@ -1619,6 +2108,43 @@ export function planMethodApplicability(
   const allDescriptors = registry.listAll();
   if (!Array.isArray(allDescriptors) || allDescriptors.length === 0) {
     throw new RangeError('ScientificMethodRegistry contains zero registered methods');
+  }
+
+  const descriptorById = new Map<ScientificMethodId, ScientificMethodDescriptor>();
+  for (const desc of allDescriptors) {
+    if (descriptorById.has(desc.methodId)) {
+      throw new RangeError(
+        `Registry contains duplicate methodId '${desc.methodId}'`,
+      );
+    }
+    descriptorById.set(desc.methodId, desc);
+  }
+  for (const desc of allDescriptors) {
+    const seenCorr = new Set<string>();
+    for (const corrId of desc.dependenceProfile.correlatedWithMethodIds) {
+      if (corrId === desc.methodId) {
+        throw new RangeError(
+          `Descriptor '${desc.methodId}' contains self-reference in correlatedWithMethodIds`,
+        );
+      }
+      if (seenCorr.has(corrId)) {
+        throw new RangeError(
+          `Descriptor '${desc.methodId}' contains duplicate '${corrId}' in correlatedWithMethodIds`,
+        );
+      }
+      seenCorr.add(corrId);
+      const peer = descriptorById.get(corrId);
+      if (!peer) {
+        throw new RangeError(
+          `Descriptor '${desc.methodId}' references unknown correlatedWithMethodId '${corrId}'`,
+        );
+      }
+      if (!peer.dependenceProfile.correlatedWithMethodIds.includes(desc.methodId)) {
+        throw new RangeError(
+          `Asymmetric correlation relationship: '${desc.methodId}' declares '${corrId}' in correlatedWithMethodIds, but '${corrId}' does not declare '${desc.methodId}'`,
+        );
+      }
+    }
   }
 
   const evaluatedMethods: MethodEvaluationRecord[] = [];
@@ -1776,34 +2302,13 @@ export function planMethodApplicability(
     }
   }
 
-  // Identify correlated method groups among applicable methods (Principle E):
-  const byCorrelationGroup = new Map<string, MethodEvaluationRecord[]>();
-  for (const rec of applicableMethods) {
-    const list = byCorrelationGroup.get(rec.correlationGroupId) ?? [];
-    list.push(rec);
-    byCorrelationGroup.set(rec.correlationGroupId, list);
-  }
-
-  const correlatedMethodGroups: CorrelatedMethodGroupDiagnostic[] = [];
-  for (const [groupId, records] of byCorrelationGroup.entries()) {
-    if (records.length >= 2) {
-      const sharedChannelsSet = new Set<MethodDataChannelId>();
-      for (const r of records) {
-        const desc = registry.getOrThrow(r.methodId);
-        for (const ch of desc.dependenceProfile.sharedInformationChannels) {
-          sharedChannelsSet.add(ch);
-        }
-      }
-      correlatedMethodGroups.push(
-        Object.freeze({
-          correlationGroupId: groupId,
-          applicableMethodIds: Object.freeze(records.map((r) => r.methodId)),
-          sharedInformationChannels: Object.freeze([...sharedChannelsSet]),
-          warning: `Methods [${records.map((r) => r.methodId).join(', ')}] belong to correlation group '${groupId}' and share information channels [${[...sharedChannelsSet].join(', ')}]; downstream synthesis must account for their statistical dependence.`,
-        }),
-      );
-    }
-  }
+  // Build deterministic correlation graph and dependence diagnostics (Principle E):
+  const dependenceDiagnostics = buildDependenceDiagnostics(
+    applicableMethods,
+    descriptorById,
+    input,
+  );
+  const correlatedMethodGroups = dependenceDiagnostics.connectedComponents;
 
   const plan: MethodApplicabilityPlan = {
     registryVersion: registry.version,
@@ -1827,7 +2332,8 @@ export function planMethodApplicability(
     structuralBaselineMethodIds: Object.freeze(structuralBaselineMethodIds),
     deferredMethodIds: Object.freeze(deferredMethodIds),
     inapplicableMethodIds: Object.freeze(inapplicableMethodIds),
-    correlatedMethodGroups: Object.freeze(correlatedMethodGroups),
+    correlatedMethodGroups,
+    dependenceDiagnostics,
     missingDataByMethod: Object.freeze(missingDataByMethod),
     unverifiedAssumptionsByMethod: Object.freeze(unverifiedAssumptionsByMethod),
     discardedMethodResults: Object.freeze(discardedMethodResults),

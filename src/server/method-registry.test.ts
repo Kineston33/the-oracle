@@ -202,11 +202,46 @@ describe('Stage 2A-2.1 — Scientific Method Registry (src/server/method-registr
         correlatedWithMethodIds: ['poisson-gamma-hazard'],
       },
     });
+    const reciprocalBaseDesc: ScientificMethodDescriptor =
+      validateScientificMethodDescriptor({
+        ...baseDesc,
+        dependenceProfile: {
+          ...baseDesc.dependenceProfile,
+          correlatedWithMethodIds: ['custom:bounded-poisson-window'],
+        },
+      });
     expect(validCustom.methodId).toBe('custom:bounded-poisson-window');
     expect(validCustom.horizonConstraints.constrained).toBe(true);
 
-    const customRegistry = createScientificMethodRegistry([baseDesc, validCustom]);
+    const customRegistry = createScientificMethodRegistry([
+      reciprocalBaseDesc,
+      validCustom,
+    ]);
     expect(customRegistry.size).toBe(2);
+
+    // Verify all core methods have symmetric reciprocal correlatedWithMethodIds,
+    // including beta-binomial-conjugate <-> dirichlet-multinomial-symmetry:
+    const betaDesc = DEFAULT_SCIENTIFIC_METHOD_REGISTRY.getOrThrow(
+      'beta-binomial-conjugate',
+    );
+    const dirichletDesc = DEFAULT_SCIENTIFIC_METHOD_REGISTRY.getOrThrow(
+      'dirichlet-multinomial-symmetry',
+    );
+    expect(betaDesc.dependenceProfile.correlatedWithMethodIds).toEqual([
+      'weighted-kish-effective-binomial',
+      'dirichlet-multinomial-symmetry',
+    ]);
+    expect(dirichletDesc.dependenceProfile.correlatedWithMethodIds).toEqual([
+      'beta-binomial-conjugate',
+    ]);
+    for (const d of DEFAULT_SCIENTIFIC_METHOD_REGISTRY.listAll()) {
+      for (const peerId of d.dependenceProfile.correlatedWithMethodIds) {
+        const peer = DEFAULT_SCIENTIFIC_METHOD_REGISTRY.getOrThrow(peerId);
+        expect(peer.dependenceProfile.correlatedWithMethodIds).toContain(
+          d.methodId,
+        );
+      }
+    }
 
     // 1. Rejects false claim that an unimplemented method has an executable implementation
     expect(() =>
@@ -280,13 +315,25 @@ describe('Stage 2A-2.1 — Scientific Method Registry (src/server/method-registr
       }),
     ).toThrow(RangeError);
 
-    // 5. Rejects self-reference or unknown method ID in correlatedWithMethodIds
+    // 5. Rejects self-reference, duplicate entries, missing references, and asymmetric declarations in correlatedWithMethodIds
     expect(() =>
       validateScientificMethodDescriptor({
         ...baseDesc,
         dependenceProfile: {
           ...baseDesc.dependenceProfile,
           correlatedWithMethodIds: ['poisson-gamma-hazard'],
+        },
+      }),
+    ).toThrow(RangeError);
+    expect(() =>
+      validateScientificMethodDescriptor({
+        ...baseDesc,
+        dependenceProfile: {
+          ...baseDesc.dependenceProfile,
+          correlatedWithMethodIds: [
+            'beta-binomial-conjugate',
+            'beta-binomial-conjugate',
+          ],
         },
       }),
     ).toThrow(RangeError);
@@ -300,6 +347,21 @@ describe('Stage 2A-2.1 — Scientific Method Registry (src/server/method-registr
           },
         },
       ]),
+    ).toThrow(RangeError);
+    // Asymmetric declaration: validCustom references baseDesc, but baseDesc does NOT reference validCustom
+    expect(() =>
+      createScientificMethodRegistry([baseDesc, validCustom]),
+    ).toThrow(RangeError);
+    // Asymmetric declaration in reverse direction: reciprocalBaseDesc references validCustom, but unlinkedCustom does not
+    const unlinkedCustom = validateScientificMethodDescriptor({
+      ...validCustom,
+      dependenceProfile: {
+        ...validCustom.dependenceProfile,
+        correlatedWithMethodIds: [],
+      },
+    });
+    expect(() =>
+      createScientificMethodRegistry([reciprocalBaseDesc, unlinkedCustom]),
     ).toThrow(RangeError);
 
     // 6. Validates subdomain identifiers and rejects empty, arbitrary, or contradictory wildcard subdomain declarations

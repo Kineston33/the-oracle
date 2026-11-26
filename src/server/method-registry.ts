@@ -13,13 +13,18 @@
  *      implemented. All seven core descriptors in Stage 2A-2.1 explicitly
  *      declare `hasExecutableImplementation: false` and
  *      `implementationStatus: 'registered-specification-only'`.
- *   2. Deep immutability: the default registry and any custom registry
- *      constructed via `createScientificMethodRegistry` are recursively
- *      frozen (`Object.freeze`) and reject duplicate method identifiers.
+ *   2. Deep immutability & strict validation: the default registry and any
+ *      custom registry constructed via `createScientificMethodRegistry` are
+ *      recursively frozen (`Object.freeze`) and reject duplicate method
+ *      identifiers, self-referential or duplicate `correlatedWithMethodIds`
+ *      entries, dangling references to unregistered methods, and asymmetric
+ *      (non-reciprocal) `correlatedWithMethodIds` declarations.
  *   3. Dependence transparency: every method declares its `correlationGroupId`,
- *      shared information channels, and correlated sibling methods so
- *      downstream stages never mistake multiple method IDs for independent
- *      empirical evidence.
+ *      `sharedInformationChannels`, `sharedLatentAssumptions`, and reciprocal
+ *      `correlatedWithMethodIds` links so downstream stages never mistake
+ *      correlated or algebraically related methods (such as binary
+ *      `beta-binomial-conjugate` and 2-category `dirichlet-multinomial-symmetry`)
+ *      for independent empirical evidence.
  *   4. No artificial horizon cutoffs: horizon constraints are declared only
  *      where mathematically required by the underlying stochastic process
  *      (such as positive time-exposure scaling for continuous-time hazard and
@@ -1159,14 +1164,17 @@ const CORE_METHOD_DESCRIPTORS_RAW: readonly ScientificMethodDescriptor[] = [
     ],
     dependenceProfile: {
       correlationGroupId: 'bernoulli-frequency-family',
-      sharedInformationChannels: ['binary-trial-counts'],
+      sharedInformationChannels: ['binary-trial-counts', 'multinomial-category-counts'],
       sharedLatentAssumptions: [
         'exchangeable-bernoulli-trials',
         'stationary-success-probability',
       ],
-      correlatedWithMethodIds: ['weighted-kish-effective-binomial'],
+      correlatedWithMethodIds: [
+        'weighted-kish-effective-binomial',
+        'dirichlet-multinomial-symmetry',
+      ],
       independenceWarning:
-        'Shares the historical binary reference class with weighted-kish-effective-binomial; ensemble synthesis must down-weight their joint contribution to avoid double-counting the same trial evidence.',
+        'Shares the historical binary reference class with weighted-kish-effective-binomial and is algebraically related on binary outcome spaces (K = 2) to dirichlet-multinomial-symmetry; downstream synthesis must never treat these methods as independent votes.',
     },
     hasExecutableImplementation: false,
     implementationStatus: 'registered-specification-only',
@@ -1473,14 +1481,14 @@ const CORE_METHOD_DESCRIPTORS_RAW: readonly ScientificMethodDescriptor[] = [
     ],
     dependenceProfile: {
       correlationGroupId: 'dirichlet-categorical-family',
-      sharedInformationChannels: ['multinomial-category-counts'],
+      sharedInformationChannels: ['multinomial-category-counts', 'binary-trial-counts'],
       sharedLatentAssumptions: [
         'exchangeable-multinomial-trials',
         'exhaustive-mutually-exclusive-categories',
       ],
-      correlatedWithMethodIds: [],
+      correlatedWithMethodIds: ['beta-binomial-conjugate'],
       independenceWarning:
-        'For K = 2, Dirichlet-Multinomial reduces mathematically to Beta-Binomial; if both are applicable on identical binary counts, they represent the same conjugate information.',
+        'For binary outcome spaces (K = 2), the 2-category Dirichlet-Multinomial model is mathematically related to Beta-Binomial and may produce equivalent predictive distributions when observing identical binary counts under compatible priors; never treat both as independent votes.',
     },
     hasExecutableImplementation: false,
     implementationStatus: 'registered-specification-only',
@@ -1831,8 +1839,17 @@ const CORE_METHOD_DESCRIPTORS_RAW: readonly ScientificMethodDescriptor[] = [
 
 /**
  * Constructs a validated, deeply immutable `ScientificMethodRegistry` from an
- * ordered list of method descriptors. Rejects empty registries, invalid
- * descriptors, duplicate method IDs, or asymmetric/dangling correlation links.
+ * ordered list of method descriptors.
+ *
+ * Validates every descriptor via `validateScientificMethodDescriptor` and
+ * enforces registry-wide integrity:
+ *   1. Non-empty descriptor list.
+ *   2. Unique `methodId` across all descriptors (rejects duplicates).
+ *   3. Referential integrity of `dependenceProfile.correlatedWithMethodIds`
+ *      (every referenced method must exist in the registry).
+ *   4. Reciprocal symmetry of `dependenceProfile.correlatedWithMethodIds`
+ *      (if method A lists method B, method B must also list method A;
+ *      asymmetric declarations are rejected without silent repair).
  */
 export function createScientificMethodRegistry(
   descriptors: readonly unknown[],
@@ -1860,11 +1877,18 @@ export function createScientificMethodRegistry(
   }
 
   // Verify that all referenced correlatedWithMethodIds exist in the registry
+  // and that every declared correlation link is reciprocal (symmetric):
   for (const desc of orderedDescriptors) {
     for (const corrId of desc.dependenceProfile.correlatedWithMethodIds) {
-      if (!byId.has(corrId)) {
+      const peer = byId.get(corrId);
+      if (!peer) {
         throw new RangeError(
           `Descriptor '${desc.methodId}' references unknown correlatedWithMethodId '${corrId}'`,
+        );
+      }
+      if (!peer.dependenceProfile.correlatedWithMethodIds.includes(desc.methodId)) {
+        throw new RangeError(
+          `Asymmetric correlation relationship: '${desc.methodId}' declares correlatedWithMethodIds containing '${corrId}', but '${corrId}' does not declare '${desc.methodId}' in correlatedWithMethodIds`,
         );
       }
     }
