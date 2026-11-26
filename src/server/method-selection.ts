@@ -41,6 +41,9 @@ import {
   METHOD_ASSUMPTION_IDS,
   METHOD_DATA_CHANNEL_IDS,
   PREDICTION_CATEGORIES,
+  UNIVERSAL_SUBDOMAIN_TOKEN,
+  hasUniversalSubdomainApplicability,
+  isValidSubdomainIdentifier,
   type ComputationalCostTier,
   type MethodAssumptionId,
   type MethodDataChannelId,
@@ -161,7 +164,10 @@ export type MethodApplicabilityDisposition =
 
 export type MethodSelectionReasonCode =
   | 'DOMAIN_COMPATIBLE'
+  | 'DOMAIN_COMPATIBLE_WITH_CAVEATS'
   | 'DOMAIN_CATEGORY_INCOMPATIBLE'
+  | 'DOMAIN_SUBDOMAIN_INCOMPATIBLE'
+  | 'DOMAIN_SUBDOMAIN_MISSING_DEFERRED'
   | 'STRUCTURAL_BASELINE_DISALLOWED'
   | 'OUTCOME_SPACE_COMPATIBLE'
   | 'OUTCOME_SPACE_KIND_INCOMPATIBLE'
@@ -406,10 +412,15 @@ export function validateMethodApplicabilityPlanningInput(
     );
   }
 
-  const subdomain =
-    value.subdomain !== undefined
-      ? assertStrictTrimmedString(value.subdomain, 'subdomain')
-      : undefined;
+  let subdomain: string | undefined;
+  if (value.subdomain !== undefined) {
+    subdomain = assertStrictTrimmedString(value.subdomain, 'subdomain');
+    if (!isValidSubdomainIdentifier(subdomain)) {
+      throw new RangeError(
+        `subdomain ('${subdomain}') must be a canonical kebab-case subdomain identifier; wildcard or pseudo-wildcard strings are forbidden on planning inputs`,
+      );
+    }
+  }
 
   // Reject untrimmed outcome labels or eventDefinitionHash instead of silently normalizing
   if (!isPlainObject(value.outcomeSpace)) {
@@ -933,34 +944,141 @@ export function validateMethodApplicabilityPlanningInput(
 function evaluateDomainGate(
   descriptor: ScientificMethodDescriptor,
   input: MethodApplicabilityPlanningInput,
-): MethodGateEvaluation {
+): {
+  readonly gate: MethodGateEvaluation;
+  readonly missingDomainRequirements: readonly string[];
+  readonly limitationNotes: readonly string[];
+} {
   if (
     descriptor.role === 'structural-symmetry-baseline' &&
     input.assumptions.allowStructuralBaseline === false
   ) {
-    return Object.freeze({
-      gateId: 'domain-compatibility',
-      status: 'failed',
-      reasonCode: 'STRUCTURAL_BASELINE_DISALLOWED',
-      explanation: `Method '${descriptor.methodId}' is a non-evidential structural baseline and allowStructuralBaseline is false.`,
-    });
+    return {
+      gate: Object.freeze({
+        gateId: 'domain-compatibility',
+        status: 'failed',
+        reasonCode: 'STRUCTURAL_BASELINE_DISALLOWED',
+        explanation: `Method '${descriptor.methodId}' is a non-evidential structural baseline and allowStructuralBaseline is false.`,
+      }),
+      missingDomainRequirements: Object.freeze([]),
+      limitationNotes: Object.freeze([]),
+    };
   }
 
   if (!descriptor.domain.applicableCategories.includes(input.questionCategory)) {
-    return Object.freeze({
-      gateId: 'domain-compatibility',
-      status: 'failed',
-      reasonCode: 'DOMAIN_CATEGORY_INCOMPATIBLE',
-      explanation: `Question category '${input.questionCategory}' is outside '${descriptor.methodId}' applicable categories [${descriptor.domain.applicableCategories.join(', ')}].`,
-    });
+    return {
+      gate: Object.freeze({
+        gateId: 'domain-compatibility',
+        status: 'failed',
+        reasonCode: 'DOMAIN_CATEGORY_INCOMPATIBLE',
+        explanation: `Question category '${input.questionCategory}' is outside '${descriptor.methodId}' applicable categories [${descriptor.domain.applicableCategories.join(', ')}].`,
+      }),
+      missingDomainRequirements: Object.freeze([]),
+      limitationNotes: Object.freeze([]),
+    };
   }
 
-  return Object.freeze({
-    gateId: 'domain-compatibility',
-    status: 'passed',
-    reasonCode: 'DOMAIN_COMPATIBLE',
-    explanation: `Question category '${input.questionCategory}' is compatible with '${descriptor.methodId}' (${descriptor.domain.mathematicalParadigm}).`,
-  });
+  // Defensive validation of descriptor subdomain metadata (never infer universal
+  // applicability from an empty array or arbitrary strings):
+  if (
+    !Array.isArray(descriptor.domain.applicableSubdomains) ||
+    descriptor.domain.applicableSubdomains.length === 0
+  ) {
+    throw new RangeError(
+      `Descriptor '${descriptor.methodId}' has an empty or invalid domain.applicableSubdomains; universal subdomain applicability is never inferred from an empty array`,
+    );
+  }
+  if (
+    descriptor.domain.universalSubdomainApplicability !== undefined &&
+    typeof descriptor.domain.universalSubdomainApplicability !== 'boolean'
+  ) {
+    throw new RangeError(
+      `Descriptor '${descriptor.methodId}' has non-boolean domain.universalSubdomainApplicability`,
+    );
+  }
+  if (
+    descriptor.domain.universalSubdomainApplicability === false &&
+    descriptor.domain.applicableSubdomains.includes(UNIVERSAL_SUBDOMAIN_TOKEN)
+  ) {
+    throw new RangeError(
+      `Descriptor '${descriptor.methodId}' has contradictory domain declaration: universalSubdomainApplicability is false, but applicableSubdomains includes '${UNIVERSAL_SUBDOMAIN_TOKEN}'`,
+    );
+  }
+  for (const sub of descriptor.domain.applicableSubdomains) {
+    if (sub !== UNIVERSAL_SUBDOMAIN_TOKEN && !isValidSubdomainIdentifier(sub)) {
+      throw new RangeError(
+        `Descriptor '${descriptor.methodId}' contains invalid or pseudo-wildcard subdomain '${String(sub)}' in domain.applicableSubdomains`,
+      );
+    }
+  }
+
+  const isUniversalSubdomain = hasUniversalSubdomainApplicability(descriptor.domain);
+  const declaredNamedSubdomains = descriptor.domain.applicableSubdomains.filter(
+    (sub) => sub !== UNIVERSAL_SUBDOMAIN_TOKEN,
+  );
+
+  if (input.subdomain !== undefined) {
+    const matchesNamedSubdomain = declaredNamedSubdomains.includes(input.subdomain);
+    if (!matchesNamedSubdomain && !isUniversalSubdomain) {
+      return {
+        gate: Object.freeze({
+          gateId: 'domain-compatibility',
+          status: 'failed',
+          reasonCode: 'DOMAIN_SUBDOMAIN_INCOMPATIBLE',
+          explanation: `Question subdomain '${input.subdomain}' is outside '${descriptor.methodId}' declared applicable subdomains [${declaredNamedSubdomains.join(', ')}].`,
+        }),
+        missingDomainRequirements: Object.freeze([]),
+        limitationNotes: Object.freeze([]),
+      };
+    }
+  } else if (!isUniversalSubdomain) {
+    const missingSubdomainRequirement = `Question subdomain is missing; method '${descriptor.methodId}' requires an explicit subdomain matching one of [${declaredNamedSubdomains.join(', ')}]`;
+    return {
+      gate: Object.freeze({
+        gateId: 'domain-compatibility',
+        status: 'deferred',
+        reasonCode: 'DOMAIN_SUBDOMAIN_MISSING_DEFERRED',
+        explanation: `Method '${descriptor.methodId}' is deferred because question lacks sufficient domain specificity: ${missingSubdomainRequirement}.`,
+      }),
+      missingDomainRequirements: Object.freeze([missingSubdomainRequirement]),
+      limitationNotes: Object.freeze([]),
+    };
+  }
+
+  const subdomainMatchDescription =
+    input.subdomain !== undefined
+      ? declaredNamedSubdomains.includes(input.subdomain)
+        ? `subdomain '${input.subdomain}'`
+        : `subdomain '${input.subdomain}' via explicit universal subdomain scope ('${UNIVERSAL_SUBDOMAIN_TOKEN}')`
+      : `explicit universal subdomain scope ('${UNIVERSAL_SUBDOMAIN_TOKEN}')`;
+
+  const domainConstraints = input.assumptions.knownDomainConstraints ?? [];
+  if (domainConstraints.length > 0) {
+    const limitationNotes = Object.freeze(
+      domainConstraints.map((c) => `Domain constraint caveat: ${c}`),
+    );
+    return {
+      gate: Object.freeze({
+        gateId: 'domain-compatibility',
+        status: 'passed-with-limitations',
+        reasonCode: 'DOMAIN_COMPATIBLE_WITH_CAVEATS',
+        explanation: `Question category '${input.questionCategory}' and ${subdomainMatchDescription} are compatible with '${descriptor.methodId}' (${descriptor.domain.mathematicalParadigm}), subject to documented domain caveat(s): ${domainConstraints.join('; ')}.`,
+      }),
+      missingDomainRequirements: Object.freeze([]),
+      limitationNotes,
+    };
+  }
+
+  return {
+    gate: Object.freeze({
+      gateId: 'domain-compatibility',
+      status: 'passed',
+      reasonCode: 'DOMAIN_COMPATIBLE',
+      explanation: `Question category '${input.questionCategory}' and ${subdomainMatchDescription} are compatible with '${descriptor.methodId}' (${descriptor.domain.mathematicalParadigm}).`,
+    }),
+    missingDomainRequirements: Object.freeze([]),
+    limitationNotes: Object.freeze([]),
+  };
 }
 
 function evaluateOutcomeSpaceGate(
@@ -1265,23 +1383,21 @@ function evaluateRequiredDataGate(
   }
 
   // Quantitative sample size & exposure checks once channels are present:
+  const reqChannels = descriptor.requiredData.requiredInputChannels;
   let observedSampleSize = 0;
-  if (descriptor.methodId === 'beta-binomial-conjugate') {
+  if (reqChannels.includes('weighted-binary-trials')) {
+    observedSampleSize = ev.weightedSampleSize ?? 0;
+  } else if (reqChannels.includes('binary-trial-counts')) {
     observedSampleSize =
       (ev.binaryTrialSuccesses ?? 0) + (ev.binaryTrialFailures ?? 0);
-  } else if (descriptor.methodId === 'weighted-kish-effective-binomial') {
-    observedSampleSize = ev.weightedSampleSize ?? 0;
-  } else if (descriptor.methodId === 'poisson-gamma-hazard') {
+  } else if (reqChannels.includes('poisson-event-counts')) {
     observedSampleSize = ev.poissonEventCount ?? 0;
-  } else if (descriptor.methodId === 'dirichlet-multinomial-symmetry') {
+  } else if (reqChannels.includes('multinomial-category-counts')) {
     observedSampleSize = (ev.multinomialOutcomeCounts ?? []).reduce(
       (acc, v) => acc + v,
       0,
     );
-  } else if (
-    descriptor.methodId === 'student-t-terminal-diffusion' ||
-    descriptor.methodId === 'first-passage-barrier-diffusion'
-  ) {
+  } else if (reqChannels.includes('continuous-state-trajectory')) {
     observedSampleSize = ev.continuousTrajectoryObservations ?? 0;
   }
 
@@ -1525,7 +1641,7 @@ export function planMethodApplicability(
   const discardedMethodResults: MethodApplicabilityResult[] = [];
 
   for (const descriptor of allDescriptors) {
-    const domainGate = evaluateDomainGate(descriptor, input);
+    const domainEval = evaluateDomainGate(descriptor, input);
     const outcomeSpaceGate = evaluateOutcomeSpaceGate(descriptor, input);
     const horizonGate = evaluateHorizonGate(descriptor, input, horizonMs);
     const assumptionsEval = evaluateAssumptionsGate(descriptor, input);
@@ -1533,7 +1649,7 @@ export function planMethodApplicability(
     const computeGate = evaluateComputationalGate(descriptor, input);
 
     const gates: readonly MethodGateEvaluation[] = Object.freeze([
-      domainGate,
+      domainEval.gate,
       outcomeSpaceGate,
       horizonGate,
       assumptionsEval.gate,
@@ -1575,8 +1691,14 @@ export function planMethodApplicability(
       disposition === 'applicable' || disposition === 'applicable-with-limitations';
 
     const activeLimitations = Object.freeze([
+      ...domainEval.limitationNotes,
       ...assumptionsEval.limitationNotes,
       ...dataEval.limitationNotes,
+    ]);
+
+    const combinedMissingRequirements = Object.freeze([
+      ...domainEval.missingDomainRequirements,
+      ...dataEval.missingDataRequirements,
     ]);
 
     const nonPassingExplanations = gates
@@ -1615,7 +1737,7 @@ export function planMethodApplicability(
       limitationGateIds: Object.freeze(limitationGateIds),
       reasonCodes: Object.freeze(reasonCodes),
       rationale,
-      missingDataRequirements: dataEval.missingDataRequirements,
+      missingDataRequirements: combinedMissingRequirements,
       unverifiedAssumptions: assumptionsEval.unverifiedAssumptions,
       violatedAssumptions: assumptionsEval.violatedAssumptions,
       activeLimitations,
@@ -1626,7 +1748,7 @@ export function planMethodApplicability(
     });
 
     evaluatedMethods.push(record);
-    missingDataByMethod[descriptor.methodId] = dataEval.missingDataRequirements;
+    missingDataByMethod[descriptor.methodId] = combinedMissingRequirements;
     unverifiedAssumptionsByMethod[descriptor.methodId] =
       assumptionsEval.unverifiedAssumptions;
 

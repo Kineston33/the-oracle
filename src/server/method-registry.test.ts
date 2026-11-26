@@ -3,8 +3,11 @@ import {
   CORE_SCIENTIFIC_METHOD_IDS,
   DEFAULT_SCIENTIFIC_METHOD_REGISTRY,
   SCIENTIFIC_METHOD_REGISTRY_VERSION,
+  UNIVERSAL_SUBDOMAIN_TOKEN,
   createScientificMethodRegistry,
+  hasUniversalSubdomainApplicability,
   isValidScientificMethodId,
+  isValidSubdomainIdentifier,
   validateScientificMethodDescriptor,
   type ScientificMethodDescriptor,
 } from './method-registry.ts';
@@ -297,6 +300,47 @@ describe('Stage 2A-2.1 — Scientific Method Registry (src/server/method-registr
           },
         },
       ]),
+    ).toThrow(RangeError);
+
+    // 6. Validates subdomain identifiers and rejects empty, arbitrary, or contradictory wildcard subdomain declarations
+    expect(isValidSubdomainIdentifier('binary-event-occurrence')).toBe(true);
+    expect(isValidSubdomainIdentifier(UNIVERSAL_SUBDOMAIN_TOKEN)).toBe(false);
+    expect(isValidSubdomainIdentifier('all')).toBe(false);
+    expect(isValidSubdomainIdentifier('any')).toBe(false);
+    expect(isValidSubdomainIdentifier('universal')).toBe(false);
+    expect(isValidSubdomainIdentifier('wildcard')).toBe(false);
+    expect(isValidSubdomainIdentifier('Invalid_Upper')).toBe(false);
+
+    expect(hasUniversalSubdomainApplicability(baselineDesc.domain)).toBe(true);
+    expect(hasUniversalSubdomainApplicability(baseDesc.domain)).toBe(false);
+
+    expect(() =>
+      validateScientificMethodDescriptor({
+        ...baseDesc,
+        domain: {
+          ...baseDesc.domain,
+          applicableSubdomains: [],
+        },
+      }),
+    ).toThrow(RangeError);
+    expect(() =>
+      validateScientificMethodDescriptor({
+        ...baseDesc,
+        domain: {
+          ...baseDesc.domain,
+          applicableSubdomains: ['all'],
+        },
+      }),
+    ).toThrow(RangeError);
+    expect(() =>
+      validateScientificMethodDescriptor({
+        ...baseDesc,
+        domain: {
+          ...baseDesc.domain,
+          universalSubdomainApplicability: false,
+          applicableSubdomains: [UNIVERSAL_SUBDOMAIN_TOKEN],
+        },
+      }),
     ).toThrow(RangeError);
   });
 

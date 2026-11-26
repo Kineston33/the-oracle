@@ -3,9 +3,11 @@ import {
   CORE_SCIENTIFIC_METHOD_IDS,
   DEFAULT_SCIENTIFIC_METHOD_REGISTRY,
   SCIENTIFIC_METHOD_REGISTRY_VERSION,
+  UNIVERSAL_SUBDOMAIN_TOKEN,
   createScientificMethodRegistry,
   validateScientificMethodDescriptor,
   type MethodAssumptionId,
+  type ScientificMethodRegistry,
 } from './method-registry.ts';
 import {
   METHOD_APPLICABILITY_PLANNER_VERSION,
@@ -24,7 +26,7 @@ function createSyntheticBinaryGeopoliticsInput(): MethodApplicabilityPlanningInp
   return {
     questionId: 'SYNTH-GEO-2026-001',
     questionCategory: 'geopolitics',
-    subdomain: 'bilateral-treaty-ratification',
+    subdomain: 'binary-event-occurrence',
     outcomeSpace: {
       kind: 'binary',
       outcomeLabels: ['Ratified before deadline', 'Not ratified before deadline'],
@@ -148,7 +150,7 @@ describe('Stage 2A-2.1 — Applicability Planner (src/server/method-selection.ts
     const syntheticEconomyInput: MethodApplicabilityPlanningInput = {
       questionId: 'SYNTH-ECON-2026-002',
       questionCategory: 'economy',
-      subdomain: 'annual-inflation-rate-brackets',
+      subdomain: 'macroeconomic-and-financial-indicators',
       outcomeSpace: {
         kind: 'discretized-continuous-partition',
         outcomeLabels: ['Below 2.0%', '2.0% to 4.0%', 'Above 4.0%'],
@@ -211,7 +213,7 @@ describe('Stage 2A-2.1 — Applicability Planner (src/server/method-selection.ts
     const syntheticBarrierInput: MethodApplicabilityPlanningInput = {
       questionId: 'SYNTH-CLIM-2026-003',
       questionCategory: 'climate',
-      subdomain: 'anomaly-barrier-exceedance',
+      subdomain: 'climate-anomaly-threshold-exceedance',
       outcomeSpace: {
         kind: 'first-passage-before-horizon',
         outcomeLabels: ['Crosses +1.7C barrier before end of 2026', 'Remains below +1.7C'],
@@ -578,6 +580,266 @@ describe('Stage 2A-2.1 — Applicability Planner (src/server/method-selection.ts
         },
       }),
     ).toThrow(RangeError);
+
+    // 6. Wildcard or pseudo-wildcard strings are rejected on planning input.subdomain
+    expect(() =>
+      planMethodApplicability({
+        ...valid,
+        subdomain: '*',
+      }),
+    ).toThrow(RangeError);
+    expect(() =>
+      planMethodApplicability({
+        ...valid,
+        subdomain: 'all',
+      }),
+    ).toThrow(RangeError);
+    expect(() =>
+      planMethodApplicability({
+        ...valid,
+        subdomain: 'universal',
+      }),
+    ).toThrow(RangeError);
+  });
+
+  it('rejects methods when supplied subdomain is outside their declared scope and accepts methods whose declared subdomain matches', () => {
+    const baseInput = createSyntheticBinaryGeopoliticsInput();
+
+    // 1. Subdomain 'heterogeneous-reference-classes' is in weighted-kish-effective-binomial's
+    // declared applicableSubdomains, but NOT in beta-binomial-conjugate, poisson-gamma-hazard,
+    // or dirichlet-multinomial-symmetry:
+    const heterogeneousPlan = planMethodApplicability({
+      ...baseInput,
+      subdomain: 'heterogeneous-reference-classes',
+    });
+
+    expect(
+      heterogeneousPlan.strictlyApplicableMethods.map((m) => m.methodId),
+    ).toEqual(['weighted-kish-effective-binomial']);
+    expect(heterogeneousPlan.evidenceDrivenApplicableMethodIds).toEqual([
+      'weighted-kish-effective-binomial',
+    ]);
+    expect(heterogeneousPlan.structuralBaselineMethodIds).toEqual([
+      'structural-uniform-baseline',
+    ]);
+
+    for (const rejectedId of [
+      'beta-binomial-conjugate',
+      'poisson-gamma-hazard',
+      'dirichlet-multinomial-symmetry',
+    ] as const) {
+      const rec = heterogeneousPlan.evaluatedMethods.find(
+        (m) => m.methodId === rejectedId,
+      )!;
+      expect(rec.disposition).toBe('inapplicable');
+      expect(rec.applicable).toBe(false);
+      expect(rec.failedGateIds).toContain('domain-compatibility');
+      expect(rec.reasonCodes).toContain('DOMAIN_SUBDOMAIN_INCOMPATIBLE');
+      expect(rec.gates[0]?.status).toBe('failed');
+      expect(rec.gates[0]?.reasonCode).toBe('DOMAIN_SUBDOMAIN_INCOMPATIBLE');
+      expect(rec.gates[0]?.explanation).toContain('heterogeneous-reference-classes');
+    }
+
+    // Because beta-binomial-conjugate was rejected by subdomain incompatibility,
+    // only 1 method in 'bernoulli-frequency-family' is applicable, so correlatedMethodGroups is empty:
+    expect(heterogeneousPlan.correlatedMethodGroups).toEqual([]);
+
+    // 2. Completely foreign subdomain rejects all 6 restricted evidence-driven methods
+    // while structural-uniform-baseline (which explicitly declares universal subdomain applicability)
+    // remains applicable-with-limitations:
+    const foreignSubdomainPlan = planMethodApplicability({
+      ...baseInput,
+      subdomain: 'unrecognized-orbital-debris-subdomain',
+    });
+    expect(foreignSubdomainPlan.evidenceDrivenApplicableMethodIds).toEqual([]);
+    expect(foreignSubdomainPlan.structuralBaselineMethodIds).toEqual([
+      'structural-uniform-baseline',
+    ]);
+    for (const id of CORE_SCIENTIFIC_METHOD_IDS) {
+      if (id === 'structural-uniform-baseline') continue;
+      const rec = foreignSubdomainPlan.evaluatedMethods.find(
+        (m) => m.methodId === id,
+      )!;
+      expect(rec.disposition).toBe('inapplicable');
+      expect(rec.failedGateIds).toContain('domain-compatibility');
+      expect(rec.reasonCodes).toContain('DOMAIN_SUBDOMAIN_INCOMPATIBLE');
+    }
+  });
+
+  it('defers restricted methods when input.subdomain is absent and explains which subdomain information is missing', () => {
+    const { subdomain: _omitted, ...inputWithoutSubdomain } =
+      createSyntheticBinaryGeopoliticsInput();
+
+    const plan = planMethodApplicability(inputWithoutSubdomain);
+
+    // None of the restricted evidence-driven methods may be silently authorized:
+    expect(plan.strictlyApplicableMethods).toEqual([]);
+    expect(plan.evidenceDrivenApplicableMethodIds).toEqual([]);
+
+    // The 4 binary-compatible evidence-driven methods are deferred specifically on domain-compatibility:
+    expect(plan.deferredMethodIds).toEqual([
+      'beta-binomial-conjugate',
+      'weighted-kish-effective-binomial',
+      'poisson-gamma-hazard',
+      'dirichlet-multinomial-symmetry',
+    ]);
+
+    for (const defId of plan.deferredMethodIds) {
+      const rec = plan.evaluatedMethods.find((m) => m.methodId === defId)!;
+      const desc = DEFAULT_SCIENTIFIC_METHOD_REGISTRY.getOrThrow(defId);
+      expect(rec.disposition).toBe('deferred');
+      expect(rec.applicable).toBe(false);
+      expect(rec.deferredGateIds).toContain('domain-compatibility');
+      expect(rec.reasonCodes).toContain('DOMAIN_SUBDOMAIN_MISSING_DEFERRED');
+      expect(rec.missingDataRequirements.length).toBeGreaterThan(0);
+      expect(rec.missingDataRequirements[0]).toContain(
+        'Question subdomain is missing',
+      );
+      for (const allowedSub of desc.domain.applicableSubdomains) {
+        expect(rec.missingDataRequirements[0]).toContain(allowedSub);
+      }
+      expect(plan.missingDataByMethod[defId]).toEqual(rec.missingDataRequirements);
+    }
+
+    // Only structural-uniform-baseline (which explicitly declares universal subdomain applicability) passes domain-compatibility:
+    expect(plan.structuralBaselineMethodIds).toEqual(['structural-uniform-baseline']);
+    expect(plan.applicableWithLimitationsMethods.map((m) => m.methodId)).toEqual([
+      'structural-uniform-baseline',
+    ]);
+  });
+
+  it('authorizes universal subdomain applicability only when explicitly declared and never infers it from empty arrays or arbitrary strings', () => {
+    const baseDesc = DEFAULT_SCIENTIFIC_METHOD_REGISTRY.getOrThrow(
+      'beta-binomial-conjugate',
+    );
+    const customUniversalEvidenceMethod = validateScientificMethodDescriptor({
+      ...baseDesc,
+      methodId: 'custom:universal-bernoulli-updater',
+      methodFamily: 'custom-scientific-method',
+      domain: {
+        ...baseDesc.domain,
+        universalSubdomainApplicability: true,
+        applicableSubdomains: [UNIVERSAL_SUBDOMAIN_TOKEN, 'binary-event-occurrence'],
+      },
+      dependenceProfile: {
+        ...baseDesc.dependenceProfile,
+        correlatedWithMethodIds: ['beta-binomial-conjugate'],
+      },
+    });
+
+    const customRegistry = createScientificMethodRegistry([
+      ...DEFAULT_SCIENTIFIC_METHOD_REGISTRY.listAll(),
+      customUniversalEvidenceMethod,
+    ]);
+
+    const { subdomain: _omitted, ...inputWithoutSubdomain } =
+      createSyntheticBinaryGeopoliticsInput();
+
+    // When subdomain is omitted, restricted methods are deferred, while the explicitly universal custom method is applicable:
+    const planWithoutSubdomain = planMethodApplicability(
+      inputWithoutSubdomain,
+      customRegistry,
+    );
+    expect(planWithoutSubdomain.evidenceDrivenApplicableMethodIds).toEqual([
+      'custom:universal-bernoulli-updater',
+    ]);
+    expect(planWithoutSubdomain.deferredMethodIds).toContain(
+      'beta-binomial-conjugate',
+    );
+
+    // Defensive check in evaluateDomainGate: unvalidated custom registry with empty applicableSubdomains or arbitrary 'all' throws RangeError
+    const malformedEmptySubdomainRegistry: ScientificMethodRegistry = {
+      ...DEFAULT_SCIENTIFIC_METHOD_REGISTRY,
+      listAll: () => [
+        {
+          ...baseDesc,
+          domain: {
+            ...baseDesc.domain,
+            applicableSubdomains: [],
+          },
+        },
+      ],
+    };
+    expect(() =>
+      planMethodApplicability(
+        createSyntheticBinaryGeopoliticsInput(),
+        malformedEmptySubdomainRegistry,
+      ),
+    ).toThrow(RangeError);
+
+    const malformedArbitraryWildcardRegistry: ScientificMethodRegistry = {
+      ...DEFAULT_SCIENTIFIC_METHOD_REGISTRY,
+      listAll: () => [
+        {
+          ...baseDesc,
+          domain: {
+            ...baseDesc.domain,
+            applicableSubdomains: ['all'],
+          },
+        },
+      ],
+    };
+    expect(() =>
+      planMethodApplicability(
+        createSyntheticBinaryGeopoliticsInput(),
+        malformedArbitraryWildcardRegistry,
+      ),
+    ).toThrow(RangeError);
+  });
+
+  it('preserves the three-way domain distinction between inapplicable (conflicting subdomain), deferred (missing subdomain), and applicable-with-limitations (documented domain caveat)', () => {
+    const baseInput = createSyntheticBinaryGeopoliticsInput();
+
+    // 1. Inapplicable: supplied subdomain conflicts with beta-binomial-conjugate's declared scope
+    const inapplicablePlan = planMethodApplicability({
+      ...baseInput,
+      subdomain: 'macroeconomic-and-financial-indicators',
+    });
+    const betaInapplicable = inapplicablePlan.evaluatedMethods.find(
+      (m) => m.methodId === 'beta-binomial-conjugate',
+    )!;
+    expect(betaInapplicable.disposition).toBe('inapplicable');
+    expect(betaInapplicable.applicable).toBe(false);
+    expect(betaInapplicable.gates[0]?.status).toBe('failed');
+    expect(betaInapplicable.gates[0]?.reasonCode).toBe(
+      'DOMAIN_SUBDOMAIN_INCOMPATIBLE',
+    );
+
+    // 2. Deferred: subdomain is absent and beta-binomial-conjugate has restricted subdomains
+    const { subdomain: _omitted, ...missingSubdomainInput } = baseInput;
+    const deferredPlan = planMethodApplicability(missingSubdomainInput);
+    const betaDeferred = deferredPlan.evaluatedMethods.find(
+      (m) => m.methodId === 'beta-binomial-conjugate',
+    )!;
+    expect(betaDeferred.disposition).toBe('deferred');
+    expect(betaDeferred.applicable).toBe(false);
+    expect(betaDeferred.gates[0]?.status).toBe('deferred');
+    expect(betaDeferred.gates[0]?.reasonCode).toBe(
+      'DOMAIN_SUBDOMAIN_MISSING_DEFERRED',
+    );
+
+    // 3. Applicable-with-limitations: domain & subdomain match, with a documented domain constraint caveat
+    const caveatPlan = planMethodApplicability({
+      ...baseInput,
+      subdomain: 'binary-event-occurrence',
+      assumptions: {
+        ...baseInput.assumptions,
+        knownDomainConstraints: [
+          'Parliamentary ratification calendar is subject to constitutional court review window',
+        ],
+      },
+    });
+    const betaCaveat = caveatPlan.evaluatedMethods.find(
+      (m) => m.methodId === 'beta-binomial-conjugate',
+    )!;
+    expect(betaCaveat.disposition).toBe('applicable-with-limitations');
+    expect(betaCaveat.applicable).toBe(true);
+    expect(betaCaveat.gates[0]?.status).toBe('passed-with-limitations');
+    expect(betaCaveat.gates[0]?.reasonCode).toBe('DOMAIN_COMPATIBLE_WITH_CAVEATS');
+    expect(betaCaveat.limitationGateIds).toContain('domain-compatibility');
+    expect(betaCaveat.activeLimitations).toContain(
+      'Domain constraint caveat: Parliamentary ratification calendar is subject to constitutional court review window',
+    );
   });
 
   it('executes with zero network requests', () => {

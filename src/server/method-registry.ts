@@ -170,9 +170,40 @@ export interface MethodAssumptionDescriptor {
   readonly verificationMode: AssumptionVerificationMode;
 }
 
+/**
+ * Explicit canonical token declaring that a method descriptor applies
+ * universally across all scientific subdomains within its declared
+ * `applicableCategories`.
+ *
+ * Universal subdomain applicability is NEVER inferred from an empty array
+ * or from arbitrary strings (such as `'all'`, `'any'`, `'universal'`, or `'wildcard'`).
+ */
+export const UNIVERSAL_SUBDOMAIN_TOKEN = '*' as const;
+
+/**
+ * Ambiguous pseudo-wildcard tokens that must never be used or inferred as
+ * universal subdomain declarations.
+ */
+export const FORBIDDEN_PSEUDO_WILDCARD_SUBDOMAINS: readonly string[] = Object.freeze([
+  'all',
+  'any',
+  'universal',
+  'wildcard',
+  'default',
+  'none',
+  '**',
+]);
+
 export interface MethodDomainDescriptor {
   readonly applicableCategories: readonly PredictionCategory[];
   readonly applicableSubdomains: readonly string[];
+  /**
+   * When `true` (or when `applicableSubdomains` explicitly includes
+   * `UNIVERSAL_SUBDOMAIN_TOKEN` `'*'`), the method is explicitly declared
+   * applicable across all subdomains within its `applicableCategories`,
+   * including when `input.subdomain` is omitted.
+   */
+  readonly universalSubdomainApplicability?: boolean;
   readonly mathematicalParadigm: string;
 }
 
@@ -317,6 +348,49 @@ export function isValidScientificMethodId(value: unknown): value is ScientificMe
   return false;
 }
 
+/**
+ * Validates whether a string is a canonical scientific subdomain identifier
+ * (kebab-case alphanumeric slug that is not a forbidden pseudo-wildcard).
+ * Does NOT accept `UNIVERSAL_SUBDOMAIN_TOKEN` (`'*'`); use
+ * `hasUniversalSubdomainApplicability` for descriptor wildcard inspection.
+ */
+export function isValidSubdomainIdentifier(value: unknown): value is string {
+  if (typeof value !== 'string' || value.trim().length === 0 || value !== value.trim()) {
+    return false;
+  }
+  if (value === UNIVERSAL_SUBDOMAIN_TOKEN) {
+    return false;
+  }
+  if (FORBIDDEN_PSEUDO_WILDCARD_SUBDOMAINS.includes(value.toLowerCase())) {
+    return false;
+  }
+  return /^[a-z0-9]+(?:-[a-z0-9]+)*$/.test(value);
+}
+
+/**
+ * Returns `true` if and only if a validated `MethodDomainDescriptor` explicitly
+ * declares universal subdomain applicability via `universalSubdomainApplicability: true`
+ * or by including `UNIVERSAL_SUBDOMAIN_TOKEN` (`'*'`) in a non-empty
+ * `applicableSubdomains` array.
+ *
+ * Never infers universal applicability from an empty array or arbitrary strings.
+ */
+export function hasUniversalSubdomainApplicability(
+  domain: MethodDomainDescriptor,
+): boolean {
+  if (
+    !domain ||
+    !Array.isArray(domain.applicableSubdomains) ||
+    domain.applicableSubdomains.length === 0
+  ) {
+    return false;
+  }
+  return (
+    domain.universalSubdomainApplicability === true ||
+    domain.applicableSubdomains.includes(UNIVERSAL_SUBDOMAIN_TOKEN)
+  );
+}
+
 function assertNonEmptyTrimmedString(value: unknown, fieldName: string): string {
   if (typeof value !== 'string' || value.trim().length === 0 || value !== value.trim()) {
     throw new RangeError(
@@ -441,6 +515,31 @@ export function validateScientificMethodDescriptor(
     value.domain.applicableSubdomains,
     `${methodId}.domain.applicableSubdomains`,
   );
+  for (let i = 0; i < applicableSubdomains.length; i++) {
+    const sub = applicableSubdomains[i]!;
+    if (sub !== UNIVERSAL_SUBDOMAIN_TOKEN && !isValidSubdomainIdentifier(sub)) {
+      throw new RangeError(
+        `${methodId}.domain.applicableSubdomains[${i}] ('${sub}') must be a canonical kebab-case subdomain identifier or UNIVERSAL_SUBDOMAIN_TOKEN ('*'); arbitrary or pseudo-wildcard strings are forbidden`,
+      );
+    }
+  }
+  const universalSubdomainApplicability = value.domain.universalSubdomainApplicability;
+  if (
+    universalSubdomainApplicability !== undefined &&
+    typeof universalSubdomainApplicability !== 'boolean'
+  ) {
+    throw new RangeError(
+      `${methodId}.domain.universalSubdomainApplicability must be a boolean when provided`,
+    );
+  }
+  if (
+    universalSubdomainApplicability === false &&
+    applicableSubdomains.includes(UNIVERSAL_SUBDOMAIN_TOKEN)
+  ) {
+    throw new RangeError(
+      `Contradictory domain declaration on '${methodId}': universalSubdomainApplicability is false, but applicableSubdomains includes UNIVERSAL_SUBDOMAIN_TOKEN ('*')`,
+    );
+  }
   const mathematicalParadigm = assertNonEmptyTrimmedString(
     value.domain.mathematicalParadigm,
     `${methodId}.domain.mathematicalParadigm`,
@@ -873,6 +972,9 @@ export function validateScientificMethodDescriptor(
     domain: {
       applicableCategories,
       applicableSubdomains,
+      ...(universalSubdomainApplicability !== undefined
+        ? { universalSubdomainApplicability }
+        : {}),
       mathematicalParadigm,
     },
     requiredData: {
@@ -979,6 +1081,7 @@ const CORE_METHOD_DESCRIPTORS_RAW: readonly ScientificMethodDescriptor[] = [
         'historical-base-rate-estimation',
         'clinical-and-scientific-replication-rates',
         'policy-and-institutional-pass-fail-outcomes',
+        'geopolitical-or-conflict-incident-rates',
       ],
       mathematicalParadigm:
         'De Finetti exchangeable Bernoulli sequence with Beta(alpha, beta) conjugate posterior',
@@ -1078,6 +1181,11 @@ const CORE_METHOD_DESCRIPTORS_RAW: readonly ScientificMethodDescriptor[] = [
     domain: {
       applicableCategories: PREDICTION_CATEGORIES,
       applicableSubdomains: [
+        'binary-event-occurrence',
+        'historical-base-rate-estimation',
+        'clinical-and-scientific-replication-rates',
+        'policy-and-institutional-pass-fail-outcomes',
+        'geopolitical-or-conflict-incident-rates',
         'heterogeneous-reference-classes',
         'recency-weighted-historical-frequencies',
         'clustered-or-stratified-empirical-evidence',
@@ -1183,6 +1291,8 @@ const CORE_METHOD_DESCRIPTORS_RAW: readonly ScientificMethodDescriptor[] = [
     domain: {
       applicableCategories: PREDICTION_CATEGORIES,
       applicableSubdomains: [
+        'binary-event-occurrence',
+        'policy-and-institutional-pass-fail-outcomes',
         'rare-event-arrival-hazards',
         'geopolitical-or-conflict-incident-rates',
         'climate-and-natural-hazard-recurrence',
@@ -1286,10 +1396,15 @@ const CORE_METHOD_DESCRIPTORS_RAW: readonly ScientificMethodDescriptor[] = [
     domain: {
       applicableCategories: PREDICTION_CATEGORIES,
       applicableSubdomains: [
+        'binary-event-occurrence',
+        'policy-and-institutional-pass-fail-outcomes',
+        'geopolitical-or-conflict-incident-rates',
         'multi-outcome-categorical-events',
         'institutional-or-electoral-plurality-outcomes',
         'discretized-regime-classifications',
         'multi-branch-scientific-or-technological-milestones',
+        'macroeconomic-and-financial-indicators',
+        'climate-temperature-and-emissions-trajectories',
       ],
       mathematicalParadigm:
         'Exchangeable K-category multinomial sequence with conjugate Dirichlet simplex posterior',
@@ -1627,7 +1742,9 @@ const CORE_METHOD_DESCRIPTORS_RAW: readonly ScientificMethodDescriptor[] = [
     role: 'structural-symmetry-baseline',
     domain: {
       applicableCategories: PREDICTION_CATEGORIES,
+      universalSubdomainApplicability: true,
       applicableSubdomains: [
+        UNIVERSAL_SUBDOMAIN_TOKEN,
         'maximum-entropy-structural-reference',
         'symmetry-invariant-finite-partitions',
         'cold-start-ignorance-prior-benchmark',
