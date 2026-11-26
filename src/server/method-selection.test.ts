@@ -158,14 +158,24 @@ describe('Stage 2A-2.1 — Applicability Planner (src/server/method-selection.ts
       'explicit-correlated-method-declaration',
       'binary-conjugate-simplex-reduction',
     ]);
-    expect(group.sharedInformationChannels).toContain('binary-trial-counts');
-    expect(group.sharedInformationChannels).toContain(
+    // Component sharedInformationChannels aggregates actual pairwise edge intersections
+    // and never falsely includes Weighted-Kish-exclusive 'weighted-binary-trials':
+    expect(group.sharedInformationChannels).toEqual([
+      'binary-trial-counts',
       'multinomial-category-counts',
+    ]);
+    expect(group.sharedInformationChannels).not.toContain(
+      'weighted-binary-trials',
     );
-    expect(group.sharedAssumptions).toContain('stationary-success-probability');
-    expect(group.commonRequiredAssumptions).toContain(
-      'stationary-success-probability',
+    expect(group.sharedInformationChannels).not.toContain(
+      'kish-effective-sample-size',
     );
+
+    // 'stationary-success-probability' is shared on the Beta-Binomial / Weighted-Kish edge,
+    // so it appears in group.sharedAssumptions, but NOT in group.commonRequiredAssumptions
+    // for the 3-method component because Dirichlet-Multinomial does not require it:
+    expect(group.sharedAssumptions).toEqual(['stationary-success-probability']);
+    expect(group.commonRequiredAssumptions).toEqual([]);
     expect(group.treatAsIndependentVotes).toBe(false);
     expect(group.warning).toContain('bernoulli-frequency-family');
     expect(group.warning).toContain('dirichlet-categorical-family');
@@ -181,6 +191,13 @@ describe('Stage 2A-2.1 — Applicability Planner (src/server/method-selection.ts
       'shared-correlation-group',
       'explicit-correlated-method-declaration',
     ]);
+    expect(group.pairwiseRelationships[0]?.sharedInformationChannels).toEqual([
+      'binary-trial-counts',
+    ]);
+    expect(group.pairwiseRelationships[0]?.sharedAssumptions).toEqual([
+      'stationary-success-probability',
+    ]);
+
     expect(group.pairwiseRelationships[1]?.methodPair).toEqual([
       'beta-binomial-conjugate',
       'dirichlet-multinomial-symmetry',
@@ -189,6 +206,13 @@ describe('Stage 2A-2.1 — Applicability Planner (src/server/method-selection.ts
       'explicit-correlated-method-declaration',
       'binary-conjugate-simplex-reduction',
     ]);
+    expect(group.pairwiseRelationships[1]?.sharedInformationChannels).toEqual([
+      'binary-trial-counts',
+      'multinomial-category-counts',
+    ]);
+    // Beta-Binomial and Dirichlet-Multinomial have disjoint assumption ID sets;
+    // the empty intersection remains [] rather than being replaced with their union:
+    expect(group.pairwiseRelationships[1]?.sharedAssumptions).toEqual([]);
 
     // Binary Beta-Binomial / Dirichlet-Multinomial equivalence diagnostic:
     const eqDiag = group.binaryBetaDirichletEquivalence!;
@@ -292,13 +316,96 @@ describe('Stage 2A-2.1 — Applicability Planner (src/server/method-selection.ts
       },
     });
     expect(betaAndKishOnlyPlan.correlatedMethodGroups).toHaveLength(1);
+    const betaKishComp = betaAndKishOnlyPlan.correlatedMethodGroups[0]!;
+    expect(betaKishComp.applicableMethodIds).toEqual([
+      'beta-binomial-conjugate',
+      'weighted-kish-effective-binomial',
+    ]);
+    // For the 2-method Beta-Binomial / Weighted-Kish component, BOTH methods require
+    // 'stationary-success-probability', so it IS in commonRequiredAssumptions, and
+    // only 'binary-trial-counts' is in sharedInformationChannels:
+    expect(betaKishComp.sharedInformationChannels).toEqual([
+      'binary-trial-counts',
+    ]);
+    expect(betaKishComp.sharedAssumptions).toEqual([
+      'stationary-success-probability',
+    ]);
+    expect(betaKishComp.commonRequiredAssumptions).toEqual([
+      'stationary-success-probability',
+    ]);
+    expect(betaKishComp.binaryBetaDirichletEquivalence).toBeUndefined();
+
+    // 2b. An explicitly correlated pair with zero common information channels and
+    // zero common assumptions still receives a dependency edge and forms a connected
+    // component, while its pairwise and component shared metadata arrays remain empty:
+    const betaBase = DEFAULT_SCIENTIFIC_METHOD_REGISTRY.getOrThrow(
+      'beta-binomial-conjugate',
+    );
+    const poissonBase = DEFAULT_SCIENTIFIC_METHOD_REGISTRY.getOrThrow(
+      'poisson-gamma-hazard',
+    );
+    const customBeta = validateScientificMethodDescriptor({
+      ...betaBase,
+      methodId: 'custom:disjoint-channel-beta',
+      methodFamily: 'custom-scientific-method',
+      dependenceProfile: {
+        correlationGroupId: 'custom-beta-group',
+        sharedInformationChannels: ['binary-trial-counts'],
+        sharedLatentAssumptions: [
+          'exchangeable-bernoulli-trials',
+          'stationary-success-probability',
+        ],
+        correlatedWithMethodIds: ['custom:disjoint-channel-poisson'],
+        independenceWarning:
+          'Explicitly correlated with custom:disjoint-channel-poisson via shared latent event window.',
+      },
+    });
+    const customPoisson = validateScientificMethodDescriptor({
+      ...poissonBase,
+      methodId: 'custom:disjoint-channel-poisson',
+      methodFamily: 'custom-scientific-method',
+      dependenceProfile: {
+        correlationGroupId: 'custom-poisson-group',
+        sharedInformationChannels: [
+          'poisson-event-counts',
+          'continuous-exposure-duration',
+        ],
+        sharedLatentAssumptions: [
+          'conditionally-independent-poisson-increments',
+          'homogeneous-or-known-exposure-intensity',
+        ],
+        correlatedWithMethodIds: ['custom:disjoint-channel-beta'],
+        independenceWarning:
+          'Explicitly correlated with custom:disjoint-channel-beta via shared latent event window.',
+      },
+    });
+    const disjointLinkedRegistry = createScientificMethodRegistry([
+      customBeta,
+      customPoisson,
+    ]);
+    const disjointLinkedPlan = planMethodApplicability(
+      baseInput,
+      disjointLinkedRegistry,
+    );
+    expect(disjointLinkedPlan.correlatedMethodGroups).toHaveLength(1);
+    const disjointComp = disjointLinkedPlan.correlatedMethodGroups[0]!;
+    expect(disjointComp.applicableMethodIds).toEqual([
+      'custom:disjoint-channel-beta',
+      'custom:disjoint-channel-poisson',
+    ]);
+    expect(disjointComp.relationshipSources).toEqual([
+      'explicit-correlated-method-declaration',
+    ]);
+    expect(disjointComp.pairwiseRelationships).toHaveLength(1);
     expect(
-      betaAndKishOnlyPlan.correlatedMethodGroups[0]?.applicableMethodIds,
-    ).toEqual(['beta-binomial-conjugate', 'weighted-kish-effective-binomial']);
-    expect(
-      betaAndKishOnlyPlan.correlatedMethodGroups[0]
-        ?.binaryBetaDirichletEquivalence,
-    ).toBeUndefined();
+      disjointComp.pairwiseRelationships[0]?.sharedInformationChannels,
+    ).toEqual([]);
+    expect(disjointComp.pairwiseRelationships[0]?.sharedAssumptions).toEqual(
+      [],
+    );
+    expect(disjointComp.sharedInformationChannels).toEqual([]);
+    expect(disjointComp.sharedAssumptions).toEqual([]);
+    expect(disjointComp.commonRequiredAssumptions).toEqual([]);
 
     // 3. Preserve Student-t / First-Passage relationship ('ito-continuous-diffusion-family')
     // when both are simultaneously applicable in a custom registry scenario:

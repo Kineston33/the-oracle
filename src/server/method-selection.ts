@@ -271,7 +271,15 @@ export interface CorrelatedMethodPairDiagnostic {
   readonly methodPair: readonly [ScientificMethodId, ScientificMethodId];
   readonly relationshipSources: readonly CorrelationRelationshipSource[];
   readonly correlationGroupIds: readonly string[];
+  /**
+   * Information channels genuinely present in BOTH methods' channel sets
+   * (strict pairwise intersection; empty array `[]` when disjoint).
+   */
   readonly sharedInformationChannels: readonly MethodDataChannelId[];
+  /**
+   * Scientific assumptions genuinely present in BOTH methods' assumption sets
+   * (strict pairwise intersection; empty array `[]` when disjoint).
+   */
   readonly sharedAssumptions: readonly MethodAssumptionId[];
   readonly binaryBetaDirichletEquivalence?: BinaryBetaDirichletEquivalenceDiagnostic;
   readonly explanation: string;
@@ -283,8 +291,24 @@ export interface CorrelatedMethodGroupDiagnostic {
   readonly applicableMethodIds: readonly ScientificMethodId[];
   readonly relationshipSources: readonly CorrelationRelationshipSource[];
   readonly pairwiseRelationships: readonly CorrelatedMethodPairDiagnostic[];
+  /**
+   * Deduplicated aggregation of the actual pairwise `sharedInformationChannels`
+   * across all declared relationship edges (`pairwiseRelationships`) in this
+   * connected component, in deterministic encounter order. Never includes
+   * channels that belong exclusively to a single member method.
+   */
   readonly sharedInformationChannels: readonly MethodDataChannelId[];
+  /**
+   * Deduplicated aggregation of the actual pairwise `sharedAssumptions`
+   * across all declared relationship edges (`pairwiseRelationships`) in this
+   * connected component, in deterministic encounter order.
+   */
   readonly sharedAssumptions: readonly MethodAssumptionId[];
+  /**
+   * Strict intersection of `requiredAssumptions` across ALL methods in this
+   * connected component (an assumption is included if and only if every member
+   * of `applicableMethodIds` requires it).
+   */
   readonly commonRequiredAssumptions: readonly MethodAssumptionId[];
   readonly binaryBetaDirichletEquivalence?: BinaryBetaDirichletEquivalenceDiagnostic;
   readonly treatAsIndependentVotes: false;
@@ -1830,26 +1854,9 @@ function buildDependenceDiagnostics(
         adj[i]!.push(j);
         adj[j]!.push(i);
 
-        const pairSharedChannels = Object.freeze(
-          intersectingChannels.length > 0
-            ? intersectingChannels
-            : Array.from(
-                new Set<MethodDataChannelId>([
-                  ...descA.dependenceProfile.sharedInformationChannels,
-                  ...descB.dependenceProfile.sharedInformationChannels,
-                ]),
-              ),
-        );
-        const pairSharedAssumptions = Object.freeze(
-          intersectingAssumptions.length > 0
-            ? intersectingAssumptions
-            : Array.from(
-                new Set<MethodAssumptionId>([
-                  ...descA.dependenceProfile.sharedLatentAssumptions,
-                  ...descB.dependenceProfile.sharedLatentAssumptions,
-                ]),
-              ),
-        );
+        // Strict pairwise intersections only; never substitute unions for empty intersections:
+        const pairSharedChannels = Object.freeze(intersectingChannels);
+        const pairSharedAssumptions = Object.freeze(intersectingAssumptions);
         const pairGroupIds = Object.freeze(
           Array.from(
             new Set([
@@ -1989,18 +1996,25 @@ function buildDependenceDiagnostics(
       RELATIONSHIP_SOURCE_ORDER.filter((src) => compSourceSet.has(src)),
     );
 
+    // Aggregate component sharedInformationChannels and sharedAssumptions
+    // strictly from actual pairwise relationship edge intersections (`compPairs`),
+    // never from the union of all component members' declarations:
     const sharedChannelsSet = new Set<MethodDataChannelId>();
     const sharedAssumptionsSet = new Set<MethodAssumptionId>();
-    const requiredAssumptionCounts = new Map<MethodAssumptionId, number>();
-
-    for (const r of compRecords) {
-      const desc = descriptorById.get(r.methodId)!;
-      for (const ch of desc.dependenceProfile.sharedInformationChannels) {
+    for (const pairDiag of compPairs) {
+      for (const ch of pairDiag.sharedInformationChannels) {
         sharedChannelsSet.add(ch);
       }
-      for (const a of desc.dependenceProfile.sharedLatentAssumptions) {
+      for (const a of pairDiag.sharedAssumptions) {
         sharedAssumptionsSet.add(a);
       }
+    }
+
+    // commonRequiredAssumptions represents the strict intersection of
+    // requiredAssumptions across ALL methods in the connected component:
+    const requiredAssumptionCounts = new Map<MethodAssumptionId, number>();
+    for (const r of compRecords) {
+      const desc = descriptorById.get(r.methodId)!;
       for (const reqA of desc.requiredAssumptions) {
         requiredAssumptionCounts.set(
           reqA.id,
@@ -2011,9 +2025,8 @@ function buildDependenceDiagnostics(
 
     const commonRequiredAssumptions: MethodAssumptionId[] = [];
     for (const [assumptionId, count] of requiredAssumptionCounts.entries()) {
-      if (count >= 2) {
+      if (count === compRecords.length) {
         commonRequiredAssumptions.push(assumptionId);
-        sharedAssumptionsSet.add(assumptionId);
       }
     }
 
