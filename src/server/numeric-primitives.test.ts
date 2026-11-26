@@ -1,0 +1,809 @@
+import { describe, expect, it } from 'vitest';
+import {
+  EPISTEMOLOGICAL_TAG_BY_KIND,
+  assertCalibrationHonesty,
+  isCalibrationFootingCoherent,
+} from './forecast-types.ts';
+import {
+  LN_MIN_NORMAL_BINARY64,
+  LN_MIN_SUBNORMAL_BINARY64,
+  LN_ROUND_TO_ZERO_THRESHOLD_BINARY64,
+  LN_SATURATED_TO_ONE_THRESHOLD_BINARY64,
+  LN_SWITCH_LOG1MEXP,
+  NumericConvergenceError,
+  classifyBinary64Probability,
+  computeStudentT4InverseIntermediates,
+  createDualChannelProbability,
+  createDualChannelProbabilityFromComplementLog,
+  createDualChannelProbabilityFromLog,
+  createDualChannelProbabilityFromPair,
+  decomposeCategoryUncertainty,
+  decomposeEnsembleEntropy,
+  erfcx,
+  erfcxConditionNumber,
+  erfcxDerivativePositive,
+  erfcxDiffPositive,
+  inverseNormalCdf,
+  inverseRegularizedGammaQ,
+  inverseRegularizedIncompleteBeta,
+  inverseStudentTCdf,
+  kahanNeumaierSum,
+  lnBeta,
+  lnGamma,
+  log1mexp,
+  logSumExp,
+  nonCentralChiSquarePower,
+  nonCentralStudentTCdf,
+  normalCdf,
+  poissonDeviance,
+  poissonDevianceTerm,
+  regularizedGammaP,
+  regularizedGammaQ,
+  regularizedIncompleteBeta,
+  stirlingError,
+  studentTCdf,
+  ulpBinary64,
+  ulpDistanceBinary64,
+  validateComplementaryLogPair,
+} from './numeric-primitives.ts';
+
+function expectRelativeErrorWithin(actual: number, expected: number, maxRelError: number): void {
+  if (expected === 0) {
+    expect(actual).toBe(0);
+    return;
+  }
+  const relError = Math.abs(actual - expected) / Math.abs(expected);
+  expect(relError).toBeLessThanOrEqual(maxRelError);
+}
+
+describe('Stage 2A-1 — Numeric Primitives & Forecast Contracts (v4.4.3)', () => {
+  describe('1. Epistemological & Calibration Honesty Contracts (forecast-types.ts)', () => {
+    it('maps every EpistemologicalClaimKind to its normative tag (IME, EBM, ANC, AA, HDO, HEN)', () => {
+      expect(EPISTEMOLOGICAL_TAG_BY_KIND['exact-mathematical-identity']).toBe('IME');
+      expect(EPISTEMOLOGICAL_TAG_BY_KIND['exact-under-explicit-model']).toBe('EBM');
+      expect(EPISTEMOLOGICAL_TAG_BY_KIND['controlled-numerical-approximation']).toBe('ANC');
+      expect(EPISTEMOLOGICAL_TAG_BY_KIND['asymptotic-approximation']).toBe('AA');
+      expect(EPISTEMOLOGICAL_TAG_BY_KIND['operational-design-heuristic']).toBe('HDO');
+      expect(EPISTEMOLOGICAL_TAG_BY_KIND['unverified-empirical-hypothesis']).toBe('HEN');
+    });
+
+    it('forbids declaring empirically-calibrated-high-evidence without out-of-sample verification', () => {
+      expect(
+        isCalibrationFootingCoherent(
+          'empirically-calibrated-high-evidence',
+          'empirically-verified-out-of-sample',
+        ),
+      ).toBe(true);
+
+      for (const uncalibratedStatus of [
+        'unverified-no-out-of-sample-evaluation',
+        'insufficient-resolved-history',
+        'out-of-sample-evaluatable-not-calibrated',
+      ] as const) {
+        expect(
+          isCalibrationFootingCoherent('empirically-calibrated-high-evidence', uncalibratedStatus),
+        ).toBe(false);
+        expect(() =>
+          assertCalibrationHonesty('empirically-calibrated-high-evidence', uncalibratedStatus),
+        ).toThrow(RangeError);
+      }
+
+      // Lower evidential tiers are permitted before out-of-sample calibration is achieved
+      expect(() =>
+        assertCalibrationHonesty(
+          'methodologically-sound-moderate-evidence',
+          'unverified-no-out-of-sample-evaluation',
+        ),
+      ).not.toThrow();
+      expect(() =>
+        assertCalibrationHonesty(
+          'defensible-low-confidence-exploratory',
+          'insufficient-resolved-history',
+        ),
+      ).not.toThrow();
+      expect(() =>
+        assertCalibrationHonesty(
+          'structural-symmetry-baseline-only',
+          'unverified-no-out-of-sample-evaluation',
+        ),
+      ).not.toThrow();
+    });
+  });
+
+  describe('2. IEEE 754 binary64 ULP Inspection & Kahan-Neumaier Summation', () => {
+    it('computes exact binary64 ULP spacing across normal, subnormal, zero, and MAX_VALUE', () => {
+      expect(ulpBinary64(0)).toBe(Number.MIN_VALUE);
+      expect(ulpBinary64(Number.MIN_VALUE)).toBe(Number.MIN_VALUE);
+      expect(ulpBinary64(2 ** -1023)).toBe(Number.MIN_VALUE);
+      expect(ulpBinary64(2 ** -1022)).toBe(Number.MIN_VALUE);
+      expect(ulpBinary64(1)).toBe(Number.EPSILON);
+      expect(ulpBinary64(-1)).toBe(Number.EPSILON);
+      expect(ulpBinary64(2)).toBe(2 * Number.EPSILON);
+      expect(ulpBinary64(Number.MAX_VALUE)).toBe(2 ** 971);
+      expect(() => ulpBinary64(Number.NaN)).toThrow(RangeError);
+      expect(() => ulpBinary64(Number.POSITIVE_INFINITY)).toThrow(RangeError);
+    });
+
+    it('computes exact integer ULP distances between adjacent floats', () => {
+      expect(ulpDistanceBinary64(1, 1 + Number.EPSILON)).toBe(1);
+      expect(ulpDistanceBinary64(1, 1 + 3 * Number.EPSILON)).toBe(3);
+      expect(ulpDistanceBinary64(0, Number.MIN_VALUE)).toBe(1);
+      expect(ulpDistanceBinary64(-0, 0)).toBe(0);
+      expect(ulpDistanceBinary64(1, Number.POSITIVE_INFINITY)).toBe(Number.POSITIVE_INFINITY);
+      expect(() => ulpDistanceBinary64(Number.NaN, 1)).toThrow(RangeError);
+    });
+
+    it('accumulates ill-conditioned alternating series via kahanNeumaierSum without loss', () => {
+      const values = [1.0, 1e16, 1.0, -1e16, 1.0];
+      expect(kahanNeumaierSum(values)).toBe(3.0);
+      expect(() => kahanNeumaierSum([1, Number.NaN])).toThrow(RangeError);
+      expect(() => kahanNeumaierSum([1, Number.POSITIVE_INFINITY])).toThrow(RangeError);
+    });
+  });
+
+  describe('3. logSumExp — Shift by Maximum, Compensated Summation & Extreme Binary64 Range', () => {
+    it('returns -Infinity when all entries are -Infinity', () => {
+      expect(logSumExp([Number.NEGATIVE_INFINITY])).toBe(Number.NEGATIVE_INFINITY);
+      expect(
+        logSumExp([
+          Number.NEGATIVE_INFINITY,
+          Number.NEGATIVE_INFINITY,
+          Number.NEGATIVE_INFINITY,
+        ]),
+      ).toBe(Number.NEGATIVE_INFINITY);
+    });
+
+    it('ignores -Infinity terms when at least one finite entry is present', () => {
+      expect(logSumExp([Number.NEGATIVE_INFINITY, -3.5, Number.NEGATIVE_INFINITY])).toBe(-3.5);
+      expect(logSumExp([Number.NEGATIVE_INFINITY, 0, 0])).toBeCloseTo(Math.LN2, 15);
+    });
+
+    it('evaluates extreme negative and positive magnitudes without underflow or overflow, including [1e308, 1e308]', () => {
+      // Deep negative regime where naive exp(-1000) === 0
+      const neg1000 = logSumExp([-1000, -1000, -1000]);
+      const expectedNeg1000 = -1000 + Math.log(3);
+      expect(ulpDistanceBinary64(neg1000, expectedNeg1000)).toBeLessThanOrEqual(2);
+
+      // Extreme positive magnitude [1e308, 1e308]:
+      // ulp(1e308) = 2^970 ~ 9.98e291 >> ln(2), so fl(1e308 + ln(2)) === 1e308 within 0.5 ULP
+      const extremePos = logSumExp([1e308, 1e308]);
+      expect(Number.isFinite(extremePos)).toBe(true);
+      expect(extremePos).toBe(1e308);
+      expect(ulpDistanceBinary64(extremePos, 1e308 + Math.LN2)).toBeLessThanOrEqual(1);
+
+      // Extreme negative magnitude [-1e308, -1e308]
+      const extremeNeg = logSumExp([-1e308, -1e308]);
+      expect(Number.isFinite(extremeNeg)).toBe(true);
+      expect(ulpDistanceBinary64(extremeNeg, -1e308 + Math.LN2)).toBeLessThanOrEqual(1);
+
+      // Wide dynamic range [1e308, -1e308]
+      expect(logSumExp([1e308, -1e308])).toBe(1e308);
+
+      // Single element is exact to 0 ULP across all magnitudes
+      for (const x of [-1e308, -745, -1, 0, 1, 709, 1e308]) {
+        expect(logSumExp([x])).toBe(x);
+      }
+    });
+
+    it('satisfies the relative / ULP error bound across large arrays of 10,000 elements', () => {
+      const n = 10_000;
+      const val = -250.5;
+      const arr = new Array<number>(n).fill(val);
+      const actual = logSumExp(arr);
+      const expected = val + Math.log(n);
+      expect(Math.abs(actual - expected)).toBeLessThanOrEqual(
+        Math.max(2.5e-15, 2 * ulpBinary64(expected)),
+      );
+    });
+
+    it('rejects empty arrays, NaN, and +Infinity at any index with RangeError', () => {
+      expect(() => logSumExp([])).toThrow(RangeError);
+      expect(() => logSumExp([Number.NaN])).toThrow(RangeError);
+      expect(() => logSumExp([Number.NEGATIVE_INFINITY, Number.NaN])).toThrow(RangeError);
+      expect(() => logSumExp([1, 2, Number.NaN])).toThrow(RangeError);
+      expect(() => logSumExp([Number.POSITIVE_INFINITY])).toThrow(RangeError);
+      expect(() => logSumExp([-10, Number.POSITIVE_INFINITY])).toThrow(RangeError);
+      expect(() =>
+        logSumExp([Number.NEGATIVE_INFINITY, Number.POSITIVE_INFINITY]),
+      ).toThrow(RangeError);
+    });
+  });
+
+  describe('4. log1mexp & IEEE 754 binary64 Probability Regimes & ULP Validation', () => {
+    it('verifies exact IEEE 754 binary64 threshold constants', () => {
+      expect(LN_MIN_NORMAL_BINARY64).toBeCloseTo(-708.3964185322641, 12);
+      expect(LN_MIN_SUBNORMAL_BINARY64).toBeCloseTo(-744.4400719213812, 12);
+      expect(LN_ROUND_TO_ZERO_THRESHOLD_BINARY64).toBeCloseTo(-745.1332191019412, 12);
+      expect(LN_SATURATED_TO_ONE_THRESHOLD_BINARY64).toBeCloseTo(-37.42994775023705, 13);
+      expect(LN_SWITCH_LOG1MEXP).toBeCloseTo(-0.6931471805599453, 15);
+    });
+
+    it('evaluates log1mexp accurately across near-zero, switch point, normal, subnormal, and underflow regimes', () => {
+      // Near 0 (x = -1e-12): reference -27.631021115929048208
+      expectRelativeErrorWithin(log1mexp(-1e-12), -27.631021115929048208, 1e-15);
+
+      // At switch point -ln(2): ln(1 - 0.5) = -ln(2)
+      expect(ulpDistanceBinary64(log1mexp(-Math.LN2), -Math.LN2)).toBeLessThanOrEqual(1);
+
+      // At x = -40: must NOT return 0; returns -exp(-40) ~ -4.248354255291589e-18
+      const l40 = log1mexp(-40);
+      expect(l40).not.toBe(0);
+      expectRelativeErrorWithin(l40, -4.2483542552915889953e-18, 1e-15);
+
+      // Normal boundary -1022 * ln(2) ~ -708.3964185322641
+      const lNormalMin = log1mexp(LN_MIN_NORMAL_BINARY64);
+      expect(lNormalMin).toBeLessThan(0);
+      expect(Math.abs(lNormalMin)).toBeGreaterThanOrEqual(2 ** -1022);
+
+      // Subnormal regime (-720): -exp(-720) is non-zero subnormal
+      const lSub = log1mexp(-720);
+      expect(lSub).toBeLessThan(0);
+      expect(Math.abs(lSub)).toBeLessThan(2 ** -1022);
+      expect(Math.abs(lSub)).toBeGreaterThanOrEqual(Number.MIN_VALUE);
+
+      // Smallest subnormal -1074 * ln(2) ~ -744.4400719213812
+      expect(log1mexp(LN_MIN_SUBNORMAL_BINARY64)).toBe(-Number.MIN_VALUE);
+
+      // Round-to-zero boundary -1075 * ln(2) ~ -745.1332191019412
+      expect(Math.exp(LN_ROUND_TO_ZERO_THRESHOLD_BINARY64)).toBe(0);
+      expect(log1mexp(LN_ROUND_TO_ZERO_THRESHOLD_BINARY64)).toBe(0);
+
+      // Exact endpoints and invalid inputs
+      expect(log1mexp(0)).toBe(Number.NEGATIVE_INFINITY);
+      expect(log1mexp(-0)).toBe(Number.NEGATIVE_INFINITY);
+      expect(log1mexp(Number.NEGATIVE_INFINITY)).toBe(0);
+      expect(() => log1mexp(1e-10)).toThrow(RangeError);
+      expect(() => log1mexp(Number.POSITIVE_INFINITY)).toThrow(RangeError);
+      expect(() => log1mexp(Number.NaN)).toThrow(RangeError);
+    });
+
+    it('classifies all 6 binary64 probability states and enforces ULP complementary log coherence', () => {
+      // 1. exact-zero
+      expect(classifyBinary64Probability(Number.NEGATIVE_INFINITY, 0)).toBe('exact-zero');
+      // 2. exact-one
+      expect(classifyBinary64Probability(0, Number.NEGATIVE_INFINITY)).toBe('exact-one');
+      // 3. underflow-to-zero at -745.1332191019412
+      expect(classifyBinary64Probability(-745.1332191019412, -0.0)).toBe('underflow-to-zero');
+      expect(classifyBinary64Probability(-800, 0)).toBe('underflow-to-zero');
+      // 4. subnormal-probability in (-745.1332191019412, -708.3964185322641)
+      expect(classifyBinary64Probability(-720, log1mexp(-720))).toBe('subnormal-probability');
+      expect(
+        classifyBinary64Probability(LN_MIN_SUBNORMAL_BINARY64, -Number.MIN_VALUE),
+      ).toBe('subnormal-probability');
+      // 5. interior-normal
+      expect(classifyBinary64Probability(-40, log1mexp(-40))).toBe('interior-normal');
+      expect(classifyBinary64Probability(Math.log(0.25), Math.log(0.75))).toBe('interior-normal');
+      // 6. saturated-to-one when logCompProb <= -54 * ln(2)
+      expect(classifyBinary64Probability(log1mexp(-40), -40)).toBe('saturated-to-one');
+      expect(
+        classifyBinary64Probability(
+          log1mexp(LN_SATURATED_TO_ONE_THRESHOLD_BINARY64),
+          LN_SATURATED_TO_ONE_THRESHOLD_BINARY64,
+        ),
+      ).toBe('saturated-to-one');
+
+      // Mandatory rejections from v4.4.1–v4.4.3 specification:
+      expect(() => classifyBinary64Probability(-708.3964185322641, -0.0)).toThrow(RangeError);
+      expect(() => classifyBinary64Probability(-708.3964185322642, -0.0)).toThrow(RangeError);
+      expect(() => classifyBinary64Probability(-745.1332191019411, -0.0)).toThrow(RangeError);
+
+      // Additional incoherent pairs
+      expect(() => classifyBinary64Probability(-1, -1)).toThrow(RangeError);
+      expect(() => classifyBinary64Probability(-20, -1e-6)).toThrow(RangeError);
+      expect(() => classifyBinary64Probability(Number.NEGATIVE_INFINITY, -1)).toThrow(RangeError);
+      expect(() => classifyBinary64Probability(-1, Number.NEGATIVE_INFINITY)).toThrow(RangeError);
+      expect(validateComplementaryLogPair(0.5, -1).valid).toBe(false);
+    });
+
+    it('constructs immutable DualChannelProbability instances preserving tail precision', () => {
+      const sat = createDualChannelProbabilityFromComplementLog(-45);
+      expect(sat.status).toBe('saturated-to-one');
+      expect(sat.probability).toBe(1);
+      expect(sat.logComplementProbability).toBe(-45);
+      expect(sat.complementProbability).toBe(Math.exp(-45));
+
+      const sub = createDualChannelProbabilityFromLog(-725);
+      expect(sub.status).toBe('subnormal-probability');
+      expect(sub.probability).toBe(Math.exp(-725));
+      expect(sub.probability).toBeGreaterThan(0);
+      expect(sub.probability).toBeLessThan(2 ** -1022);
+
+      const pHalf = createDualChannelProbability(0.5);
+      expect(pHalf.status).toBe('interior-normal');
+      expect(pHalf.probability).toBe(0.5);
+      expect(pHalf.complementProbability).toBe(0.5);
+      expect(Object.isFrozen(pHalf)).toBe(true);
+
+      const pPair = createDualChannelProbabilityFromPair(Math.log(0.25), Math.log(0.75));
+      expect(pPair.status).toBe('interior-normal');
+      expect(pPair.probability).toBeCloseTo(0.25, 15);
+      expect(pPair.complementProbability).toBeCloseTo(0.75, 15);
+
+      const pZero = createDualChannelProbability(0);
+      expect(pZero.status).toBe('exact-zero');
+      const pOne = createDualChannelProbability(1);
+      expect(pOne.status).toBe('exact-one');
+    });
+  });
+
+  describe('5. erfcx, erfcxConditionNumber, & erfcxDiffPositive (Peano-Markov & Stieltjes Bounds)', () => {
+    it('matches 20-digit reference values for erfcx across [0, 100] and +Infinity', () => {
+      const references: ReadonlyArray<readonly [number, number]> = [
+        [0.0, 1.0],
+        [0.1, 0.89645697996912663972],
+        [0.25, 0.77034654773099673818],
+        [0.46875, 0.6320696892495560662],
+        [1.0, 0.42758357615580695976],
+        [1.5, 0.3215854164543173237],
+        [2.0, 0.25539567631050468468],
+        [4.0, 0.13699945762506139256],
+        [5.0, 0.11070463773306862853],
+        [10.0, 0.056140992743822586952],
+        [50.0, 0.01128153626532377272],
+        [100.0, 0.0056416137829894330135],
+      ];
+
+      for (const [x, expected] of references) {
+        expectRelativeErrorWithin(erfcx(x), expected, 5e-15);
+      }
+      expect(erfcx(Number.POSITIVE_INFINITY)).toBe(0);
+      expect(() => erfcx(-0.1)).toThrow(RangeError);
+      expect(() => erfcx(Number.NaN)).toThrow(RangeError);
+    });
+
+    it('verifies erfcxConditionNumber is strictly increasing in [0, 1) for finite x >= 0', () => {
+      expect(erfcxConditionNumber(0)).toBe(0);
+      expect(erfcxConditionNumber(Number.POSITIVE_INFINITY)).toBe(1);
+      let prev = 0;
+      for (const x of [0.1, 0.5, 1.0, 1.5, 2.0, 5.0, 10.0, 50.0, 100.0]) {
+        const kappa = erfcxConditionNumber(x);
+        expect(kappa).toBeGreaterThan(prev);
+        expect(kappa).toBeLessThan(1);
+        prev = kappa;
+      }
+    });
+
+    it('evaluates erfcxDiffPositive with relative error <= 1e-13 across direct, Stieltjes CF, and asymptotic regimes', () => {
+      // Exact zero and infinite upper bound
+      expect(erfcxDiffPositive(2.5, 2.5)).toBe(0);
+      expect(erfcxDiffPositive(1.0, Number.POSITIVE_INFINITY)).toBe(erfcx(1.0));
+
+      // Direct subtraction regime (erfcx(b) <= 0.75 * erfcx(a))
+      expectRelativeErrorWithin(
+        erfcxDiffPositive(0.0, 1.0),
+        1.0 - 0.42758357615580695976,
+        1e-13,
+      );
+
+      // Counterexample from v4.4.2 where erfcx(b) > 0.75 * erfcx(a) and (b - a) / max(1, a) = 0.5055 > 0.35
+      expectRelativeErrorWithin(
+        erfcxDiffPositive(1.0, 1.50550065356),
+        1.0689589403857435242e-1,
+        1e-13,
+      );
+
+      // Subinterval crossing u = 1.5 (where local max step h_m <= 0.075 gives Peano bound <= 3.10e-31)
+      expectRelativeErrorWithin(
+        erfcxDiffPositive(1.4, 1.6),
+        3.2790548408793598978e-2,
+        1e-13,
+      );
+
+      // Close intervals: verify against the exact mathematical difference of the represented binary64 floats
+      expectRelativeErrorWithin(
+        erfcxDiffPositive(0.5, 0.5 + 1e-8),
+        5.1268882188526531095e-9,
+        1e-13,
+      );
+      expectRelativeErrorWithin(
+        erfcxDiffPositive(10.0, 10.0 + 1e-8),
+        5.5593126735617059257e-11,
+        1e-13,
+      );
+      expectRelativeErrorWithin(
+        erfcxDiffPositive(100.0, 100.0 + 1e-6),
+        5.6410496919549989106e-11,
+        1e-13,
+      );
+
+      // Also verify against the decimal-ideal references of v4.4.3 within the exact binary64 input-rounding bound
+      expectRelativeErrorWithin(
+        erfcxDiffPositive(0.5, 0.5 + 1e-8),
+        5.1268881930912739381e-9,
+        1e-8,
+      );
+      expectRelativeErrorWithin(
+        erfcxDiffPositive(10.0, 10.0 + 1e-8),
+        5.559312213582151219e-11,
+        1e-7,
+      );
+      expectRelativeErrorWithin(
+        erfcxDiffPositive(100.0, 100.0 + 1e-6),
+        5.6410497061972800392e-11,
+        1e-8,
+      );
+    });
+
+    it('throws NumericConvergenceError when Stieltjes CF iteration budget is insufficient and rejects invalid domains', () => {
+      expect(() => erfcxDiffPositive(2.0, 2.01, { maxIterations: 3 })).toThrow(
+        NumericConvergenceError,
+      );
+      expect(() => erfcxDerivativePositive(2.0, { maxIterations: 3 })).toThrow(RangeError);
+      expect(() => erfcxDiffPositive(-1, 1)).toThrow(RangeError);
+      expect(() => erfcxDiffPositive(2, 1)).toThrow(RangeError);
+      expect(() => erfcxDiffPositive(Number.NaN, 1)).toThrow(RangeError);
+    });
+  });
+
+  describe('6. lnGamma, stirlingError, lnBeta, & poissonDeviance', () => {
+    it('evaluates lnGamma near 1 and 2 without cancellation and without zeta(1), matching represented and decimal references', () => {
+      expect(lnGamma(1.0)).toBe(0);
+      expect(lnGamma(2.0)).toBe(0);
+
+      // Verify against the exact mathematical value at the represented binary64 float (<= 1e-20 abs error)
+      expect(Math.abs(lnGamma(1.0 + 1e-5) - -5.7720744027504826216e-6)).toBeLessThanOrEqual(
+        1e-20,
+      );
+      expect(Math.abs(lnGamma(1.0 - 1e-5) - 5.7722388960930893727e-6)).toBeLessThanOrEqual(
+        1e-20,
+      );
+      expect(Math.abs(lnGamma(2.0 + 1e-5) - 4.2278755976483595969e-6)).toBeLessThanOrEqual(
+        1e-20,
+      );
+      expect(Math.abs(lnGamma(2.0 - 1e-5) - -4.2278111042416735176e-6)).toBeLessThanOrEqual(
+        1e-20,
+      );
+
+      // Also verify against the v4.4.3 decimal-ideal references within the 5e-15 absolute tolerance
+      expect(Math.abs(lnGamma(1.0 + 1e-5) - -5.7720744027126691233e-6)).toBeLessThanOrEqual(
+        5e-15,
+      );
+      expect(Math.abs(lnGamma(1.0 - 1e-5) - 5.7722388961193593576e-6)).toBeLessThanOrEqual(
+        5e-15,
+      );
+      expect(Math.abs(lnGamma(2.0 + 1e-5) - 4.22787559762066171e-6)).toBeLessThanOrEqual(
+        5e-15,
+      );
+      expect(Math.abs(lnGamma(2.0 - 1e-5) - -4.2278111042139764758e-6)).toBeLessThanOrEqual(
+        5e-15,
+      );
+    });
+
+    it('matches high-precision references for lnGamma, stirlingError, and lnBeta(2.5, 4.5) = ln(7*pi/1024)', () => {
+      expectRelativeErrorWithin(lnGamma(0.1), 2.2527126517342059599, 5e-15);
+      expectRelativeErrorWithin(lnGamma(0.5), 0.5 * Math.log(Math.PI), 5e-15);
+      expectRelativeErrorWithin(lnGamma(1.5), Math.log(0.5 * Math.sqrt(Math.PI)), 5e-15);
+      expectRelativeErrorWithin(lnGamma(10.0), Math.log(362880), 5e-15);
+      expectRelativeErrorWithin(lnGamma(50.0), 144.56574394634488607, 5e-15);
+
+      // Exact identity B(5/2, 9/2) = 7 * pi / 1024 = 0.021475731030398977216
+      const expectedLnBeta = Math.log((7 * Math.PI) / 1024);
+      expect(Math.abs(lnBeta(2.5, 4.5) - expectedLnBeta)).toBeLessThanOrEqual(1e-15);
+
+      // Large parameters a = 1000, b = 1000 via stirlingError decomposition
+      expectRelativeErrorWithin(
+        stirlingError(20),
+        1 / (12 * 20) - 1 / (360 * 8000) + 1 / (1260 * 3_200_000) - 1 / (1680 * 1_280_000_000),
+        1e-12,
+      );
+      expect(lnBeta(1000, 1000)).toBeLessThan(0);
+
+      expect(() => lnGamma(0)).toThrow(RangeError);
+      expect(() => lnGamma(-2)).toThrow(RangeError);
+      expect(() => lnGamma(1e9)).toThrow(RangeError);
+    });
+
+    it('evaluates poissonDeviance without catastrophic cancellation when y ~ mu', () => {
+      expect(poissonDevianceTerm(0, 3.5)).toBe(7.0);
+      expect(poissonDevianceTerm(4.2, 4.2)).toBe(0);
+      // Exact dyadic perturbation y = 1024, u = 2^-24 where mu = y * (1 + u) has zero input rounding
+      const y = 1024;
+      const u = 2 ** -24;
+      const mu = y * (1 + u);
+      const dev = poissonDeviance([y], [mu]);
+      const expected = 2 * y * (u * u * (0.5 - u / 3 + (u * u) / 4));
+      expectRelativeErrorWithin(dev, expected, 1e-14);
+    });
+  });
+
+  describe('7. Regularized Incomplete Gamma P, Q & inverseRegularizedGammaQ', () => {
+    it('enforces exact boundary contracts at x = 0, x = +Infinity, q = 1, and q = 0', () => {
+      for (const a of [0.05, 0.5, 1.0, 2.5, 100.0, 4999.5, 10000.0]) {
+        expect(regularizedGammaP(a, 0)).toBe(0);
+        expect(regularizedGammaQ(a, 0)).toBe(1);
+        expect(regularizedGammaP(a, Number.POSITIVE_INFINITY)).toBe(1);
+        expect(regularizedGammaQ(a, Number.POSITIVE_INFINITY)).toBe(0);
+        expect(inverseRegularizedGammaQ(a, 1)).toBe(0);
+        expect(inverseRegularizedGammaQ(a, 0)).toBe(Number.POSITIVE_INFINITY);
+      }
+    });
+
+    it('matches inverseRegularizedGammaQ(4999.5, 0.50) = 4999.1666706179675725 and round-trips P + Q = 1', () => {
+      const xMed = inverseRegularizedGammaQ(4999.5, 0.5);
+      expectRelativeErrorWithin(xMed, 4999.1666706179675725, 1e-13);
+      expect(Math.abs(regularizedGammaQ(4999.5, xMed) - 0.5)).toBeLessThanOrEqual(1e-13);
+      expect(Math.abs(regularizedGammaP(4999.5, xMed) - 0.5)).toBeLessThanOrEqual(1e-13);
+
+      for (const [a, q] of [
+        [0.5, 0.05],
+        [1.0, 0.1],
+        [2.5, 0.25],
+        [10.0, 0.01],
+        [250.0, 0.9],
+      ] as const) {
+        const x = inverseRegularizedGammaQ(a, q);
+        const qBack = regularizedGammaQ(a, x);
+        const pBack = regularizedGammaP(a, x);
+        expect(Math.abs(pBack + qBack - 1)).toBeLessThanOrEqual(1e-15);
+        expectRelativeErrorWithin(qBack, q, 1e-11);
+      }
+    });
+
+    it('throws NumericConvergenceError when iteration budget is exhausted and rejects invalid parameters', () => {
+      expect(() => regularizedGammaP(50, 45, { maxIterations: 2 })).toThrow(
+        NumericConvergenceError,
+      );
+      expect(() => regularizedGammaQ(50, 55, { maxIterations: 2 })).toThrow(
+        NumericConvergenceError,
+      );
+      expect(() => regularizedGammaP(0.01, 1)).toThrow(RangeError);
+      expect(() => regularizedGammaQ(1, -0.1)).toThrow(RangeError);
+      expect(() => inverseRegularizedGammaQ(1, 1.1)).toThrow(RangeError);
+    });
+  });
+
+  describe('8. Regularized Incomplete Beta & inverseRegularizedIncompleteBeta', () => {
+    it('enforces exact boundary contracts at x in {0, 1} and p in {0, 1}', () => {
+      for (const [a, b] of [
+        [0.05, 0.05],
+        [2.5, 4.5],
+        [10.5, 10.5],
+        [1000, 1000],
+      ] as const) {
+        expect(regularizedIncompleteBeta(0, a, b)).toBe(0);
+        expect(regularizedIncompleteBeta(1, a, b)).toBe(1);
+        expect(inverseRegularizedIncompleteBeta(0, a, b)).toBe(0);
+        expect(inverseRegularizedIncompleteBeta(1, a, b)).toBe(1);
+      }
+    });
+
+    it('matches the corrected v4.4.2 reference I_0.3(2.5, 4.5) = 0.40653901668245927373', () => {
+      // B(5/2, 9/2) = 7*pi/1024 = 0.021475731030398977216
+      // int_0^0.3 t^(3/2)*(1-t)^(7/2) dt = 0.0087307225756353780867
+      // Ratio = 0.40653901668245927373
+      const actual = regularizedIncompleteBeta(0.3, 2.5, 4.5);
+      expect(Math.abs(actual - 0.40653901668245927373)).toBeLessThanOrEqual(1e-14);
+    });
+
+    it('matches inverseRegularizedIncompleteBeta references at (0.05, 10.5, 10.5) and (0.95, 10.5, 10.5) with exact symmetry', () => {
+      const q05 = inverseRegularizedIncompleteBeta(0.05, 10.5, 10.5);
+      const q95 = inverseRegularizedIncompleteBeta(0.95, 10.5, 10.5);
+      expect(Math.abs(q05 - 0.32423438452823023898)).toBeLessThanOrEqual(1e-13);
+      expect(Math.abs(q95 - 0.67576561547176976102)).toBeLessThanOrEqual(1e-13);
+      expect(Math.abs(q05 + q95 - 1)).toBeLessThanOrEqual(5e-16);
+      // Exact dyadic complement 0.0625 + 0.9375 === 1 has 0-ULP reflection identity
+      const qDyadicLow = inverseRegularizedIncompleteBeta(0.0625, 10.5, 10.5);
+      const qDyadicHigh = inverseRegularizedIncompleteBeta(0.9375, 10.5, 10.5);
+      expect(1 - qDyadicLow).toBe(qDyadicHigh);
+      expect(inverseRegularizedIncompleteBeta(0.5, 10.5, 10.5)).toBe(0.5);
+    });
+
+    it('throws NumericConvergenceError on insufficient iteration budget and rejects out-of-range inputs', () => {
+      expect(() => regularizedIncompleteBeta(0.5, 500, 500, { maxIterations: 2 })).toThrow(
+        NumericConvergenceError,
+      );
+      expect(() => regularizedIncompleteBeta(-0.1, 2, 2)).toThrow(RangeError);
+      expect(() => regularizedIncompleteBeta(1.1, 2, 2)).toThrow(RangeError);
+      expect(() => inverseRegularizedIncompleteBeta(-0.01, 2, 2)).toThrow(RangeError);
+    });
+  });
+
+  describe('9. Central Student-t CDF & Quantile Function (Including Exact df = 1, 2, 4)', () => {
+    it('enforces exact boundary contracts at +/-Infinity and p in {0, 1}, and handles huge finite t = +/-1e200', () => {
+      for (const df of [1, 2, 4, 10, 60, 120, 20000]) {
+        expect(studentTCdf(Number.NEGATIVE_INFINITY, df)).toBe(0);
+        expect(studentTCdf(Number.POSITIVE_INFINITY, df)).toBe(1);
+        expect(studentTCdf(0, df)).toBe(0.5);
+        expect(studentTCdf(1e200, df)).toBe(1);
+        expect(studentTCdf(-1e200, df)).toBe(0);
+        expect(inverseStudentTCdf(0, df)).toBe(Number.NEGATIVE_INFINITY);
+        expect(inverseStudentTCdf(1, df)).toBe(Number.POSITIVE_INFINITY);
+        expect(inverseStudentTCdf(0.5, df)).toBe(0);
+      }
+    });
+
+    it('verifies exact df = 4 CDF and intermediate quantile values (theta, x, t) at p = 0.975', () => {
+      expect(Math.abs(studentTCdf(3.0, 4) - 0.98002901596414058636)).toBeLessThanOrEqual(1e-15);
+
+      const details = computeStudentT4InverseIntermediates(0.975);
+      expect(Math.abs(details.theta - 0.41774529916779175291)).toBeLessThanOrEqual(1e-15);
+      expect(Math.abs(details.x - 0.81140135189950784672)).toBeLessThanOrEqual(1e-15);
+      expect(Math.abs(details.t - 2.7764451051977943578)).toBeLessThanOrEqual(1e-14);
+      expect(Math.abs(inverseStudentTCdf(0.975, 4) - 2.7764451051977943578)).toBeLessThanOrEqual(
+        1e-14,
+      );
+      expect(Math.abs(inverseStudentTCdf(0.025, 4) - -2.7764451051977943578)).toBeLessThanOrEqual(
+        1e-14,
+      );
+    });
+
+    it('matches 20-digit quantile references for df = 1, 2, 60, and 120', () => {
+      expectRelativeErrorWithin(inverseStudentTCdf(0.975, 1), 12.706204736174704646, 1e-14);
+      expectRelativeErrorWithin(inverseStudentTCdf(0.975, 2), 4.3026527297494638523, 1e-14);
+      expectRelativeErrorWithin(inverseStudentTCdf(0.995, 60), 2.6602830288550371871, 1e-13);
+      expectRelativeErrorWithin(inverseStudentTCdf(0.975, 120), 1.9799304050824408467, 1e-13);
+
+      // Normal quantile round-trip
+      expect(Math.abs(normalCdf(inverseNormalCdf(0.999)) - 0.999)).toBeLessThanOrEqual(1e-15);
+    });
+  });
+
+  describe('10. nonCentralChiSquarePower & nonCentralStudentTCdf (Benton-Krishnamoorthy)', () => {
+    it('evaluates nonCentralChiSquarePower accurately at (4.0, 1, 0.05) and ncp = 0', () => {
+      expect(nonCentralChiSquarePower(0, 5, 0.05)).toBe(0.05);
+      expect(
+        Math.abs(nonCentralChiSquarePower(4.0, 1, 0.05) - 0.51600527397617473718),
+      ).toBeLessThanOrEqual(1e-12);
+      expect(() => nonCentralChiSquarePower(500, 10, 0.05, { maxIterations: 2 })).toThrow(
+        NumericConvergenceError,
+      );
+    });
+
+    it('evaluates nonCentralStudentTCdf across all 4 sign quadrants of (t, delta)', () => {
+      // Quadrant I: t > 0, delta > 0
+      expect(
+        Math.abs(nonCentralStudentTCdf(1.0, 10, 2.0) - 0.15851505953771169513),
+      ).toBeLessThanOrEqual(1e-13);
+      // Quadrant IV: t > 0, delta < 0
+      expect(
+        Math.abs(nonCentralStudentTCdf(1.0, 10, -2.0) - 0.99818356658957035093),
+      ).toBeLessThanOrEqual(1e-13);
+      // Quadrant II: t < 0, delta > 0
+      expect(
+        Math.abs(nonCentralStudentTCdf(-1.0, 10, 2.0) - 0.0018164334104296490679),
+      ).toBeLessThanOrEqual(1e-13);
+      // Quadrant III: t < 0, delta < 0
+      expect(
+        Math.abs(nonCentralStudentTCdf(-1.0, 10, -2.0) - 0.84148494046228830487),
+      ).toBeLessThanOrEqual(1e-13);
+
+      // Exact reflection symmetry F(t; nu, delta) + F(-t; nu, -delta) === 1
+      expect(
+        Math.abs(
+          nonCentralStudentTCdf(1.0, 10, 2.0) + nonCentralStudentTCdf(-1.0, 10, -2.0) - 1,
+        ),
+      ).toBeLessThanOrEqual(1e-15);
+      expect(
+        Math.abs(
+          nonCentralStudentTCdf(1.0, 10, -2.0) + nonCentralStudentTCdf(-1.0, 10, 2.0) - 1,
+        ),
+      ).toBeLessThanOrEqual(1e-15);
+    });
+
+    it('delegates delta === 0 to central studentTCdf, handles t === 0, and evaluates extreme noncentrality |delta| = 50', () => {
+      // delta === 0
+      for (const t of [-3.5, -0.5, 0, 0.5, 2.75, 1e200]) {
+        expect(nonCentralStudentTCdf(t, 12, 0)).toBe(studentTCdf(t, 12));
+      }
+
+      // t === 0 -> Phi(-delta)
+      expect(nonCentralStudentTCdf(0, 15, 2.0)).toBeCloseTo(normalCdf(-2.0), 15);
+      expect(nonCentralStudentTCdf(0, 15, -2.0)).toBeCloseTo(normalCdf(2.0), 15);
+
+      // High noncentrality reference points from v4.4–v4.4.3
+      expect(
+        Math.abs(nonCentralStudentTCdf(2.2281388519649385, 10, 2.0) - 0.56044793641770942754),
+      ).toBeLessThanOrEqual(1e-12);
+      expect(
+        Math.abs(nonCentralStudentTCdf(2.0859634472658364, 20, 3.0) - 0.18583062138230143021),
+      ).toBeLessThanOrEqual(1e-12);
+      expect(
+        Math.abs(nonCentralStudentTCdf(55.0, 20, 50.0) - 0.68228248261497954098),
+      ).toBeLessThanOrEqual(1e-9);
+      expect(
+        Math.abs(nonCentralStudentTCdf(-55.0, 20, -50.0) - 0.31771751738502045902),
+      ).toBeLessThanOrEqual(1e-9);
+    });
+
+    it('handles huge finite t (including +/-1e200) without Infinity/Infinity NaN and enforces +/-Infinity boundaries', () => {
+      expect(nonCentralStudentTCdf(Number.NEGATIVE_INFINITY, 10, 2.0)).toBe(0);
+      expect(nonCentralStudentTCdf(Number.POSITIVE_INFINITY, 10, 2.0)).toBe(1);
+      expect(nonCentralStudentTCdf(1e200, 10, 2.0)).toBe(1);
+      expect(nonCentralStudentTCdf(-1e200, 10, 2.0)).toBe(0);
+      expect(nonCentralStudentTCdf(1e200, 10, -2.0)).toBe(1);
+      expect(nonCentralStudentTCdf(-1e200, 10, -2.0)).toBe(0);
+      expect(nonCentralStudentTCdf(1e200, 20, 50.0)).toBe(1);
+      expect(nonCentralStudentTCdf(-1e200, 20, 50.0)).toBe(0);
+    });
+
+    it('throws NumericConvergenceError when truncation bound B_tail(S) <= 1e-12 is not reached within maxIterations', () => {
+      expect(() => nonCentralStudentTCdf(55.0, 20, 50.0, { maxIterations: 5 })).toThrow(
+        NumericConvergenceError,
+      );
+      expect(() => nonCentralStudentTCdf(55.0, 20, 50.0, { maxIterations: 5 })).toThrow(
+        RangeError,
+      );
+      expect(() => nonCentralStudentTCdf(1.0, 10, 55.0)).toThrow(RangeError);
+      expect(() => nonCentralStudentTCdf(1.0, 0.5, 2.0)).toThrow(RangeError);
+      expect(() => nonCentralStudentTCdf(Number.NaN, 10, 2.0)).toThrow(RangeError);
+    });
+  });
+
+  describe('11. Orthogonal Variance & Entropy Decompositions', () => {
+    it('satisfies exact three-way variance closure p_bar*(1 - p_bar) = aleatoric + within + between', () => {
+      const m1 = createDualChannelProbability(0.25);
+      const m2 = createDualChannelProbability(0.65);
+      const m3 = createDualChannelProbability(0.45);
+
+      const decomp = decomposeCategoryUncertainty(
+        0,
+        'outcome-yes',
+        [
+          {
+            methodId: 'beta-binomial-conjugate',
+            weight: 0.5,
+            predictiveProbability: m1,
+            parametricVariance: 0.015,
+          },
+          {
+            methodId: 'poisson-gamma-hazard',
+            weight: 0.3,
+            predictiveProbability: m2,
+            parametricVariance: 0.02,
+          },
+          {
+            methodId: 'structural-uniform-baseline',
+            weight: 0.2,
+            predictiveProbability: m3,
+            parametricVariance: 0,
+          },
+        ],
+        {
+          kind: 'available',
+          interval: {
+            level: 0.9,
+            lower: 0.18,
+            upper: 0.68,
+            median: 0.41,
+            parameterName: 'theta_yes',
+            interpretation: 'epistemic-parameter-uncertainty-not-outcome-frequency',
+          },
+        },
+      );
+
+      expect(decomp.predictiveProbability.probability).toBeCloseTo(
+        0.5 * 0.25 + 0.3 * 0.65 + 0.2 * 0.45,
+        15,
+      );
+      expect(decomp.aleatoricVariance).toBeGreaterThan(0);
+      expect(decomp.withinMethodParametricVariance).toBeCloseTo(0.5 * 0.015 + 0.3 * 0.02, 15);
+      expect(decomp.betweenMethodDisagreementVariance).toBeGreaterThan(0);
+      expect(decomp.closureResidual).toBeLessThanOrEqual(1e-15);
+    });
+
+    it('satisfies exact Shannon entropy & Jensen-Shannon divergence closure H(p_bar) = H_within + JSD_w', () => {
+      const dist1 = [
+        createDualChannelProbability(0.7),
+        createDualChannelProbability(0.2),
+        createDualChannelProbability(0.1),
+      ];
+      const dist2 = [
+        createDualChannelProbability(0.2),
+        createDualChannelProbability(0.5),
+        createDualChannelProbability(0.3),
+      ];
+      const weights = [0.6, 0.4];
+      const ensemble = [
+        createDualChannelProbability(0.6 * 0.7 + 0.4 * 0.2),
+        createDualChannelProbability(0.6 * 0.2 + 0.4 * 0.5),
+        createDualChannelProbability(0.6 * 0.1 + 0.4 * 0.3),
+      ];
+
+      const entropyDecomp = decomposeEnsembleEntropy([dist1, dist2], weights, ensemble);
+      expect(entropyDecomp.jensenShannonDivergenceNats).toBeGreaterThan(0);
+      expect(entropyDecomp.normalizedDisagreementIndex).toBeGreaterThan(0);
+      expect(entropyDecomp.normalizedDisagreementIndex).toBeLessThanOrEqual(1);
+      expect(entropyDecomp.closureResidualNats).toBeLessThanOrEqual(1e-15);
+    });
+  });
+});
