@@ -24,6 +24,7 @@ import {
   erfcxConditionNumber,
   erfcxDerivativePositive,
   erfcxDiffPositive,
+  evaluateLaplaceStieltjesEnclosure,
   inverseNormalCdf,
   inverseRegularizedGammaQ,
   inverseRegularizedIncompleteBeta,
@@ -35,6 +36,7 @@ import {
   logSumExp,
   nonCentralChiSquarePower,
   nonCentralStudentTCdf,
+  nonCentralStudentTDualCdf,
   normalCdf,
   poissonDeviance,
   poissonDevianceTerm,
@@ -45,8 +47,10 @@ import {
   studentTCdf,
   ulpBinary64,
   ulpDistanceBinary64,
+  validateCategoryUncertaintyDecomposition,
   validateComplementaryLogPair,
   validateDualChannelProbability,
+  validateEntropyDecomposition,
   validateExhaustiveDistribution,
   validateForecastDistributionContract,
   validateOutcomeSpaceDescriptor,
@@ -367,6 +371,34 @@ describe('Stage 2A-1 — Numeric Primitives & Forecast Contracts (v4.4.3)', () =
         expect(kappa).toBeLessThan(1);
         prev = kappa;
       }
+    });
+
+    it('evaluates Euler-Wallis Stieltjes convergents and certified enclosures in evaluateLaplaceStieltjesEnclosure and erfcxDerivativePositive across (1.5, 60]', () => {
+      // 25-digit independent Decimal(80) reference values for (u, R_CF(u), D_erfcx(u))
+      const stieltjesReferences: ReadonlyArray<readonly [number, number, number]> = [
+        [1.500001, 2.544002935301332038551633e-1, 1.636227654305791485407763e-1],
+        [1.6, 2.440400904728857946626332e-1, 1.493295918285011707874553e-1],
+        [2.0, 2.090804029972070989864449e-1, 1.067964618534895984358046e-1],
+        [3.0, 1.518768445016172124848946e-1, 5.437226000717287138039001e-2],
+        [5.0, 9.635002743184075330852912e-2, 2.133278976482631019403804e-2],
+        [10.0, 4.951205836730211477222544e-2, 5.559312219060856745811159e-3],
+        [30.0, 1.664819937811420283776863e-2, 6.258354105074840686391602e-4],
+        [60.0, 8.331020124378828964583477e-3, 1.566540743459432434058823e-4],
+      ];
+
+      for (const [u, exactRCf, exactDErfcx] of stieltjesReferences) {
+        const enc = evaluateLaplaceStieltjesEnclosure(u);
+        expect(enc.lowerConvergent).toBeLessThanOrEqual(enc.upperConvergent);
+        expect(enc.certifiedLowerBound).toBeLessThanOrEqual(exactRCf);
+        expect(enc.certifiedUpperBound).toBeGreaterThanOrEqual(exactRCf);
+        expect(Math.abs(enc.value - exactRCf)).toBeLessThanOrEqual(enc.certifiedErrorBound);
+        expectRelativeErrorWithin(enc.value, exactRCf, 2e-15);
+        expectRelativeErrorWithin(erfcxDerivativePositive(u), exactDErfcx, 5e-15);
+      }
+
+      expect(() => evaluateLaplaceStieltjesEnclosure(0)).toThrow(RangeError);
+      expect(() => evaluateLaplaceStieltjesEnclosure(-1)).toThrow(RangeError);
+      expect(() => evaluateLaplaceStieltjesEnclosure(2.0, 2)).toThrow(NumericConvergenceError);
     });
 
     it('evaluates erfcxDiffPositive with relative error <= 1e-13 across direct, Stieltjes CF, and asymptotic regimes', () => {
@@ -816,6 +848,74 @@ describe('Stage 2A-1 — Numeric Primitives & Forecast Contracts (v4.4.3)', () =
       expect(pMinusSmall).toBeGreaterThan(studentTCdf(1.0, 10));
     });
 
+    it('preserves deep lower-tail and upper-tail accuracy without 1 - CDF reflection cancellation, including F_t(10, ncp=10)(-20)', () => {
+      // 1. Independent 30-digit reference: F_t(10, ncp=10)(-20) = 3.886976004833870417352570567389e-39
+      const exactTailRef = 3.88697600483387041735e-39;
+      const lowerTailVal = nonCentralStudentTCdf(-20, 10, 10);
+      expectRelativeErrorWithin(lowerTailVal, exactTailRef, 1e-13);
+
+      // Dual-channel representation at (-20, 10, 10)
+      const lowerDual = nonCentralStudentTDualCdf(-20, 10, 10);
+      expect(validateDualChannelProbability(lowerDual)).toEqual(lowerDual);
+      expectRelativeErrorWithin(lowerDual.probability, exactTailRef, 1e-13);
+      expect(lowerDual.complementProbability).toBe(1);
+      expect(lowerDual.status).toBe('interior-normal');
+      expectRelativeErrorWithin(lowerDual.logProbability, Math.log(exactTailRef), 1e-14);
+
+      // 2. Equivalent upper tail at (t = +20, df = 10, ncp = -10):
+      // By exact distributional symmetry T_nu(delta) =^d -T_nu(-delta),
+      // 1 - F_t(10, ncp=-10)(20) = F_t(10, ncp=10)(-20) = 3.88697600483387041735e-39
+      const upperDual = nonCentralStudentTDualCdf(20, 10, -10);
+      expect(validateDualChannelProbability(upperDual)).toEqual(upperDual);
+      expect(upperDual.probability).toBe(1);
+      expect(upperDual.status).toBe('saturated-to-one');
+      expectRelativeErrorWithin(upperDual.complementProbability, exactTailRef, 1e-13);
+      expectRelativeErrorWithin(
+        upperDual.logComplementProbability,
+        Math.log(exactTailRef),
+        1e-14,
+      );
+      expect(upperDual.complementProbability).toBe(lowerDual.probability);
+      expect(upperDual.logComplementProbability).toBe(lowerDual.logProbability);
+
+      // 3. Additional high-precision tail & negative-ncp references across all 4 quadrants:
+      const tailReferences: ReadonlyArray<readonly [number, number, number, number]> = [
+        [-20, 10, -10, 1.15500900422341051806e-2],
+        [20, 10, 10, 9.88449909957765894819e-1],
+        [-5, 10, 3, 2.664337922210245957e-9],
+        [2, 10, 10, 2.26612742368488211297e-13],
+        [-2.5, 10, 1.5, 2.33802064033990057128e-4],
+        [2.5, 10, -1.5, 9.99766197935966009943e-1],
+        [-2.5, 10, -1.5, 2.06060890963816505812e-1],
+        [2.5, 10, 1.5, 7.93939109036183494188e-1],
+      ];
+
+      for (const [t, df, ncp, expected] of tailReferences) {
+        const cdfVal = nonCentralStudentTCdf(t, df, ncp);
+        expectRelativeErrorWithin(cdfVal, expected, 1e-13);
+        const dual = nonCentralStudentTDualCdf(t, df, ncp);
+        const dualMirror = nonCentralStudentTDualCdf(-t, df, -ncp);
+        expect(validateDualChannelProbability(dual)).toEqual(dual);
+        expect(validateDualChannelProbability(dualMirror)).toEqual(dualMirror);
+        expectRelativeErrorWithin(dual.probability, expected, 1e-13);
+        expectRelativeErrorWithin(dual.complementProbability, dualMirror.probability, 1e-14);
+        expectRelativeErrorWithin(
+          dual.logComplementProbability,
+          dualMirror.logProbability,
+          1e-14,
+        );
+      }
+
+      // 4. Central symmetry (ncp = 0) in deep lower/upper tails across df = 1, 2, 4, 10:
+      for (const df of [1, 2, 4, 10]) {
+        const dLower = nonCentralStudentTDualCdf(-50, df, 0);
+        const dUpper = nonCentralStudentTDualCdf(50, df, 0);
+        expect(dLower.probability).toBeGreaterThan(0);
+        expect(dLower.probability).toBe(dUpper.complementProbability);
+        expect(dLower.logProbability).toBe(dUpper.logComplementProbability);
+      }
+    });
+
     it('throws NumericConvergenceError when truncation bound B_tail(S) <= 1e-12 is not reached within maxIterations', () => {
       expect(() => nonCentralStudentTCdf(55.0, 20, 50.0, { maxIterations: 5 })).toThrow(
         NumericConvergenceError,
@@ -1152,6 +1252,50 @@ describe('Stage 2A-1 — Numeric Primitives & Forecast Contracts (v4.4.3)', () =
       expect(validateDualChannelProbability(pYes)).toEqual(pYes);
       expect(validateExhaustiveDistribution([pYes, pNo], 2)).toHaveLength(2);
 
+      // Valid boundary, underflow, subnormal, and saturated-to-one DualChannelProbability states are preserved:
+      const pSubnormal = createDualChannelProbabilityFromLog(-720);
+      const pSaturated = createDualChannelProbabilityFromComplementLog(-45);
+      const pUnderflow = createDualChannelProbabilityFromLog(-800);
+      const pExactZero = createDualChannelProbability(0);
+      const pExactOne = createDualChannelProbability(1);
+      expect(validateDualChannelProbability(pSubnormal).status).toBe('subnormal-probability');
+      expect(validateDualChannelProbability(pSaturated).status).toBe('saturated-to-one');
+      expect(validateDualChannelProbability(pUnderflow).status).toBe('underflow-to-zero');
+      expect(validateDualChannelProbability(pExactZero).status).toBe('exact-zero');
+      expect(validateDualChannelProbability(pExactOne).status).toBe('exact-one');
+
+      // Mandatory rejections: linear channels that differ from exp(logChannel) by << 4 * Number.EPSILON
+      // must still be rejected by ULP / regime validation:
+      // Case A: logProbability = -720 accompanied by probability = 1e-16
+      expect(() =>
+        validateDualChannelProbability({
+          ...pSubnormal,
+          probability: 1e-16,
+        }),
+      ).toThrow(RangeError);
+
+      // Case B: logComplementProbability = -45 accompanied by complementProbability = 1e-16
+      expect(() =>
+        validateDualChannelProbability({
+          ...pSaturated,
+          complementProbability: 1e-16,
+        }),
+      ).toThrow(RangeError);
+
+      // Case C: underflow-to-zero accompanied by non-zero probability (1e-16 or Number.MIN_VALUE)
+      expect(() =>
+        validateDualChannelProbability({
+          ...pUnderflow,
+          probability: 1e-16,
+        }),
+      ).toThrow(RangeError);
+      expect(() =>
+        validateDualChannelProbability({
+          ...pUnderflow,
+          probability: Number.MIN_VALUE,
+        }),
+      ).toThrow(RangeError);
+
       // Tampered status or incoherent linear/log channels must be rejected
       expect(() =>
         validateDualChannelProbability({
@@ -1169,8 +1313,7 @@ describe('Stage 2A-1 — Numeric Primitives & Forecast Contracts (v4.4.3)', () =
 
       expect(() => validateExhaustiveDistribution([pYes, pYes], 2)).toThrow(RangeError);
 
-      // 3. validateParametricIntervalField coherence with DualChannelProbability status
-      const pExactZero = createDualChannelProbability(0);
+      // 3. validateParametricIntervalField coherence & skewed posterior support
       expect(() =>
         validateParametricIntervalField(
           {
@@ -1206,18 +1349,55 @@ describe('Stage 2A-1 — Numeric Primitives & Forecast Contracts (v4.4.3)', () =
         ),
       ).toThrow(RangeError);
 
-      expect(
-        validateParametricIntervalField(
-          {
-            kind: 'omitted',
-            reason: 'point-mass-structural-baseline',
-            explanation: 'Uniform structural baseline has no concentration parameter',
+      // Strongly skewed posterior (e.g. Beta(0.05, 5), where posterior mean ~ 0.0099 > 50% upper quantile)
+      // is valid as long as 0 <= lower <= median <= upper <= 1 and lower < upper:
+      const pSkewedMean = createDualChannelProbability(0.0099);
+      const skewedInterval = validateParametricIntervalField(
+        {
+          kind: 'available',
+          interval: {
+            level: 0.5,
+            lower: 1e-12,
+            median: 1e-6,
+            upper: 0.002,
+            parameterName: '  theta_skewed  ',
+            interpretation: 'epistemic-parameter-uncertainty-not-outcome-frequency',
           },
-          pYes,
-        ).kind,
-      ).toBe('omitted');
+        },
+        pSkewedMean,
+      );
+      expect(skewedInterval.kind).toBe('available');
+      if (skewedInterval.kind === 'available') {
+        expect(skewedInterval.interval.parameterName).toBe('theta_skewed');
+      }
 
-      // 4. validateForecastDistributionContract end-to-end
+      // Verify decomposeCategoryUncertainty preserves and returns the normalized/frozen ParametricIntervalField:
+      const decompWithNormalizedInterval = decomposeCategoryUncertainty(
+        0,
+        '  Yes  ',
+        [
+          {
+            methodId: 'beta-binomial-conjugate',
+            weight: 1,
+            predictiveProbability: pSkewedMean,
+            parametricVariance: 0.0005,
+          },
+        ],
+        {
+          kind: 'omitted',
+          reason: 'point-mass-structural-baseline',
+          explanation: '  padded explanation text  ',
+        },
+      );
+      expect(decompWithNormalizedInterval.outcomeLabel).toBe('Yes');
+      expect(Object.isFrozen(decompWithNormalizedInterval.parametricInterval)).toBe(true);
+      if (decompWithNormalizedInterval.parametricInterval.kind === 'omitted') {
+        expect(decompWithNormalizedInterval.parametricInterval.explanation).toBe(
+          'padded explanation text',
+        );
+      }
+
+      // 4. validateForecastDistributionContract end-to-end & independent residual recomputation
       const decompYes = decomposeCategoryUncertainty(
         0,
         'Yes',
@@ -1280,12 +1460,144 @@ describe('Stage 2A-1 — Numeric Primitives & Forecast Contracts (v4.4.3)', () =
           entropyDecomposition: entropyDecomp,
           categoryDecompositions: [decompYes, decompNo],
         },
-        epistemologicalClaims: [],
-        methodologicalLimitations: [],
+        epistemologicalClaims: [
+          {
+            kind: 'exact-mathematical-identity',
+            tag: 'IME',
+            statement: 'Three-way orthogonal Bernoulli variance decomposition',
+          },
+        ],
+        methodologicalLimitations: ['Single-method conjugate baseline'],
       });
       expect(validForecastContract.outcomes).toHaveLength(2);
 
-      // Reject forecast contract that falsely claims empirical calibration without out-of-sample verification
+      // Negative tests for validateCategoryUncertaintyDecomposition & validateForecastDistributionContract:
+      // (a) Falsified closureResidual: 0 when variance components do not sum to p*(1-p)
+      expect(() =>
+        validateForecastDistributionContract({
+          ...validForecastContract,
+          contrastReport: {
+            ...validForecastContract.contrastReport,
+            categoryDecompositions: [
+              {
+                ...decompYes,
+                aleatoricVariance: decompYes.aleatoricVariance + 0.05,
+                closureResidual: 0, // falsified residual!
+              },
+              decompNo,
+            ],
+          },
+        }),
+      ).toThrow(RangeError);
+
+      // (b) Negative variance component (even if compensated so sum equals totalBernoulliVariance)
+      expect(() =>
+        validateCategoryUncertaintyDecomposition({
+          ...decompYes,
+          withinMethodParametricVariance: -0.01,
+          aleatoricVariance: decompYes.aleatoricVariance + 0.01,
+          totalEpistemicParametricVariance: -0.01,
+          closureResidual: 0,
+        }),
+      ).toThrow(RangeError);
+
+      // (c) Inconsistent totalEpistemicParametricVariance != within + between
+      expect(() =>
+        validateCategoryUncertaintyDecomposition({
+          ...decompYes,
+          totalEpistemicParametricVariance: decompYes.withinMethodParametricVariance + 0.02,
+          closureResidual: 0,
+        }),
+      ).toThrow(RangeError);
+
+      // (d) Non-finite (NaN or +Infinity) variance component
+      expect(() =>
+        validateCategoryUncertaintyDecomposition({
+          ...decompYes,
+          aleatoricVariance: Number.NaN,
+        }),
+      ).toThrow(RangeError);
+      expect(() =>
+        validateCategoryUncertaintyDecomposition({
+          ...decompYes,
+          withinMethodParametricVariance: Number.POSITIVE_INFINITY,
+        }),
+      ).toThrow(RangeError);
+
+      // (e) Falsified entropy closureResidualNats: 0 when H(p_bar) != H_within + JSD_w
+      expect(() =>
+        validateForecastDistributionContract({
+          ...validForecastContract,
+          contrastReport: {
+            ...validForecastContract.contrastReport,
+            entropyDecomposition: {
+              ...entropyDecomp,
+              withinMethodExpectedEntropyNats:
+                entropyDecomp.withinMethodExpectedEntropyNats * 0.5,
+              closureResidualNats: 0, // falsified residual!
+            },
+          },
+        }),
+      ).toThrow(RangeError);
+
+      // (f) Negative or non-finite entropy component
+      expect(() =>
+        validateEntropyDecomposition(
+          {
+            ...entropyDecomp,
+            jensenShannonDivergenceNats: -1e-6,
+          },
+          [pYes, pNo],
+          1,
+        ),
+      ).toThrow(RangeError);
+      expect(() =>
+        validateEntropyDecomposition(
+          {
+            ...entropyDecomp,
+            totalPredictiveEntropyNats: Number.NaN,
+          },
+          [pYes, pNo],
+          1,
+        ),
+      ).toThrow(RangeError);
+
+      // (g) Inconsistent totalPredictiveEntropyNats vs actual Shannon entropy of outcomes
+      expect(() =>
+        validateEntropyDecomposition(
+          {
+            ...entropyDecomp,
+            totalPredictiveEntropyNats: 0.1,
+            withinMethodExpectedEntropyNats: 0.1,
+            jensenShannonDivergenceNats: 0,
+            closureResidualNats: 0,
+          },
+          [pYes, pNo],
+          1,
+        ),
+      ).toThrow(RangeError);
+
+      // (h) Invalid contrastReport weightsByMethod or effectiveIndependentMethodCount
+      expect(() =>
+        validateForecastDistributionContract({
+          ...validForecastContract,
+          contrastReport: {
+            ...validForecastContract.contrastReport,
+            weightsByMethod: { 'beta-binomial-conjugate': 0.8 },
+          },
+        }),
+      ).toThrow(RangeError);
+      expect(() =>
+        validateForecastDistributionContract({
+          ...validForecastContract,
+          contrastReport: {
+            ...validForecastContract.contrastReport,
+            effectiveIndependentMethodCount: 2, // > executedMethodIds.length (1)
+          },
+        }),
+      ).toThrow(RangeError);
+
+      // (i) Reject forecast contract that falsely claims empirical calibration without out-of-sample verification
       expect(() =>
         validateForecastDistributionContract({
           ...validForecastContract,

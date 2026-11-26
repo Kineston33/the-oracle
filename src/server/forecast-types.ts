@@ -128,6 +128,14 @@ export type AbstentionReason =
   | 'unverifiable-or-corrupted-input-data'
   | 'numerical-representation-or-convergence-failure';
 
+export const ABSTENTION_REASONS: readonly AbstentionReason[] = Object.freeze([
+  'no-defensible-theoretical-or-empirical-basis',
+  'undefined-or-ambiguous-outcome-space',
+  'incompatible-method-outcome-spaces',
+  'unverifiable-or-corrupted-input-data',
+  'numerical-representation-or-convergence-failure',
+]);
+
 /**
  * Enforces the fundamental epistemological invariant that probabilities cannot
  * be declared empirically calibrated before passing out-of-sample evaluation.
@@ -646,6 +654,12 @@ export function validateParametricIntervalField(
     }
 
     if (predictiveProbability !== undefined) {
+      // Note [IME]: For a random parameter theta in [0, 1], E[theta] = 0 iff P(theta = 0) = 1
+      // and E[theta] = 1 iff P(theta = 1) = 1. However, for non-degenerate skewed posteriors
+      // (such as Beta(alpha, beta) with alpha << 1 or beta << 1), the posterior mean
+      // E[theta] = predictiveProbability.probability is NOT required to lie inside an
+      // equal-tailed or HPD credible interval [lower, upper]; only 0 <= lower <= median <= upper <= 1
+      // and lower < upper are universal mathematical invariants.
       if (predictiveProbability.status === 'exact-zero') {
         if (lower !== 0 || median !== 0 || upper !== 0) {
           throw new RangeError(
@@ -658,20 +672,10 @@ export function validateParametricIntervalField(
             `Incoherent parametric interval [${lower}, ${upper}] for 'exact-one' probability: must be [1, 1]`,
           );
         }
-      } else {
-        if (lower === upper) {
-          throw new RangeError(
-            `Non-degenerate probability (status '${predictiveProbability.status}') cannot have a zero-width available parametric interval [${lower}, ${upper}]; use kind: 'omitted' for point-mass parameters`,
-          );
-        }
-        if (
-          predictiveProbability.probability < lower - 1e-12 ||
-          predictiveProbability.probability > upper + 1e-12
-        ) {
-          throw new RangeError(
-            `Predictive probability (${predictiveProbability.probability}) lies outside its parametric credible interval [${lower}, ${upper}]`,
-          );
-        }
+      } else if (lower === upper) {
+        throw new RangeError(
+          `Non-degenerate probability (status '${predictiveProbability.status}') cannot have a zero-width available parametric interval [${lower}, ${upper}]; use kind: 'omitted' for point-mass parameters`,
+        );
       }
     }
 

@@ -9,15 +9,19 @@
  */
 
 import {
+  ABSTENTION_REASONS,
+  EPISTEMOLOGICAL_TAG_BY_KIND,
   assertCalibrationHonesty,
   validateOutcomeSpaceDescriptor,
   validateParametricIntervalField,
+  type AbstentionReason,
   type Binary64ProbabilityStatus,
   type CalibrationVerificationStatus,
   type CategoryUncertaintyDecomposition,
   type ComplementaryLogCoherenceResult,
   type DualChannelProbability,
   type EntropyDecomposition,
+  type EpistemologicalClaimKind,
   type EvidentialFootingTier,
   type ForecastDistributionOutput,
   type MethodCategoryContribution,
@@ -647,49 +651,136 @@ export function erfcx(x: number): number {
 }
 
 /**
+ * Diagnostic result of evaluating Laplace's Stieltjes continued fraction
+ * `R_CF(u) = (1/2) / (u + 1 / (u + (3/2) / (u + ...)))` for `u > 0`
+ * via the exact three-term Euler-Wallis convergent recurrence [IME / ANC].
+ */
+export interface LaplaceStieltjesEnclosureResult {
+  readonly value: number;
+  readonly lowerConvergent: number;
+  readonly upperConvergent: number;
+  readonly certifiedLowerBound: number;
+  readonly certifiedUpperBound: number;
+  readonly certifiedErrorBound: number;
+  readonly iterations: number;
+}
+
+/**
  * Evaluates Laplace's Stieltjes continued fraction remainder
  * `R_CF(u) = (1/2) / (u + 1 / (u + (3/2) / (u + ...)))`
  * for `u > 0`, where `erfcx(u) = 1 / (sqrt(pi) * (u + R_CF(u)))` and
  * `-erfcx'(u) = 2 * R_CF(u) * erfcx(u) > 0` [IME / ANC].
  *
- * Because `a_k = k/2 > 0` and `b_k = u > 0`, the odd and even convergents of
- * this Stieltjes continued fraction monotonically bracket the exact value:
- * `C_{2m-1}(u) < R_CF(u) < C_{2m}(u)`.
+ * Mathematical & Epistemological Justification:
+ *   1. `[IME]` (Real-arithmetic Stieltjes bracketing, Henrici Vol. 2, Theorem 12.1a):
+ *      Unlike Lentz's modified ratio algorithm (which perturbs zero denominators by `TINY`),
+ *      we evaluate the true Euler-Wallis numerators `A_k` and denominators `B_k`:
+ *        `A_{-1} = 1, B_{-1} = 0, A_0 = 0, B_0 = 1`
+ *        `A_k = u * A_{k-1} + (k / 2) * A_{k-2}, B_k = u * B_{k-1} + (k / 2) * B_{k-2}`
+ *      Because `a_k = k/2 > 0` and `b_k = u > 0` for all `k >= 1`, all `A_k, B_k > 0`
+ *      are sums of strictly positive terms (zero subtraction), and the exact convergents
+ *      `C_k(u) = A_k(u) / B_k(u)` strictly bracket `R_CF(u)` (with even convergents
+ *      approaching from below and odd convergents approaching from above):
+ *        `0 < C_2(u) < C_4(u) < ... < C_{2m}(u) < R_CF(u) < C_{2m-1}(u) < ... < C_1(u) = 1/(2u)`.
+ *   2. `[ANC]` (IEEE 754 `binary64` realization):
+ *      Rescaling `(A_{k-1}, B_{k-1}, A_k, B_k)` by `2^-512` whenever `max(A_k, B_k) > 2^512`
+ *      is an exact exponent shift in `binary64` that leaves the significands and `A_k / B_k`
+ *      bit-for-bit invariant. Accounting for the `binary64` rounding of `k` positive additions
+ *      and one division via `roundMargin = (2 * k + 2) * Number.EPSILON * upperConvergent`,
+ *      `[lowerConvergent - roundMargin, upperConvergent + roundMargin]` provides a certified
+ *      enclosure of `R_CF(u)`.
  */
-function evaluateLaplaceContinuedFractionR(u: number, maxIterations = 120): number {
-  const TINY = 1e-300;
-  let f = TINY;
-  let c = f;
-  let d = 0;
+export function evaluateLaplaceStieltjesEnclosure(
+  u: number,
+  maxIterations = 120,
+): LaplaceStieltjesEnclosureResult {
+  if (typeof u !== 'number' || !Number.isFinite(u) || Number.isNaN(u) || u <= 0) {
+    throw new RangeError(
+      `evaluateLaplaceStieltjesEnclosure requires finite u > 0, received ${String(u)}`,
+    );
+  }
+
+  const RESCALE_THRESHOLD = 2 ** 512;
+  const RESCALE_FACTOR = 2 ** -512;
+
+  let aPrev2 = 1;
+  let bPrev2 = 0;
+  let aPrev1 = 0;
+  let bPrev1 = 1;
+
+  let bestEvenLower = 0;
+  let bestOddUpper = Number.POSITIVE_INFINITY;
   let prevConvergent = 0;
 
   for (let k = 1; k <= maxIterations; k++) {
     const ak = 0.5 * k;
-    const bk = u;
-    d = bk + ak * d;
-    if (Math.abs(d) < TINY) {
-      d = TINY;
-    }
-    c = bk + ak / c;
-    if (Math.abs(c) < TINY) {
-      c = TINY;
-    }
-    d = 1 / d;
-    const delta = c * d;
-    f *= delta;
+    const aCurr = u * aPrev1 + ak * aPrev2;
+    const bCurr = u * bPrev1 + ak * bPrev2;
+    const convergent = aCurr / bCurr;
 
-    if (k >= 2) {
-      const enclosureWidth = Math.abs(f - prevConvergent);
-      const minBracket = Math.min(f, prevConvergent);
-      if (minBracket > 0 && enclosureWidth <= 1e-15 * minBracket) {
-        return 0.5 * (f + prevConvergent);
+    if (!Number.isFinite(convergent) || Number.isNaN(convergent) || convergent <= 0) {
+      throw new NumericConvergenceError(
+        'erfcxDiffPositive[LaplaceStieltjesCF]',
+        k,
+        Number.NaN,
+        1e-15,
+        `non-finite Euler-Wallis convergent at u = ${u}, k = ${k}`,
+      );
+    }
+
+    if (k % 2 === 0) {
+      if (convergent > bestEvenLower) {
+        bestEvenLower = convergent;
+      }
+    } else {
+      if (convergent < bestOddUpper) {
+        bestOddUpper = convergent;
       }
     }
-    prevConvergent = f;
+
+    if (k >= 2 && bestEvenLower > 0 && Number.isFinite(bestOddUpper)) {
+      const lowerConvergent = Math.min(convergent, prevConvergent);
+      const upperConvergent = Math.max(convergent, prevConvergent);
+      const algebraicWidth = upperConvergent - lowerConvergent;
+      const roundMargin = (2 * k + 2) * Number.EPSILON * upperConvergent;
+      const certifiedLowerBound = Math.max(
+        0,
+        Math.min(bestEvenLower, lowerConvergent) - roundMargin,
+      );
+      const certifiedUpperBound = Math.max(bestOddUpper, upperConvergent) + roundMargin;
+      const value = 0.5 * (lowerConvergent + upperConvergent);
+      const certifiedErrorBound = 0.5 * (certifiedUpperBound - certifiedLowerBound);
+
+      if (algebraicWidth <= 1e-15 * lowerConvergent) {
+        return Object.freeze({
+          value,
+          lowerConvergent,
+          upperConvergent,
+          certifiedLowerBound,
+          certifiedUpperBound,
+          certifiedErrorBound,
+          iterations: k,
+        });
+      }
+    }
+
+    prevConvergent = convergent;
+
+    if (aCurr > RESCALE_THRESHOLD || bCurr > RESCALE_THRESHOLD) {
+      aPrev2 = aPrev1 * RESCALE_FACTOR;
+      bPrev2 = bPrev1 * RESCALE_FACTOR;
+      aPrev1 = aCurr * RESCALE_FACTOR;
+      bPrev1 = bCurr * RESCALE_FACTOR;
+    } else {
+      aPrev2 = aPrev1;
+      bPrev2 = bPrev1;
+      aPrev1 = aCurr;
+      bPrev1 = bCurr;
+    }
   }
 
-  const finalWidth = Math.abs(f - prevConvergent);
-  const finalMin = Math.max(1e-300, Math.min(f, prevConvergent));
+  const finalWidth = Math.abs(bestOddUpper - bestEvenLower);
+  const finalMin = Math.max(1e-300, bestEvenLower);
   throw new NumericConvergenceError(
     'erfcxDiffPositive[LaplaceStieltjesCF]',
     maxIterations,
@@ -697,6 +788,10 @@ function evaluateLaplaceContinuedFractionR(u: number, maxIterations = 120): numb
     1e-15,
     `failed at u = ${u}`,
   );
+}
+
+function evaluateLaplaceContinuedFractionR(u: number, maxIterations = 120): number {
+  return evaluateLaplaceStieltjesEnclosure(u, maxIterations).value;
 }
 
 /**
@@ -2015,15 +2110,29 @@ export function studentTCdf(t: number, df: number): number {
   }
 
   if (df === 1) {
+    // Avoid 0.5 + atan(t)/pi cancellation in the deep lower tail t < -1 via atan(-1/t)/pi [IME]
+    if (t < -1) {
+      return Math.atan(-1 / t) / Math.PI;
+    }
     return 0.5 + Math.atan(t) / Math.PI;
   }
   if (df === 2) {
-    const x = t / Math.hypot(t, Math.SQRT2);
-    return 0.5 * (1 + x);
+    const absX = absT / Math.hypot(absT, Math.SQRT2);
+    // For t < 0, 0.5 * (1 - absX) = 0.5 * (1 - absX^2) / (1 + absX) = 0.5 * z / (1 + absX) [IME]
+    if (t < 0) {
+      return (0.5 * z) / (1 + absX);
+    }
+    return 0.5 * (1 + absX);
   }
   if (df === 4) {
-    const x = t / Math.hypot(t, 2);
-    return 0.5 + 0.25 * x * (3 - x * x);
+    const absX = absT / Math.hypot(absT, 2);
+    // For t < 0, 0.5 - 0.25 * absX * (3 - absX^2) = 0.25 * (1 - absX)^2 * (2 + absX)
+    // and 1 - absX = (1 - absX^2) / (1 + absX) = z / (1 + absX) [IME]
+    if (t < 0) {
+      const oneMinusAbsX = z / (1 + absX);
+      return 0.25 * oneMinusAbsX * oneMinusAbsX * (2 + absX);
+    }
+    return 0.5 + 0.25 * absX * (3 - absX * absX);
   }
 
   const halfTail = 0.5 * regularizedIncompleteBeta(z, 0.5 * df, 0.5);
@@ -2173,91 +2282,65 @@ export function nonCentralChiSquarePower(
   );
 }
 
+function logStandardNormalCdf(w: number): number {
+  if (w <= 0) {
+    const y = -w * Math.SQRT1_2;
+    if (y >= 1e150) {
+      return -Math.LN2 - 0.5 * w * w - 0.5 * Math.log(Math.PI) - Math.log(y);
+    }
+    return -Math.LN2 - 0.5 * w * w + Math.log(erfcx(y));
+  }
+  const y = w * Math.SQRT1_2;
+  const upperTail = 0.5 * Math.exp(-0.5 * w * w) * erfcx(y);
+  return Math.log1p(-upperTail);
+}
+
+function dLogStandardNormalCdf(w: number): number {
+  if (w <= 0) {
+    const y = -w * Math.SQRT1_2;
+    if (y >= 1e150) {
+      return -w;
+    }
+    return Math.SQRT2 * ONE_OVER_SQRT_PI / erfcx(y);
+  }
+  const pdf = Math.exp(-0.5 * w * w) / Math.sqrt(2 * Math.PI);
+  return pdf / normalCdf(w);
+}
+
 /**
- * Evaluates the noncentral Student-t cumulative distribution function `F_{t_nu(delta)}(t)`
- * for `t in [-Infinity, +Infinity]`, `df in [1, 2000]`, and `|ncp| <= 50` using
- * Benton & Krishnamoorthy's (2003) modal expansion around `j_0 = floor(delta^2 / 2)` [IME / ANC]:
- *
- *   1. Exact boundary returns: `t === -Infinity -> 0`, `t === +Infinity -> 1`.
- *   2. Exact central delegation for `ncp === 0`: returns `studentTCdf(t, df)`.
- *   3. Exact origin shortcut for `t === 0`: returns `normalCdf(-ncp)`.
- *   4. Overflow-safe computation of `x = t^2 / (t^2 + df)` and `1 - x = df / (t^2 + df)`
- *      via `w = sqrt(df) / |t|` when `|t| > sqrt(df)` (preventing `Infinity / Infinity = NaN`
- *      for huge finite `t` such as `1e200`).
- *   5. Log-space initialization at `j_0 = floor(lambda)` (`lambda = delta^2 / 2`),
- *      preserving `sgn(delta)` in `q_j(delta)`.
- *   6. Upward recurrence (`j -> j + 1`) where multipliers `lambda / (j + 1) <= 1` and
- *      `lambda / (j + 3/2) < 1` are contractionary from `j_0`, and downward recurrence
- *      (`j -> j - 1`) where `p_{j-1} = p_j * (j / lambda)` has multiplier `<= 1` and
- *      `|q_{j-1}| = |q_j| * ((j + 1/2) / lambda)` can exceed `1` only on the first step
- *      `j = j_0` when `lambda - floor(lambda) < 0.5` (bounded by `<= 1.5` for `j_0 >= 1`)
- *      and is strictly `< 1` for all `j <= j_0 - 1`.
- *   7. Neumaier compensated summation of all series terms and a single strict truncation
- *      criterion `B_tail(S) <= 1e-12` within `maxIterations` (default `500`), throwing
- *      `NumericConvergenceError` if the bound is not reached.
+ * Verifies that Benton & Krishnamoorthy's (2003) modal expansion around
+ * `j_0 = floor(delta^2 / 2)` achieves its strict analytical tail bound
+ * `B_tail(S) <= 1e-12` within `maxSteps` iterations, and optionally evaluates
+ * the all-positive series when `signMode !== 'check-only'` [IME / ANC].
  */
-export function nonCentralStudentTCdf(
-  t: number,
+function evaluateBentonKrishnamoorthyModalSeries(
+  absT: number,
   df: number,
   ncp: number,
-  options?: NumericEvaluationOptions,
+  maxSteps: number,
+  mode: 'quadrant1-positive' | 'complementary-small-ncp' | 'check-only',
 ): number {
-  if (
-    typeof t !== 'number' ||
-    typeof df !== 'number' ||
-    typeof ncp !== 'number' ||
-    Number.isNaN(t) ||
-    Number.isNaN(df) ||
-    Number.isNaN(ncp) ||
-    df < 1 ||
-    df > 2000 ||
-    Math.abs(ncp) > 50
-  ) {
-    throw new RangeError(
-      `nonCentralStudentTCdf requires t in [-Infinity, +Infinity], df in [1, 2000], |ncp| <= 50, received (${String(t)}, ${String(df)}, ${String(ncp)})`,
-    );
-  }
-  if (t === Number.NEGATIVE_INFINITY) {
-    return 0;
-  }
-  if (t === Number.POSITIVE_INFINITY) {
-    return 1;
-  }
-  if (ncp === 0) {
-    return studentTCdf(t, df);
-  }
-  if (t === 0) {
-    return normalCdf(-ncp);
-  }
-  if (t < 0) {
-    return 1 - nonCentralStudentTCdf(-t, df, -ncp, options);
-  }
-
-  // Now t > 0 and ncp !== 0. Compute x = t^2 / (t^2 + df) and oneMinusX = df / (t^2 + df)
-  // without overflowing t^2 for large finite t (such as t = 1e200).
   const sqrtDf = Math.sqrt(df);
-  let x: number;
-  let oneMinusX: number;
-  if (t <= sqrtDf) {
-    const u = (t * t) / df;
-    x = u / (1 + u);
-    oneMinusX = 1 / (1 + u);
-  } else {
-    const w = sqrtDf / t;
-    const v = w * w;
-    x = 1 / (1 + v);
-    oneMinusX = v / (1 + v);
+  let x = 0;
+  let oneMinusX = 1;
+  if (mode !== 'check-only') {
+    if (absT <= sqrtDf) {
+      const u = (absT * absT) / df;
+      x = u / (1 + u);
+      oneMinusX = 1 / (1 + u);
+    } else {
+      const w = sqrtDf / absT;
+      const v = w * w;
+      x = 1 / (1 + v);
+      oneMinusX = v / (1 + v);
+    }
   }
 
   const lambda = 0.5 * ncp * ncp;
   const signDelta = ncp < 0 ? -1 : 1;
   const j0 = Math.floor(lambda);
   const halfDf = 0.5 * df;
-  const maxSteps = options?.maxIterations ?? 500;
 
-  // When j0 === 0 (i.e. |ncp| < sqrt(2)), lambda^0 === 1 identically even if lambda underflows
-  // to +0.0 in binary64 (e.g. |ncp| <= 1e-162). Avoid 0 * Math.log(0) = NaN and preserve
-  // the exact first-order noncentral weight q_0(delta) = delta * sqrt(2 / pi) * exp(-lambda).
   let pUp: number;
   let absQUp: number;
   if (j0 === 0) {
@@ -2278,12 +2361,13 @@ export function nonCentralStudentTCdf(
   let pDown = pUp;
   let absQDown = absQUp;
 
-  // When oneMinusX === 0 (e.g., t = 1e200 where df / t^2 underflows below Number.MIN_VALUE),
-  // use the exact complementary series 1 - 0.5 * sum_j [p_j I_{1-x}(df/2, j+1/2) + q_j I_{1-x}(df/2, j+1)]
-  // so that I_0 = 0 yields exact 1.0 without residual tail offset, while still enforcing B_tail(S) <= 1e-12.
   const useComplementaryZeroTail = oneMinusX === 0;
-
-  let sum = useComplementaryZeroTail ? 1 : normalCdf(-ncp);
+  let sum =
+    mode === 'quadrant1-positive'
+      ? useComplementaryZeroTail
+        ? 1
+        : normalCdf(-ncp)
+      : 0;
   let compensation = 0;
 
   function addCompensated(val: number): void {
@@ -2297,12 +2381,19 @@ export function nonCentralStudentTCdf(
   }
 
   function evaluateSeriesTerm(pj: number, absQj: number, j: number): number {
-    if (useComplementaryZeroTail) {
+    if (mode === 'check-only' || useComplementaryZeroTail) {
       return 0;
     }
-    const iP = regularizedIncompleteBeta(x, j + 0.5, halfDf);
-    const iQ = regularizedIncompleteBeta(x, j + 1, halfDf);
-    return 0.5 * (pj * iP + signDelta * absQj * iQ);
+    if (mode === 'quadrant1-positive') {
+      const iP = regularizedIncompleteBeta(x, j + 0.5, halfDf);
+      const iQ = regularizedIncompleteBeta(x, j + 1, halfDf);
+      return 0.5 * (pj * iP + absQj * iQ);
+    }
+    // mode === 'complementary-small-ncp' for t < 0 with tiny |ncp| <= 1e-4:
+    // F(t; df, ncp) = 0.5 * sum_j [p_j I_{1-x}(df/2, j+1/2) - q_j(ncp) I_{1-x}(df/2, j+1)]
+    const iPComp = regularizedIncompleteBeta(oneMinusX, halfDf, j + 0.5);
+    const iQComp = regularizedIncompleteBeta(oneMinusX, halfDf, j + 1);
+    return 0.5 * (pj * iPComp - signDelta * absQj * iQComp);
   }
 
   addCompensated(evaluateSeriesTerm(pUp, absQUp, j0));
@@ -2340,7 +2431,8 @@ export function nonCentralStudentTCdf(
     }
 
     const bTail = 0.5 * (uPPlus + uQPlus + lPMinus + lQMinus);
-    if (bTail <= 1e-12) {
+    const targetTol = mode === 'check-only' ? 1e-12 : 1e-15;
+    if (bTail <= targetTol || (s === maxSteps && bTail <= 1e-12)) {
       const total = sum + compensation;
       return Math.min(1, Math.max(0, total));
     }
@@ -2367,19 +2459,406 @@ export function nonCentralStudentTCdf(
   throw new NumericConvergenceError('nonCentralStudentTCdf', maxSteps, finalBTail, 1e-12);
 }
 
+/**
+ * Evaluates `ln F_{t_nu(delta)}(t)` directly from the strictly positive
+ * conditional-normal chi-distribution integral [IME / ANC]:
+ *
+ *   `F_{t_nu(delta)}(t) = int_0^inf Phi((t / sqrt(nu)) * z - delta) * (2^(1 - nu/2) / Gamma(nu/2)) * z^(nu - 1) * exp(-z^2 / 2) dz`
+ *
+ * Because the log-integrand `psi(z)` is strictly concave (`psi''(z) < -1`) on `(0, +inf)`
+ * for all `nu >= 1`, its unique global maximum `z_*` is located via bracketed bisection,
+ * `exp(psi(z_*))` is factored out in log-space, and the normalized positive bell curve
+ * `exp(psi(z) - psi(z_*))` is integrated via adaptive 8-point Gauss-Legendre quadrature
+ * without any subtraction or `1 - CDF` reflection cancellation.
+ */
+function evaluateLogNonCentralStudentTCdfIntegral(
+  t: number,
+  df: number,
+  ncp: number,
+  options?: NumericEvaluationOptions,
+): number {
+  const a = t / Math.sqrt(df);
+  if (!Number.isFinite(a) || Math.abs(a) > 1e140) {
+    return t < 0 ? Number.NEGATIVE_INFINITY : 0;
+  }
+  const logPref = (1 - 0.5 * df) * Math.LN2 - lnGamma(0.5 * df);
+
+  function psi(z: number): number {
+    if (z <= 0) {
+      return df === 1 ? logPref + logStandardNormalCdf(-ncp) : Number.NEGATIVE_INFINITY;
+    }
+    const w = a * z - ncp;
+    const termZ = df === 1 ? 0 : (df - 1) * Math.log(z);
+    return logPref + logStandardNormalCdf(w) + termZ - 0.5 * z * z;
+  }
+
+  function dPsi(z: number): number {
+    const w = a * z - ncp;
+    return a * dLogStandardNormalCdf(w) + (df - 1) / z - z;
+  }
+
+  let zStar = 0;
+  if (df === 1 && a * dLogStandardNormalCdf(-ncp) <= 0) {
+    zStar = 0;
+  } else {
+    const bQuad = a * ncp;
+    const cQuad = df - 1;
+    const aQuad = 1 + a * a;
+    const zGuess =
+      cQuad > 0
+        ? bQuad <= 0
+          ? (2 * cQuad) / (Math.sqrt(bQuad * bQuad + 4 * aQuad * cQuad) - bQuad)
+          : (bQuad + Math.sqrt(bQuad * bQuad + 4 * aQuad * cQuad)) / (2 * aQuad)
+        : Math.max(1e-6, Math.sqrt(df));
+    let lo = Math.max(1e-150, 0.1 * zGuess);
+    let hi = Math.max(1e-140, 10 * zGuess + Math.sqrt(df) + Math.abs(ncp) + 10);
+    while (dPsi(lo) < 0 && lo > 1e-300) {
+      hi = lo;
+      lo *= 0.1;
+    }
+    while (dPsi(hi) > 0 && hi < 1e150) {
+      lo = hi;
+      hi *= 2;
+    }
+    for (let i = 0; i < 100; i++) {
+      const mid = 0.5 * (lo + hi);
+      if (mid <= lo || mid >= hi || hi - lo <= 1e-15 * mid) {
+        zStar = mid;
+        break;
+      }
+      const val = dPsi(mid);
+      if (val === 0) {
+        zStar = mid;
+        break;
+      }
+      if (val > 0) {
+        lo = mid;
+      } else {
+        hi = mid;
+      }
+      zStar = mid;
+    }
+  }
+
+  const maxPsi = psi(zStar);
+  if (!Number.isFinite(maxPsi)) {
+    return maxPsi;
+  }
+
+  const curv = 1 + a * a + (zStar > 0 && df > 1 ? (df - 1) / (zStar * zStar) : 0);
+  const sigmaStar = 1 / Math.sqrt(curv);
+
+  let rightStep = 0.5 * sigmaStar;
+  while (psi(zStar + rightStep) - maxPsi > -50) {
+    rightStep *= 1.5;
+  }
+  const rightBound = zStar + rightStep;
+
+  let leftBound = 0;
+  if (zStar > 0) {
+    let leftStep = Math.min(0.5 * zStar, 0.5 * sigmaStar);
+    while (zStar - leftStep > 0 && psi(zStar - leftStep) - maxPsi > -50) {
+      leftStep *= 1.5;
+    }
+    leftBound = Math.max(0, zStar - leftStep);
+  }
+
+  // Regularize z^(df - 1) near z = 0 when 1 < df < 4 via z = u^2 (dz = 2*u du)
+  const useSquareSub = leftBound === 0 && df > 1 && df < 4;
+
+  function evalNormalizedIntegrand(x: number): number {
+    if (useSquareSub) {
+      if (x <= 0) {
+        return 0;
+      }
+      const z = x * x;
+      const w = a * z - ncp;
+      const logVal =
+        logPref +
+        logStandardNormalCdf(w) +
+        (2 * df - 1) * Math.log(x) -
+        0.5 * z * z -
+        maxPsi;
+      return 2 * Math.exp(logVal);
+    }
+    return Math.exp(psi(x) - maxPsi);
+  }
+
+  const domLeft = useSquareSub ? 0 : leftBound;
+  const domRight = useSquareSub ? Math.sqrt(rightBound) : rightBound;
+
+  function gl8Panel(uL: number, uR: number): number {
+    const mid = 0.5 * (uL + uR);
+    const halfH = 0.5 * (uR - uL);
+    let s = 0;
+    for (let i = 0; i < 4; i++) {
+      const off = halfH * GL8_POSITIVE_NODES[i]!;
+      s +=
+        GL8_POSITIVE_WEIGHTS[i]! *
+        (evalNormalizedIntegrand(mid - off) + evalNormalizedIntegrand(mid + off));
+    }
+    return halfH * s;
+  }
+
+  const initPanels = 16;
+  const maxSubdivisions = Math.max(64, options?.maxIterations ?? 500);
+  const h = (domRight - domLeft) / initPanels;
+  const stack: Array<{
+    readonly left: number;
+    readonly right: number;
+    readonly coarse: number;
+    readonly depth: number;
+  }> = [];
+  for (let m = initPanels - 1; m >= 0; m--) {
+    const uL = domLeft + m * h;
+    const uR = m === initPanels - 1 ? domRight : domLeft + (m + 1) * h;
+    stack.push({ left: uL, right: uR, coarse: gl8Panel(uL, uR), depth: 0 });
+  }
+
+  let total = 0;
+  let compensation = 0;
+  let subdivisionsUsed = initPanels;
+
+  while (stack.length > 0) {
+    const cur = stack.pop()!;
+    const mid = 0.5 * (cur.left + cur.right);
+    const leftVal = gl8Panel(cur.left, mid);
+    const rightVal = gl8Panel(mid, cur.right);
+    subdivisionsUsed += 2;
+    const fine = leftVal + rightVal;
+    const diff = Math.abs(fine - cur.coarse);
+
+    if (
+      cur.depth >= 16 ||
+      mid <= cur.left ||
+      mid >= cur.right ||
+      diff <= 1e-14 * Math.max(1e-18, fine)
+    ) {
+      const next = total + fine;
+      if (Math.abs(total) >= Math.abs(fine)) {
+        compensation += total - next + fine;
+      } else {
+        compensation += fine - next + total;
+      }
+      total = next;
+    } else {
+      if (subdivisionsUsed > maxSubdivisions * 4) {
+        throw new NumericConvergenceError(
+          'nonCentralStudentTCdf[AdaptiveGL8]',
+          subdivisionsUsed,
+          diff / Math.max(1e-300, fine),
+          1e-14,
+        );
+      }
+      stack.push({ left: mid, right: cur.right, coarse: rightVal, depth: cur.depth + 1 });
+      stack.push({ left: cur.left, right: mid, coarse: leftVal, depth: cur.depth + 1 });
+    }
+  }
+
+  const integral = total + compensation;
+  if (!(integral > 0) || !Number.isFinite(integral)) {
+    return Number.NEGATIVE_INFINITY;
+  }
+  return Math.min(0, maxPsi + Math.log(integral));
+}
+
+function validateNonCentralStudentTParams(
+  t: number,
+  df: number,
+  ncp: number,
+  fnName: string,
+): void {
+  if (
+    typeof t !== 'number' ||
+    typeof df !== 'number' ||
+    typeof ncp !== 'number' ||
+    Number.isNaN(t) ||
+    Number.isNaN(df) ||
+    Number.isNaN(ncp) ||
+    df < 1 ||
+    df > 2000 ||
+    Math.abs(ncp) > 50
+  ) {
+    throw new RangeError(
+      `${fnName} requires t in [-Infinity, +Infinity], df in [1, 2000], |ncp| <= 50, received (${String(t)}, ${String(df)}, ${String(ncp)})`,
+    );
+  }
+}
+
+/**
+ * Evaluates both the lower-tail CDF `F_{t_nu(delta)}(t)` and the upper-tail
+ * survival probability `1 - F_{t_nu(delta)}(t) = F_{t_nu(-delta)}(-t)` as a
+ * coherent `DualChannelProbability` without catastrophic `1 - CDF` reflection
+ * cancellation in either tail [IME / ANC].
+ */
+export function nonCentralStudentTDualCdf(
+  t: number,
+  df: number,
+  ncp: number,
+  options?: NumericEvaluationOptions,
+): DualChannelProbability {
+  validateNonCentralStudentTParams(t, df, ncp, 'nonCentralStudentTDualCdf');
+  if (t === Number.NEGATIVE_INFINITY) {
+    return createDualChannelProbability(0);
+  }
+  if (t === Number.POSITIVE_INFINITY) {
+    return createDualChannelProbability(1);
+  }
+  if (ncp === 0) {
+    if (t === 0) {
+      return createDualChannelProbability(0.5);
+    }
+    const lowerTail = studentTCdf(-Math.abs(t), df);
+    if (lowerTail === 0) {
+      return t < 0 ? createDualChannelProbability(0) : createDualChannelProbability(1);
+    }
+    const logLower = Math.log(lowerTail);
+    return t < 0
+      ? createDualChannelProbabilityFromLog(logLower)
+      : createDualChannelProbabilityFromComplementLog(logLower);
+  }
+  if (t === 0) {
+    const absNcp = Math.abs(ncp);
+    const logSmallTail = logStandardNormalCdf(-absNcp);
+    return ncp > 0
+      ? createDualChannelProbabilityFromLog(logSmallTail)
+      : createDualChannelProbabilityFromComplementLog(logSmallTail);
+  }
+
+  const maxSteps = options?.maxIterations ?? 500;
+  // Enforce the strict analytical modal truncation bound B_tail(S) <= 1e-12
+  evaluateBentonKrishnamoorthyModalSeries(Math.abs(t), df, ncp, maxSteps, 'check-only');
+
+  // By exact distributional symmetry T_nu(delta) =^d -T_nu(-delta),
+  // 1 - F_{t_nu(delta)}(t) = F_{t_nu(-delta)}(-t).
+  // Evaluate whichever tail is smaller (<= 0.5) directly in log-space without subtraction:
+  if (t <= ncp) {
+    const logF = evaluateLogNonCentralStudentTCdfIntegral(t, df, ncp, options);
+    if (logF <= LN_SWITCH_LOG1MEXP) {
+      return createDualChannelProbabilityFromLog(logF);
+    }
+    const logS = evaluateLogNonCentralStudentTCdfIntegral(-t, df, -ncp, options);
+    return createDualChannelProbabilityFromComplementLog(logS);
+  } else {
+    const logS = evaluateLogNonCentralStudentTCdfIntegral(-t, df, -ncp, options);
+    if (logS <= LN_SWITCH_LOG1MEXP) {
+      return createDualChannelProbabilityFromComplementLog(logS);
+    }
+    const logF = evaluateLogNonCentralStudentTCdfIntegral(t, df, ncp, options);
+    return createDualChannelProbabilityFromLog(logF);
+  }
+}
+
+/**
+ * Evaluates the noncentral Student-t cumulative distribution function `F_{t_nu(delta)}(t)`
+ * for `t in [-Infinity, +Infinity]`, `df in [1, 2000]`, and `|ncp| <= 50` without
+ * catastrophic `1 - CDF` reflection cancellation in the tails [IME / ANC]:
+ *
+ *   1. Exact boundary returns: `t === -Infinity -> 0`, `t === +Infinity -> 1`.
+ *   2. Exact central delegation for `ncp === 0`: returns `studentTCdf(t, df)`.
+ *   3. Exact origin shortcut for `t === 0`: returns `normalCdf(-ncp)`.
+ *   4. Enforces the Benton & Krishnamoorthy (2003) modal truncation bound
+ *      `B_tail(S) <= 1e-12` around `j_0 = floor(delta^2 / 2)` within `maxIterations`
+ *      (default `500`), throwing `NumericConvergenceError` if not reached.
+ *   5. Eliminates the naive reflection `1 - nonCentralStudentTCdf(-t, df, -ncp)` for `t < 0`:
+ *      - For `t < 0` with tiny `|ncp| <= 1e-4`, evaluates the direct complementary
+ *        Benton-Krishnamoorthy series `0.5 * sum_j [p_j I_{1-x}(df/2, j+1/2) - q_j I_{1-x}(df/2, j+1)]`.
+ *      - For `t > 0` and `ncp > 0` outside the deep lower tail, evaluates the all-positive
+ *        Quadrant-I Benton-Krishnamoorthy series.
+ *      - For all opposite-sign (`t < 0, ncp > 0` and `t > 0, ncp < 0`), Quadrant-III (`t < 0, ncp < 0`),
+ *        and deep lower-tail cases (such as `F_{t_10(10)}(-20) = 3.8869760048338704e-39`),
+ *        evaluates the smaller tail directly in log-space via the strictly positive
+ *        conditional-normal chi-distribution integral (`nonCentralStudentTDualCdf`).
+ */
+export function nonCentralStudentTCdf(
+  t: number,
+  df: number,
+  ncp: number,
+  options?: NumericEvaluationOptions,
+): number {
+  validateNonCentralStudentTParams(t, df, ncp, 'nonCentralStudentTCdf');
+  if (t === Number.NEGATIVE_INFINITY) {
+    return 0;
+  }
+  if (t === Number.POSITIVE_INFINITY) {
+    return 1;
+  }
+  if (ncp === 0) {
+    return studentTCdf(t, df);
+  }
+  if (t === 0) {
+    return normalCdf(-ncp);
+  }
+
+  const maxSteps = options?.maxIterations ?? 500;
+  if (t < 0 && Math.abs(ncp) <= 1e-4) {
+    return evaluateBentonKrishnamoorthyModalSeries(
+      -t,
+      df,
+      ncp,
+      maxSteps,
+      'complementary-small-ncp',
+    );
+  }
+  if (t > 0 && ncp > 0) {
+    const bkVal = evaluateBentonKrishnamoorthyModalSeries(
+      t,
+      df,
+      ncp,
+      maxSteps,
+      'quadrant1-positive',
+    );
+    if (bkVal >= 1e-3) {
+      return bkVal;
+    }
+  }
+  return nonCentralStudentTDualCdf(t, df, ncp, options).probability;
+}
+
 /* -------------------------------------------------------------------------
    11. Runtime Contract Validators & Orthogonal Variance/Entropy Decompositions
    ------------------------------------------------------------------------- */
+
+function isLinearChannelCoherentWithLog(
+  linearVal: number,
+  refLinearVal: number,
+  logVal: number,
+): boolean {
+  if (refLinearVal === 0) {
+    return linearVal === 0;
+  }
+  if (refLinearVal === 1) {
+    return linearVal === 1;
+  }
+  if (refLinearVal < MIN_NORMAL_BINARY64) {
+    return (
+      linearVal > 0 &&
+      linearVal < MIN_NORMAL_BINARY64 &&
+      ulpDistanceBinary64(linearVal, refLinearVal) <= 2
+    );
+  }
+  if (linearVal < MIN_NORMAL_BINARY64 || linearVal >= 1) {
+    return false;
+  }
+  if (ulpDistanceBinary64(linearVal, refLinearVal) > 4) {
+    return false;
+  }
+  if (refLinearVal <= 0.5 && ulpDistanceBinary64(Math.log(linearVal), logVal) > 4) {
+    return false;
+  }
+  return true;
+}
 
 /**
  * Validates at runtime that an object conforms to `DualChannelProbability`,
  * checking channel finiteness/range, exact status classification via
  * `classifyBinary64Probability(logProbability, logComplementProbability)`,
- * and exact coherence between `(probability, complementProbability)` and
- * `(exp(logProbability), exp(logComplementProbability))`.
+ * and regime-aware ULP coherence between `(probability, complementProbability)` and
+ * `(exp(logProbability), exp(logComplementProbability))` across normal, subnormal,
+ * underflow-to-zero, and saturated-to-one states.
  */
 export function validateDualChannelProbability(value: unknown): DualChannelProbability {
-  if (typeof value !== 'object' || value === null) {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) {
     throw new RangeError('DualChannelProbability must be a non-null object');
   }
   const cand = value as Record<string, unknown>;
@@ -2401,7 +2880,9 @@ export function validateDualChannelProbability(value: unknown): DualChannelProba
     probability < 0 ||
     probability > 1 ||
     complementProbability < 0 ||
-    complementProbability > 1
+    complementProbability > 1 ||
+    logProbability > 0 ||
+    logComplementProbability > 0
   ) {
     throw new RangeError('DualChannelProbability contains non-numeric or out-of-range fields');
   }
@@ -2421,15 +2902,30 @@ export function validateDualChannelProbability(value: unknown): DualChannelProba
     logComplementProbability,
   );
   if (
-    Math.abs(probability - reference.probability) > 4 * Number.EPSILON ||
-    Math.abs(complementProbability - reference.complementProbability) > 4 * Number.EPSILON
+    !isLinearChannelCoherentWithLog(
+      probability,
+      reference.probability,
+      reference.logProbability,
+    ) ||
+    !isLinearChannelCoherentWithLog(
+      complementProbability,
+      reference.complementProbability,
+      reference.logComplementProbability,
+    ) ||
+    Math.abs(probability + complementProbability - 1) > Number.EPSILON
   ) {
     throw new RangeError(
       `DualChannelProbability linear channels (${probability}, ${complementProbability}) are incoherent with log channels (${logProbability}, ${logComplementProbability}) and status '${expectedStatus}'`,
     );
   }
 
-  return value as DualChannelProbability;
+  return Object.freeze({
+    probability: probability === 0 ? 0 : probability,
+    complementProbability: complementProbability === 0 ? 0 : complementProbability,
+    logProbability: logProbability === 0 ? 0 : logProbability,
+    logComplementProbability: logComplementProbability === 0 ? 0 : logComplementProbability,
+    status: expectedStatus,
+  });
 }
 
 /**
@@ -2592,7 +3088,10 @@ export function decomposeCategoryUncertainty(
   const logPBar = logSumExp(logWeightedProbs);
   const logQBar = logSumExp(logWeightedComps);
   const predictiveProbability = createDualChannelProbabilityFromPair(logPBar, logQBar);
-  validateParametricIntervalField(parametricInterval, predictiveProbability);
+  const validatedParametricInterval = validateParametricIntervalField(
+    parametricInterval,
+    predictiveProbability,
+  );
 
   const pBar = predictiveProbability.probability;
   const qBar = predictiveProbability.complementProbability;
@@ -2625,7 +3124,7 @@ export function decomposeCategoryUncertainty(
 
   return Object.freeze({
     outcomeIndex,
-    outcomeLabel,
+    outcomeLabel: outcomeLabel.trim(),
     predictiveProbability,
     totalBernoulliVariance,
     aleatoricVariance,
@@ -2633,7 +3132,7 @@ export function decomposeCategoryUncertainty(
     betweenMethodDisagreementVariance,
     totalEpistemicParametricVariance,
     closureResidual,
-    parametricInterval,
+    parametricInterval: validatedParametricInterval,
   });
 }
 
@@ -2791,21 +3290,289 @@ export function decomposeEnsembleEntropy(
   });
 }
 
+function isFiniteNonNegativeNumber(x: unknown): x is number {
+  return typeof x === 'number' && Number.isFinite(x) && !Number.isNaN(x) && x >= 0;
+}
+
+/**
+ * Validates at runtime a `CategoryUncertaintyDecomposition`, independently
+ * recomputing the total Bernoulli variance `p_bar * (1 - p_bar)`, the total
+ * epistemic parametric variance `within + between`, and the true closure
+ * residual without trusting the declared `closureResidual` field [IME].
+ */
+export function validateCategoryUncertaintyDecomposition(
+  value: unknown,
+  expectedOutcomeIndex?: number,
+  expectedOutcomeLabel?: string,
+  expectedOutcomeProbability?: DualChannelProbability,
+  executedMethodCount?: number,
+): CategoryUncertaintyDecomposition {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+    throw new RangeError('CategoryUncertaintyDecomposition must be a non-null object');
+  }
+  const cand = value as Record<string, unknown>;
+  const outcomeIndex = cand.outcomeIndex;
+  const outcomeLabel = cand.outcomeLabel;
+
+  if (
+    typeof outcomeIndex !== 'number' ||
+    !Number.isInteger(outcomeIndex) ||
+    outcomeIndex < 0
+  ) {
+    throw new RangeError(
+      `CategoryUncertaintyDecomposition.outcomeIndex must be a non-negative integer, received ${String(outcomeIndex)}`,
+    );
+  }
+  if (expectedOutcomeIndex !== undefined && outcomeIndex !== expectedOutcomeIndex) {
+    throw new RangeError(
+      `CategoryUncertaintyDecomposition.outcomeIndex (${outcomeIndex}) does not match expected index ${expectedOutcomeIndex}`,
+    );
+  }
+
+  if (typeof outcomeLabel !== 'string' || outcomeLabel.trim().length === 0) {
+    throw new RangeError('CategoryUncertaintyDecomposition.outcomeLabel must be a non-empty string');
+  }
+  if (
+    expectedOutcomeLabel !== undefined &&
+    outcomeLabel.trim() !== expectedOutcomeLabel.trim()
+  ) {
+    throw new RangeError(
+      `CategoryUncertaintyDecomposition.outcomeLabel ('${outcomeLabel}') does not match expected label '${expectedOutcomeLabel}'`,
+    );
+  }
+
+  const pred = validateDualChannelProbability(cand.predictiveProbability);
+  if (expectedOutcomeProbability !== undefined) {
+    if (
+      pred.status !== expectedOutcomeProbability.status ||
+      !isLinearChannelCoherentWithLog(
+        pred.probability,
+        expectedOutcomeProbability.probability,
+        expectedOutcomeProbability.logProbability,
+      ) ||
+      !isLinearChannelCoherentWithLog(
+        pred.complementProbability,
+        expectedOutcomeProbability.complementProbability,
+        expectedOutcomeProbability.logComplementProbability,
+      )
+    ) {
+      throw new RangeError(
+        `categoryDecompositions[${outcomeIndex}].predictiveProbability does not match outcomes[${outcomeIndex}]`,
+      );
+    }
+  }
+
+  const validatedInterval = validateParametricIntervalField(cand.parametricInterval, pred);
+
+  const totalBernoulliVariance = cand.totalBernoulliVariance;
+  const aleatoricVariance = cand.aleatoricVariance;
+  const withinMethodParametricVariance = cand.withinMethodParametricVariance;
+  const betweenMethodDisagreementVariance = cand.betweenMethodDisagreementVariance;
+  const totalEpistemicParametricVariance = cand.totalEpistemicParametricVariance;
+  const declaredResidual = cand.closureResidual;
+
+  if (
+    !isFiniteNonNegativeNumber(totalBernoulliVariance) ||
+    !isFiniteNonNegativeNumber(aleatoricVariance) ||
+    !isFiniteNonNegativeNumber(withinMethodParametricVariance) ||
+    !isFiniteNonNegativeNumber(betweenMethodDisagreementVariance) ||
+    !isFiniteNonNegativeNumber(totalEpistemicParametricVariance) ||
+    !isFiniteNonNegativeNumber(declaredResidual)
+  ) {
+    throw new RangeError(
+      `categoryDecompositions[${outcomeIndex}] contains negative, NaN, or non-finite variance components`,
+    );
+  }
+
+  // 1. Independently recompute total Bernoulli variance p * (1 - p)
+  const expectedBernoulli = pred.probability * pred.complementProbability;
+  if (Math.abs(totalBernoulliVariance - expectedBernoulli) > 1e-12) {
+    throw new RangeError(
+      `categoryDecompositions[${outcomeIndex}].totalBernoulliVariance (${totalBernoulliVariance}) is inconsistent with p*(1-p) (${expectedBernoulli})`,
+    );
+  }
+
+  // 2. Verify each component lies within [0, p*(1-p) + 1e-12]
+  if (
+    aleatoricVariance > expectedBernoulli + 1e-12 ||
+    withinMethodParametricVariance > expectedBernoulli + 1e-12 ||
+    betweenMethodDisagreementVariance > expectedBernoulli + 1e-12 ||
+    totalEpistemicParametricVariance > expectedBernoulli + 1e-12
+  ) {
+    throw new RangeError(
+      `categoryDecompositions[${outcomeIndex}] has a variance component exceeding total Bernoulli variance (${expectedBernoulli})`,
+    );
+  }
+
+  if (executedMethodCount === 1 && betweenMethodDisagreementVariance > 1e-12) {
+    throw new RangeError(
+      `categoryDecompositions[${outcomeIndex}].betweenMethodDisagreementVariance (${betweenMethodDisagreementVariance}) must be 0 when only 1 method was executed`,
+    );
+  }
+
+  // 3. Independently recompute total epistemic parametric variance = within + between
+  const recomputedEpistemic =
+    withinMethodParametricVariance + betweenMethodDisagreementVariance;
+  if (Math.abs(totalEpistemicParametricVariance - recomputedEpistemic) > 1e-12) {
+    throw new RangeError(
+      `categoryDecompositions[${outcomeIndex}].totalEpistemicParametricVariance (${totalEpistemicParametricVariance}) is inconsistent with within + between (${recomputedEpistemic})`,
+    );
+  }
+
+  // 4. Independently recompute the true three-way closure residual and verify both
+  //    trueResidual <= 1e-12 and |declaredResidual - trueResidual| <= 1e-12
+  const recomputedTotal = aleatoricVariance + recomputedEpistemic;
+  const trueResidual = Math.abs(expectedBernoulli - recomputedTotal);
+  if (trueResidual > 1e-12) {
+    throw new RangeError(
+      `categoryDecompositions[${outcomeIndex}] violates three-way variance closure: true residual ${trueResidual} > 1e-12`,
+    );
+  }
+  if (Math.abs(declaredResidual - trueResidual) > 1e-12) {
+    throw new RangeError(
+      `categoryDecompositions[${outcomeIndex}].closureResidual (${declaredResidual}) is falsified or inconsistent with recomputed residual (${trueResidual})`,
+    );
+  }
+
+  return Object.freeze({
+    outcomeIndex,
+    outcomeLabel: outcomeLabel.trim(),
+    predictiveProbability: pred,
+    totalBernoulliVariance,
+    aleatoricVariance,
+    withinMethodParametricVariance,
+    betweenMethodDisagreementVariance,
+    totalEpistemicParametricVariance,
+    closureResidual: declaredResidual,
+    parametricInterval: validatedInterval,
+  });
+}
+
+/**
+ * Validates at runtime an `EntropyDecomposition`, independently recomputing the
+ * Shannon entropy `H(p_bar)` of `outcomes`, the closure residual
+ * `|H(p_bar) - (H_within + JSD_w)|`, and the normalized disagreement index
+ * `JSD_w / ln(M)` without trusting the declared `closureResidualNats` field [IME].
+ */
+export function validateEntropyDecomposition(
+  value: unknown,
+  outcomes: readonly DualChannelProbability[],
+  executedMethodCount?: number,
+): EntropyDecomposition {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+    throw new RangeError('EntropyDecomposition must be a non-null object');
+  }
+  const cand = value as Record<string, unknown>;
+  const totalPredictiveEntropyNats = cand.totalPredictiveEntropyNats;
+  const withinMethodExpectedEntropyNats = cand.withinMethodExpectedEntropyNats;
+  const jensenShannonDivergenceNats = cand.jensenShannonDivergenceNats;
+  const normalizedDisagreementIndex = cand.normalizedDisagreementIndex;
+  const declaredResidualNats = cand.closureResidualNats;
+
+  if (
+    !isFiniteNonNegativeNumber(totalPredictiveEntropyNats) ||
+    !isFiniteNonNegativeNumber(withinMethodExpectedEntropyNats) ||
+    !isFiniteNonNegativeNumber(jensenShannonDivergenceNats) ||
+    !isFiniteNonNegativeNumber(normalizedDisagreementIndex) ||
+    !isFiniteNonNegativeNumber(declaredResidualNats)
+  ) {
+    throw new RangeError(
+      'EntropyDecomposition contains negative, NaN, or non-finite components',
+    );
+  }
+
+  const maxEntropyNats = Math.log(outcomes.length);
+  if (
+    totalPredictiveEntropyNats > maxEntropyNats + 1e-12 ||
+    withinMethodExpectedEntropyNats > maxEntropyNats + 1e-12 ||
+    jensenShannonDivergenceNats > maxEntropyNats + 1e-12 ||
+    normalizedDisagreementIndex > 1 + 1e-12
+  ) {
+    throw new RangeError(
+      `EntropyDecomposition components exceed mathematical upper bounds (ln(K) = ${maxEntropyNats})`,
+    );
+  }
+
+  // 1. Independently recompute H(p_bar) from the validated ensemble outcomes
+  const expectedTotalEntropyNats = shannonEntropyFromDistribution(outcomes);
+  if (Math.abs(totalPredictiveEntropyNats - expectedTotalEntropyNats) > 1e-12) {
+    throw new RangeError(
+      `EntropyDecomposition.totalPredictiveEntropyNats (${totalPredictiveEntropyNats}) does not match Shannon entropy of outcomes (${expectedTotalEntropyNats})`,
+    );
+  }
+
+  // 2. Independently recompute true closure residual |H(p_bar) - (H_within + JSD_w)|
+  const recomputedSumNats =
+    withinMethodExpectedEntropyNats + jensenShannonDivergenceNats;
+  const trueResidualNats = Math.abs(expectedTotalEntropyNats - recomputedSumNats);
+  if (trueResidualNats > 1e-12) {
+    throw new RangeError(
+      `EntropyDecomposition violates H(p_bar) = H_within + JSD_w: true residual ${trueResidualNats} > 1e-12`,
+    );
+  }
+  if (Math.abs(declaredResidualNats - trueResidualNats) > 1e-12) {
+    throw new RangeError(
+      `EntropyDecomposition.closureResidualNats (${declaredResidualNats}) is falsified or inconsistent with recomputed residual (${trueResidualNats})`,
+    );
+  }
+
+  // 3. Check JSD_w and normalizedDisagreementIndex against executedMethodCount when provided
+  if (executedMethodCount !== undefined) {
+    if (executedMethodCount === 1) {
+      if (jensenShannonDivergenceNats > 1e-12 || normalizedDisagreementIndex > 1e-12) {
+        throw new RangeError(
+          'EntropyDecomposition with 1 executed method must have JSD = 0 and normalizedDisagreementIndex = 0',
+        );
+      }
+    } else if (executedMethodCount >= 2) {
+      const logM = Math.log(executedMethodCount);
+      if (jensenShannonDivergenceNats > logM + 1e-12) {
+        throw new RangeError(
+          `EntropyDecomposition.jensenShannonDivergenceNats (${jensenShannonDivergenceNats}) exceeds ln(M) (${logM})`,
+        );
+      }
+      const expectedNormalizedIndex = Math.min(
+        1,
+        Math.max(0, jensenShannonDivergenceNats / logM),
+      );
+      if (Math.abs(normalizedDisagreementIndex - expectedNormalizedIndex) > 1e-12) {
+        throw new RangeError(
+          `EntropyDecomposition.normalizedDisagreementIndex (${normalizedDisagreementIndex}) does not match JSD_w / ln(M) (${expectedNormalizedIndex})`,
+        );
+      }
+    }
+  }
+
+  return Object.freeze({
+    totalPredictiveEntropyNats,
+    withinMethodExpectedEntropyNats,
+    jensenShannonDivergenceNats,
+    normalizedDisagreementIndex,
+    closureResidualNats: declaredResidualNats,
+  });
+}
+
 /**
  * Validates a complete `ForecastDistributionOutput` object at runtime, verifying:
- *   1. `outcomeSpace` via `validateOutcomeSpaceDescriptor`
- *   2. `outcomes` via `validateExhaustiveDistribution(outcomes, outcomeSpace.outcomeLabels.length)`
- *   3. `footingTier` and `calibrationStatus` via `assertCalibrationHonesty`
- *   4. Coherence of every `contrastReport.categoryDecompositions[k]` and its `parametricInterval`
- *   5. Coherence of `contrastReport.entropyDecomposition` (`H(p_bar) = H_within + JSD_w` within `1e-12`)
+ *   1. `questionCategory`, `outcomeSpace`, and `outcomes` (`validateExhaustiveDistribution`)
+ *   2. `footingTier`, `calibrationStatus`, and `abstentionReason` (`assertCalibrationHonesty`)
+ *   3. `epistemologicalClaims` and `methodologicalLimitations`
+ *   4. `contrastReport` (`executedMethodIds`, `discardedMethods`, `weightsByMethod`,
+ *      `effectiveIndependentMethodCount`)
+ *   5. Independent recomputation of every `categoryDecompositions[k]` and
+ *      `entropyDecomposition` without trusting declared closure residuals.
  */
 export function validateForecastDistributionContract(
   value: unknown,
 ): ForecastDistributionOutput {
-  if (typeof value !== 'object' || value === null) {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) {
     throw new RangeError('ForecastDistributionOutput must be a non-null object');
   }
   const cand = value as Record<string, unknown>;
+  if (typeof cand.questionCategory !== 'string' || cand.questionCategory.trim().length === 0) {
+    throw new RangeError('ForecastDistributionOutput.questionCategory must be a non-empty string');
+  }
+
   const outcomeSpace = validateOutcomeSpaceDescriptor(cand.outcomeSpace);
   const outcomeCount = outcomeSpace.outcomeLabels.length;
   const outcomes = validateExhaustiveDistribution(cand.outcomes, outcomeCount);
@@ -2814,9 +3581,138 @@ export function validateForecastDistributionContract(
   const calibrationStatus = cand.calibrationStatus as CalibrationVerificationStatus;
   assertCalibrationHonesty(footingTier, calibrationStatus);
 
+  if (cand.abstentionReason !== undefined) {
+    if (
+      typeof cand.abstentionReason !== 'string' ||
+      !ABSTENTION_REASONS.includes(cand.abstentionReason as AbstentionReason)
+    ) {
+      throw new RangeError(
+        `Invalid ForecastDistributionOutput.abstentionReason: ${String(cand.abstentionReason)}`,
+      );
+    }
+  } else if (footingTier === 'insufficient-basis-abstain') {
+    throw new RangeError(
+      "ForecastDistributionOutput with footingTier 'insufficient-basis-abstain' requires an abstentionReason",
+    );
+  }
+
+  if (!Array.isArray(cand.epistemologicalClaims)) {
+    throw new RangeError('ForecastDistributionOutput.epistemologicalClaims must be an array');
+  }
+  for (let i = 0; i < cand.epistemologicalClaims.length; i++) {
+    const claim = cand.epistemologicalClaims[i] as Record<string, unknown> | undefined;
+    if (!claim || typeof claim !== 'object' || Array.isArray(claim)) {
+      throw new RangeError(`epistemologicalClaims[${i}] must be a non-null object`);
+    }
+    const kind = claim.kind as EpistemologicalClaimKind;
+    const expectedTag = EPISTEMOLOGICAL_TAG_BY_KIND[kind];
+    if (!expectedTag || claim.tag !== expectedTag) {
+      throw new RangeError(
+        `epistemologicalClaims[${i}] has incoherent (kind='${String(claim.kind)}', tag='${String(claim.tag)}')`,
+      );
+    }
+    if (typeof claim.statement !== 'string' || claim.statement.trim().length === 0) {
+      throw new RangeError(`epistemologicalClaims[${i}].statement must be a non-empty string`);
+    }
+  }
+
+  if (!Array.isArray(cand.methodologicalLimitations)) {
+    throw new RangeError('ForecastDistributionOutput.methodologicalLimitations must be an array');
+  }
+  for (let i = 0; i < cand.methodologicalLimitations.length; i++) {
+    const lim = cand.methodologicalLimitations[i];
+    if (typeof lim !== 'string' || lim.trim().length === 0) {
+      throw new RangeError(`methodologicalLimitations[${i}] must be a non-empty string`);
+    }
+  }
+
   const contrastReport = cand.contrastReport as Record<string, unknown> | undefined;
-  if (!contrastReport || typeof contrastReport !== 'object') {
+  if (!contrastReport || typeof contrastReport !== 'object' || Array.isArray(contrastReport)) {
     throw new RangeError('ForecastDistributionOutput.contrastReport must be a non-null object');
+  }
+
+  const executedMethodIds = contrastReport.executedMethodIds;
+  if (!Array.isArray(executedMethodIds) || executedMethodIds.length === 0) {
+    throw new RangeError(
+      'ForecastDistributionOutput.contrastReport.executedMethodIds must be a non-empty array',
+    );
+  }
+  const executedSet = new Set<string>();
+  for (let m = 0; m < executedMethodIds.length; m++) {
+    const id = executedMethodIds[m];
+    if (typeof id !== 'string' || id.trim().length === 0) {
+      throw new RangeError(`executedMethodIds[${m}] must be a non-empty string`);
+    }
+    if (executedSet.has(id)) {
+      throw new RangeError(`executedMethodIds contains duplicate methodId '${id}'`);
+    }
+    executedSet.add(id);
+  }
+
+  const discardedMethods = contrastReport.discardedMethods;
+  if (!Array.isArray(discardedMethods)) {
+    throw new RangeError(
+      'ForecastDistributionOutput.contrastReport.discardedMethods must be an array',
+    );
+  }
+  for (let i = 0; i < discardedMethods.length; i++) {
+    const dm = discardedMethods[i] as Record<string, unknown> | undefined;
+    if (
+      !dm ||
+      typeof dm !== 'object' ||
+      typeof dm.methodId !== 'string' ||
+      dm.methodId.trim().length === 0 ||
+      dm.applicable !== false ||
+      typeof dm.rationale !== 'string' ||
+      dm.rationale.trim().length === 0 ||
+      !Array.isArray(dm.failedGateIds) ||
+      executedSet.has(dm.methodId)
+    ) {
+      throw new RangeError(
+        `contrastReport.discardedMethods[${i}] is invalid or overlaps with executedMethodIds`,
+      );
+    }
+  }
+
+  const weightsByMethod = contrastReport.weightsByMethod as Record<string, unknown> | undefined;
+  if (
+    !weightsByMethod ||
+    typeof weightsByMethod !== 'object' ||
+    Array.isArray(weightsByMethod)
+  ) {
+    throw new RangeError(
+      'ForecastDistributionOutput.contrastReport.weightsByMethod must be a non-null object',
+    );
+  }
+  const weightKeys = Object.keys(weightsByMethod);
+  if (weightKeys.length !== executedSet.size) {
+    throw new RangeError(
+      `weightsByMethod key count (${weightKeys.length}) must match executedMethodIds count (${executedSet.size})`,
+    );
+  }
+  const orderedWeights: number[] = [];
+  for (const id of executedSet) {
+    if (!Object.prototype.hasOwnProperty.call(weightsByMethod, id)) {
+      throw new RangeError(`weightsByMethod is missing weight for executed method '${id}'`);
+    }
+    orderedWeights.push(weightsByMethod[id] as number);
+  }
+  validateAndNormalizeEnsembleWeights(
+    orderedWeights,
+    'validateForecastDistributionContract[weightsByMethod]',
+  );
+
+  const effectiveIndependentMethodCount = contrastReport.effectiveIndependentMethodCount;
+  if (
+    typeof effectiveIndependentMethodCount !== 'number' ||
+    !Number.isFinite(effectiveIndependentMethodCount) ||
+    Number.isNaN(effectiveIndependentMethodCount) ||
+    effectiveIndependentMethodCount < 1 - 1e-12 ||
+    effectiveIndependentMethodCount > executedSet.size + 1e-12
+  ) {
+    throw new RangeError(
+      `contrastReport.effectiveIndependentMethodCount (${String(effectiveIndependentMethodCount)}) must lie in [1, ${executedSet.size}]`,
+    );
   }
 
   const categoryDecompositions = contrastReport.categoryDecompositions as
@@ -2832,53 +3728,20 @@ export function validateForecastDistributionContract(
   }
 
   for (let k = 0; k < outcomeCount; k++) {
-    const decomp = categoryDecompositions[k];
-    if (!decomp || typeof decomp !== 'object') {
-      throw new RangeError(`Missing categoryDecomposition at index ${k}`);
-    }
-    if (
-      decomp.outcomeIndex !== k ||
-      decomp.outcomeLabel !== outcomeSpace.outcomeLabels[k]
-    ) {
-      throw new RangeError(
-        `categoryDecompositions[${k}] outcomeIndex/outcomeLabel mismatch with outcomeSpace`,
-      );
-    }
-    const pred = validateDualChannelProbability(decomp.predictiveProbability);
-    const outK = outcomes[k]!;
-    if (
-      Math.abs(pred.probability - outK.probability) > 1e-12 ||
-      Math.abs(pred.complementProbability - outK.complementProbability) > 1e-12
-    ) {
-      throw new RangeError(
-        `categoryDecompositions[${k}].predictiveProbability does not match outcomes[${k}]`,
-      );
-    }
-    validateParametricIntervalField(decomp.parametricInterval, pred);
-    if (
-      !Number.isFinite(decomp.closureResidual) ||
-      decomp.closureResidual > 1e-12
-    ) {
-      throw new RangeError(
-        `categoryDecompositions[${k}].closureResidual (${decomp.closureResidual}) exceeds 1e-12`,
-      );
-    }
-  }
-
-  const entropy = contrastReport.entropyDecomposition as EntropyDecomposition | undefined;
-  if (
-    !entropy ||
-    typeof entropy !== 'object' ||
-    !Number.isFinite(entropy.totalPredictiveEntropyNats) ||
-    !Number.isFinite(entropy.withinMethodExpectedEntropyNats) ||
-    !Number.isFinite(entropy.jensenShannonDivergenceNats) ||
-    !Number.isFinite(entropy.closureResidualNats) ||
-    entropy.closureResidualNats > 1e-12
-  ) {
-    throw new RangeError(
-      'ForecastDistributionOutput.contrastReport.entropyDecomposition is missing or violates closure residual <= 1e-12',
+    validateCategoryUncertaintyDecomposition(
+      categoryDecompositions[k],
+      k,
+      outcomeSpace.outcomeLabels[k]!,
+      outcomes[k]!,
+      executedSet.size,
     );
   }
+
+  validateEntropyDecomposition(
+    contrastReport.entropyDecomposition,
+    outcomes,
+    executedSet.size,
+  );
 
   return value as ForecastDistributionOutput;
 }
