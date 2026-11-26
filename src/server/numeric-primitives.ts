@@ -679,6 +679,28 @@ function succNonNegativeBinary64(x: number): number {
 }
 
 /**
+ * Returns a strict lower bound in IEEE 754 `binary64` for any real value `r`
+ * whose round-to-nearest-even float is `x = fl(r)` [ANC].
+ */
+function predSignedBinary64(x: number): number {
+  if (!Number.isFinite(x)) {
+    return Number.NEGATIVE_INFINITY;
+  }
+  return x - ulpBinary64(x);
+}
+
+/**
+ * Returns a strict upper bound in IEEE 754 `binary64` for any real value `r`
+ * whose round-to-nearest-even float is `x = fl(r)` [ANC].
+ */
+function succSignedBinary64(x: number): number {
+  if (!Number.isFinite(x)) {
+    return Number.POSITIVE_INFINITY;
+  }
+  return x + ulpBinary64(x);
+}
+
+/**
  * Evaluates Higham's (2002, Lemma 3.1) forward rounding constant
  * `gamma_n = (n * u) / (1 - n * u)` for `u = 0.5 * Number.EPSILON = 2^-53`,
  * rounded upward via `succNonNegativeBinary64` so the returned float is a
@@ -694,6 +716,9 @@ function gammaBinary64(n: number): number {
   return succNonNegativeBinary64(nu / denom);
 }
 
+/** Default certified relative error tolerance for `evaluateLaplaceStieltjesEnclosure`. */
+export const DEFAULT_LAPLACE_STIELTJES_CERTIFIED_REL_TOL = 1e-13;
+
 /**
  * Diagnostic result of evaluating Laplace's Stieltjes continued fraction
  * `R_CF(u) = (1/2) / (u + 1 / (u + (3/2) / (u + ...)))` for `u > 0`
@@ -706,7 +731,9 @@ export interface LaplaceStieltjesEnclosureResult {
   readonly upperConvergent: number;
   readonly certifiedLowerBound: number;
   readonly certifiedUpperBound: number;
+  readonly certifiedWidth: number;
   readonly certifiedErrorBound: number;
+  readonly certifiedRelativeError: number;
   readonly iterations: number;
   readonly gammaIndex: number;
   readonly gammaBound: number;
@@ -728,43 +755,70 @@ export interface LaplaceStieltjesEnclosureResult {
  *      positive terms (zero subtraction), and the exact real-arithmetic convergents
  *      `C_k(u) = A_k(u) / B_k(u)` strictly bracket `R_CF(u)`:
  *        `0 < C_2(u) < C_4(u) < ... < C_{2m}(u) < R_CF(u) < C_{2m-1}(u) < ... < C_1(u) = 1/(2u)`.
- *   2. `[ANC]` (Complete IEEE 754 `binary64` rounding proof):
+ *   2. `[ANC]` (Complete IEEE 754 `binary64` rounding proof & certified width verification):
  *      Let `u_mach = 2^-53 = 0.5 * Number.EPSILON` be the IEEE 754 `binary64` unit roundoff.
- *      - Exactness of `a_k = 0.5 * k`: for `1 <= k <= 2^53`, `k` is an exact `binary64` integer
- *        and `0.5 * k >= 0.5 >= 2^-1022` is an exact exponent shift (`delta_{a_k} = 0`).
- *      - Exactness of base step `k = 1`: `A_1 = 0.5` and `B_1 = u` are exact (`delta_1 = 0`).
- *      - Outward-rounded interval arithmetic (`[A_k^lo, A_k^hi]`, `[B_k^lo, B_k^hi]`):
- *        Every multiplication `u * X_{k-1}`, `a_k * X_{k-2}`, every addition `p_k + q_k`,
- *        any rescaling where an operand could enter the subnormal range, and the final
- *        division `A_k / B_k` are bounded outward via `predNonNegativeBinary64` and
- *        `succNonNegativeBinary64`, which hold across normal, subnormal, and zero regimes.
- *      - Higham `gamma_{4k+1}` forward error bound (Higham 2002, Lemma 3.1 & §3.2):
- *        When all intermediate products, sums, rescalings, and quotients lie in the normal
- *        range `[2^-1022, MAX_VALUE]` (`allNormalOperations === true`), each step `j >= 2`
- *        satisfies `fl(u * X_{j-1} + a_j * X_{j-2}) = u * X_{j-1} * (1 + d_{j,1})(1 + d_{j,3}) + a_j * X_{j-2} * (1 + d_{j,2})(1 + d_{j,3})`
- *        with `|d_{j,i}| <= u_mach`. Since all terms are non-negative and `j = 1` is exact,
- *        induction over `j = 2, ..., k` gives `(1 - u_mach)^{2k-2} X_k <= hat(X)_k <= (1 + u_mach)^{2k-2} X_k`
- *        for `X in {A, B}`. Including the final division `hat(C)_k = fl(hat(A)_k / hat(B)_k) = (hat(A)_k / hat(B)_k)(1 + d_div)`
- *        with `|d_div| <= u_mach`, the exact convergent `C_k = A_k / B_k` satisfies:
- *          `hat(C)_k * (1 - u_mach)^{2k-2} / (1 + u_mach)^{2k-1} <= C_k <= hat(C)_k * (1 + u_mach)^{2k-2} / (1 - u_mach)^{2k-1}`.
- *        By Higham's Lemma 3.1 with `n = (2k - 2) + (2k - 1) = 4k - 3 <= 4k + 1`,
- *        `C_k in [hat(C)_k * (1 - gamma_{4k+1}), hat(C)_k * (1 + gamma_{4k+1})]`.
- *      - Power-of-two rescaling by `2^-512` (when `max(A_k, B_k) > 2^512`) is an exact
- *        exponent shift with zero rounding error whenever all rescaled operands are `>= 2^-510`
- *        (so their products with `2^-512` remain `>= 2^-1022 = MIN_NORMAL_BINARY64`); otherwise
- *        `allNormalOperations` is set to `false` and the outward interval bounds enclose
- *        any subnormal rounding.
- *      - Taking the conservative outer hull of the outward interval enclosure and Higham's
- *        `gamma_{4k+1}` enclosure guarantees `certifiedLowerBound <= C_{2m}(u) < R_CF(u) < C_{2m-1}(u) <= certifiedUpperBound`
- *        and `|value - R_CF(u)| <= certifiedErrorBound`.
+ *      - Exactness of `a_k = 0.5 * k` (`1 <= k <= 2^53`) and base step `k = 1` (`A_1 = 0.5`, `B_1 = u`).
+ *      - Outward-rounded interval arithmetic (`[A_k^lo, A_k^hi]`, `[B_k^lo, B_k^hi]`) via
+ *        `predNonNegativeBinary64` and `succNonNegativeBinary64` bounds every multiplication,
+ *        addition, rescaling, and division across normal, subnormal, and zero regimes.
+ *      - Higham `gamma_{4k+1}` forward error bound (Higham 2002, Lemma 3.1 & §3.2) when all
+ *        operations lie in the normal range (`allNormalOperations === true`).
+ *      - Convergence is governed strictly by the outer certified interval
+ *        `[certifiedLowerBound, certifiedUpperBound]` and `certifiedErrorBound` (never by
+ *        the nominal convergent difference `algebraicWidth`): the function verifies
+ *        `certifiedLowerBound <= value && value <= certifiedUpperBound`, requires
+ *        `certifiedErrorBound <= max(absoluteTolerance, relativeTolerance * certifiedLowerBound)`,
+ *        continues iterating while the certified interval is actively shrinking, and throws
+ *        `NumericConvergenceError` if the certified error bound cannot meet the target
+ *        tolerance within `maxIterations`.
  */
 export function evaluateLaplaceStieltjesEnclosure(
   u: number,
-  maxIterations = 120,
+  optionsOrMaxIterations: number | NumericEvaluationOptions = 120,
 ): LaplaceStieltjesEnclosureResult {
   if (typeof u !== 'number' || !Number.isFinite(u) || Number.isNaN(u) || u <= 0) {
     throw new RangeError(
       `evaluateLaplaceStieltjesEnclosure requires finite u > 0, received ${String(u)}`,
+    );
+  }
+
+  const maxIterations =
+    typeof optionsOrMaxIterations === 'number'
+      ? optionsOrMaxIterations
+      : (optionsOrMaxIterations.maxIterations ?? 120);
+  const relativeTolerance =
+    typeof optionsOrMaxIterations === 'number'
+      ? DEFAULT_LAPLACE_STIELTJES_CERTIFIED_REL_TOL
+      : (optionsOrMaxIterations.relativeTolerance ??
+        DEFAULT_LAPLACE_STIELTJES_CERTIFIED_REL_TOL);
+  const absoluteTolerance =
+    typeof optionsOrMaxIterations === 'number'
+      ? 0
+      : (optionsOrMaxIterations.absoluteTolerance ?? 0);
+
+  if (!Number.isSafeInteger(maxIterations) || maxIterations < 1) {
+    throw new RangeError(
+      `evaluateLaplaceStieltjesEnclosure requires integer maxIterations >= 1, received ${String(maxIterations)}`,
+    );
+  }
+  if (
+    typeof relativeTolerance !== 'number' ||
+    !Number.isFinite(relativeTolerance) ||
+    Number.isNaN(relativeTolerance) ||
+    relativeTolerance <= 0
+  ) {
+    throw new RangeError(
+      `evaluateLaplaceStieltjesEnclosure requires finite relativeTolerance > 0, received ${String(relativeTolerance)}`,
+    );
+  }
+  if (
+    typeof absoluteTolerance !== 'number' ||
+    !Number.isFinite(absoluteTolerance) ||
+    Number.isNaN(absoluteTolerance) ||
+    absoluteTolerance < 0
+  ) {
+    throw new RangeError(
+      `evaluateLaplaceStieltjesEnclosure requires finite absoluteTolerance >= 0, received ${String(absoluteTolerance)}`,
     );
   }
 
@@ -794,6 +848,8 @@ export function evaluateLaplaceStieltjesEnclosure(
   let bestCertifiedLower = 0;
   let bestCertifiedUpper = Number.POSITIVE_INFINITY;
   let prevConvergent = 0;
+  let prevCertifiedWidth = Number.POSITIVE_INFINITY;
+  let lastCertifiedRelativeError = Number.POSITIVE_INFINITY;
 
   for (let k = 1; k <= maxIterations; k++) {
     const ak = 0.5 * k;
@@ -859,7 +915,7 @@ export function evaluateLaplaceStieltjesEnclosure(
         'erfcxDiffPositive[LaplaceStieltjesCF]',
         k,
         Number.NaN,
-        1e-15,
+        relativeTolerance,
         `non-finite Euler-Wallis convergent at u = ${u}, k = ${k}`,
       );
     }
@@ -906,33 +962,63 @@ export function evaluateLaplaceStieltjesEnclosure(
     if (k >= 2 && bestCertifiedLower > 0 && Number.isFinite(bestCertifiedUpper)) {
       const lowerConvergent = Math.min(convergent, prevConvergent);
       const upperConvergent = Math.max(convergent, prevConvergent);
-      const algebraicWidth = upperConvergent - lowerConvergent;
       const certifiedLowerBound = bestCertifiedLower;
       const certifiedUpperBound = bestCertifiedUpper;
-      const value = 0.5 * (certifiedLowerBound + certifiedUpperBound);
-      const certifiedErrorBound = succNonNegativeBinary64(
-        Math.max(
-          succNonNegativeBinary64(Math.abs(value - certifiedLowerBound)),
-          succNonNegativeBinary64(Math.abs(certifiedUpperBound - value)),
-        ),
-      );
 
-      if (
-        certifiedLowerBound <= certifiedUpperBound &&
-        algebraicWidth <= 1e-15 * lowerConvergent
-      ) {
-        return Object.freeze({
-          value,
-          lowerConvergent,
-          upperConvergent,
-          certifiedLowerBound,
+      if (certifiedLowerBound <= certifiedUpperBound) {
+        const midpoint = 0.5 * (certifiedLowerBound + certifiedUpperBound);
+        const value = Math.min(
           certifiedUpperBound,
-          certifiedErrorBound,
-          iterations: k,
-          gammaIndex: gammaIdx,
-          gammaBound: gammaVal,
-          allNormalOperations,
-        });
+          Math.max(certifiedLowerBound, midpoint),
+        );
+        const certifiedWidth = succNonNegativeBinary64(
+          certifiedUpperBound - certifiedLowerBound,
+        );
+        const certifiedErrorBound = succNonNegativeBinary64(
+          Math.max(
+            succNonNegativeBinary64(Math.abs(value - certifiedLowerBound)),
+            succNonNegativeBinary64(Math.abs(certifiedUpperBound - value)),
+          ),
+        );
+        const certifiedRelativeError = succNonNegativeBinary64(
+          certifiedErrorBound / certifiedLowerBound,
+        );
+        lastCertifiedRelativeError = certifiedRelativeError;
+
+        const targetAllowedError = Math.max(
+          absoluteTolerance,
+          predNonNegativeBinary64(relativeTolerance * certifiedLowerBound),
+        );
+        const meetsCertifiedTolerance =
+          certifiedLowerBound <= value &&
+          value <= certifiedUpperBound &&
+          (certifiedErrorBound <= targetAllowedError ||
+            certifiedRelativeError <= relativeTolerance);
+
+        // Continue tightening while the certified width is still shrinking by more than
+        // 4 ULPs, unless k === maxIterations (where we return immediately if certified
+        // tolerance is already met):
+        const certifiedWidthStabilized =
+          prevCertifiedWidth - certifiedWidth <= 2 * Number.EPSILON * certifiedLowerBound ||
+          k === maxIterations;
+
+        if (meetsCertifiedTolerance && certifiedWidthStabilized) {
+          return Object.freeze({
+            value,
+            lowerConvergent,
+            upperConvergent,
+            certifiedLowerBound,
+            certifiedUpperBound,
+            certifiedWidth,
+            certifiedErrorBound,
+            certifiedRelativeError,
+            iterations: k,
+            gammaIndex: gammaIdx,
+            gammaBound: gammaVal,
+            allNormalOperations,
+          });
+        }
+        prevCertifiedWidth = certifiedWidth;
       }
     }
 
@@ -987,14 +1073,12 @@ export function evaluateLaplaceStieltjesEnclosure(
     }
   }
 
-  const finalWidth = Math.abs(bestOddNominal - bestEvenNominal);
-  const finalMin = Math.max(1e-300, bestEvenNominal);
   throw new NumericConvergenceError(
     'erfcxDiffPositive[LaplaceStieltjesCF]',
     maxIterations,
-    finalWidth / finalMin,
-    1e-15,
-    `failed at u = ${u}`,
+    lastCertifiedRelativeError,
+    relativeTolerance,
+    `certified enclosure failed to achieve relativeTolerance=${relativeTolerance} at u = ${u}`,
   );
 }
 
@@ -2668,7 +2752,29 @@ function evaluateBentonKrishnamoorthyModalSeries(
   throw new NumericConvergenceError('nonCentralStudentTCdf', maxSteps, finalBTail, 1e-12);
 }
 
-const SQRT_HALF_PI = Math.sqrt(0.5 * Math.PI);
+const HALF_LN_HALF_PI = 0.5 * Math.log(0.5 * Math.PI);
+
+/** Default unified total relative error budget tolerance for `evaluateLogNonCentralStudentTCdfIntegralWithDiagnostics`. */
+export const DEFAULT_NONCENTRAL_T_INTEGRAL_REL_TOL = 1e-12;
+
+/**
+ * Converts a logarithmic upper bound `logBound` into a conservative non-negative
+ * `binary64` linear upper bound without turning a mathematically positive tail
+ * (`logBound > -Infinity`) into `0` upon `binary64` underflow [IME / ANC]:
+ *   - `logBound === -Infinity` (empty integration interval `(0, 0)`) -> `0` (exact)
+ *   - `logBound > -Infinity` with `Math.exp(logBound) === 0` (underflow) -> `Number.MIN_VALUE` (`2^-1074 > 0`)
+ *   - `logBound > -Infinity` with `Math.exp(logBound) > 0` -> `succNonNegativeBinary64(Math.exp(logBound))`
+ */
+function conservativePositiveLinearUpperBoundFromLog(logBound: number): number {
+  if (logBound === Number.NEGATIVE_INFINITY) {
+    return 0;
+  }
+  if (!Number.isFinite(logBound) || Number.isNaN(logBound)) {
+    return Number.POSITIVE_INFINITY;
+  }
+  const rawExp = Math.exp(logBound);
+  return rawExp === 0 ? Number.MIN_VALUE : succNonNegativeBinary64(rawExp);
+}
 
 /**
  * Computes `ln Phi(w) - ln Phi(wStar)` where `deltaW = w - wStar` without
@@ -2690,16 +2796,32 @@ function diffLogStandardNormalCdf(w: number, wStar: number, deltaW: number): num
 }
 
 /**
- * Diagnostic breakdown of the 4 error controls in `evaluateLogNonCentralStudentTCdfIntegralWithDiagnostics`:
- *   - `leftTailRelativeBound` (`[IME]` / `[ANC]`): strict analytical upper bound on
- *     `int_0^{z_L} exp(psi(z) - psi(z_*)) dz / I_mid` derived from strong concavity `psi''(z) <= -1`.
- *   - `rightTailRelativeBound` (`[IME]` / `[ANC]`): strict analytical upper bound on
- *     `int_{z_R}^inf exp(psi(z) - psi(z_*)) dz / I_mid` derived from strong concavity `psi''(z) <= -1`.
- *   - `quadratureRelativeErrorEstimate` (`[EBM]`): a posteriori two-level 8-point Gauss-Legendre
- *     refinement discrepancy `sum_p |I_{fine,p} - I_{coarse,p}| / I_mid` across `[z_L, z_*] U [z_*, z_R]`
- *     (empirically validated against 80-to-120-digit references; not a 16th-derivative Peano proof).
- *   - `roundingRelativeBound` (`[ANC]`): IEEE 754 `binary64` rounding and Kahan-Neumaier
- *     accumulation bound for the quadrature sum and integrand evaluations.
+ * Diagnostic breakdown of the error controls in `evaluateLogNonCentralStudentTCdfIntegralWithDiagnostics`,
+ * explicitly separating rigorously proven analytical/summation bounds from empirically
+ * benchmarked quadrature and transcendental evaluation estimates:
+ *
+ *   1. Rigorous analytical & basic-arithmetic bounds (`rigorousRelativeBound`):
+ *      - `leftTailLogRelativeBound` & `leftTailRelativeBound` (`[IME]`): analytical log-concavity
+ *        upper bound on `int_0^{z_L} exp(psi(z) - psi(z_*)) dz / I_mid` from `psi''(z) <= -1`,
+ *        evaluated in log-space and bounded linearly by `>= Number.MIN_VALUE` whenever `z_L > 0`.
+ *      - `rightTailLogRelativeBound` & `rightTailRelativeBound` (`[IME]`): analytical log-concavity
+ *        upper bound on `int_{z_R}^inf exp(psi(z) - psi(z_*)) dz / I_mid` from `psi''(z) <= -1`,
+ *        evaluated in log-space and bounded linearly by `>= Number.MIN_VALUE`.
+ *      - `kahanSummationRelativeBound` (`[ANC]`): Higham `gamma_2 + M * u^2` bound for Kahan-Neumaier
+ *        accumulation of the `M` positive `binary64` panel integrals using only `+` and `-`.
+ *
+ *   2. Empirically validated numerical estimates (`empiricalRelativeEstimate`, `[EBM]`):
+ *      - `quadratureRelativeErrorEstimate` (`[EBM]`): a posteriori two-level 8-point Gauss-Legendre
+ *        refinement discrepancy `sum_p |I_{fine,p} - I_{coarse,p}| / I_mid`.
+ *      - `evaluationRoundingRelativeEstimate` (`[EBM]`): conditioning estimate for ECMAScript
+ *        `Math.exp`, `Math.log`, `Math.log1p`, `erfcx`, `lnGamma`, and numerical `z_*` location
+ *        (since IEEE 754 / Higham `gamma_n` basic-operation theorems do not certify host library
+ *        transcendental functions).
+ *
+ *   3. Combined error budget (`totalRelativeErrorBudget`, `totalLogErrorBudget`, `[EBM]`):
+ *      - Accumulated via `kahanNeumaierSum` and checked against the unified `targetRelativeTolerance`
+ *        (default `1e-12`). Because it incorporates `empiricalRelativeEstimate`, the combined budget
+ *        is classified as an empirically benchmarked error budget (`[EBM]`), not a certified `[ANC]` bound.
  */
 export interface NonCentralStudentTIntegralDiagnostics {
   readonly logProbability: number;
@@ -2707,12 +2829,22 @@ export interface NonCentralStudentTIntegralDiagnostics {
   readonly leftBound: number;
   readonly rightBound: number;
   readonly scaledIntegral: number;
+  readonly leftTailDeltaPsi: number;
+  readonly rightTailDeltaPsi: number;
+  readonly leftTailLogRelativeBound: number;
+  readonly rightTailLogRelativeBound: number;
   readonly leftTailRelativeBound: number;
   readonly rightTailRelativeBound: number;
+  readonly kahanSummationRelativeBound: number;
+  readonly evaluationRoundingRelativeEstimate: number;
   readonly quadratureRelativeErrorEstimate: number;
   readonly roundingRelativeBound: number;
+  readonly rigorousRelativeBound: number;
+  readonly empiricalRelativeEstimate: number;
   readonly totalRelativeErrorBudget: number;
   readonly totalLogErrorBudget: number;
+  readonly targetRelativeTolerance: number;
+  readonly errorGuaranteeClassification: 'analytical-tails-and-summation-only-empirical-quadrature-and-eval';
   readonly panelEvaluations: number;
 }
 
@@ -2722,25 +2854,9 @@ export interface NonCentralStudentTIntegralDiagnostics {
  *
  *   `F_{t_nu(delta)}(t) = int_0^inf Phi((t / sqrt(nu)) * z - delta) * (2^(1 - nu/2) / Gamma(nu/2)) * z^(nu - 1) * exp(-z^2 / 2) dz`
  *
- * with four independent error controls:
- *   A. Left-tail truncation bound (`leftTailRelativeBound`, `[IME]` / `[ANC]`):
- *      Either `z_L = 0` (exact zero left tail) or `0 < z_L < z_*` with `s_L = psi'(z_L) > 0`,
- *      where strong log-concavity `psi''(z) <= -1 - (nu - 1)/z^2 <= -1` implies
- *      `psi(z_L - u) <= psi(z_L) - s_L * u - 0.5 * u^2` for `u in [0, z_L]`, bounding the
- *      scaled left-tail integral by `exp(psi(z_L) - psi(z_*)) * min(z_L, 1/s_L, sqrt(pi/2)*erfcx(s_L/sqrt(2)))`.
- *   B. Right-tail truncation bound (`rightTailRelativeBound`, `[IME]` / `[ANC]`):
- *      For `z_R > z_*`, `s_R = -psi'(z_R) >= z_R - z_* > 0`, and `psi''(z) <= -1` implies
- *      `psi(z_R + u) <= psi(z_R) - s_R * u - 0.5 * u^2` for `u >= 0`, bounding the scaled
- *      right-tail integral by `exp(psi(z_R) - psi(z_*)) * min(1/s_R, sqrt(pi/2)*erfcx(s_R/sqrt(2)))`.
- *   C. Interior quadrature error control (`quadratureRelativeErrorEstimate`, `[EBM]`):
- *      Partitions `[z_L, z_R]` explicitly at `z_*` (with smooth `z = u^4` transformation
- *      when `z_L = 0` and `1 < nu < 4` so `z^(nu-1) dz = 4 u^(4*nu - 1) du` is `C^3` at `u = 0`)
- *      and refines panels via two-level 8-point Gauss-Legendre quadrature without silent
- *      acceptance on depth or iteration exhaustion.
- *   D. Rounding & Kahan-Neumaier accumulation bound (`roundingRelativeBound`, `[ANC]`):
- *      Evaluates `psi(z) - psi(z_*)` in cancellation-free incremental form without adding/subtracting
- *      `c_nu`, accumulates panels via Kahan-Neumaier summation, and bounds the `binary64`
- *      evaluation and summation error via Higham `gamma_n` constants.
+ * with independent log-space tail truncation bounds (`[IME]`), Kahan-Neumaier summation
+ * rounding bounds (`[ANC]`), and empirically validated adaptive 8-point Gauss-Legendre
+ * quadrature and transcendental evaluation error estimates (`[EBM]`).
  */
 export function evaluateLogNonCentralStudentTCdfIntegralWithDiagnostics(
   t: number,
@@ -2754,6 +2870,19 @@ export function evaluateLogNonCentralStudentTCdfIntegralWithDiagnostics(
     ncp,
     'evaluateLogNonCentralStudentTCdfIntegralWithDiagnostics',
   );
+  const targetRelativeTolerance =
+    options?.relativeTolerance ?? DEFAULT_NONCENTRAL_T_INTEGRAL_REL_TOL;
+  if (
+    typeof targetRelativeTolerance !== 'number' ||
+    !Number.isFinite(targetRelativeTolerance) ||
+    Number.isNaN(targetRelativeTolerance) ||
+    targetRelativeTolerance <= 0
+  ) {
+    throw new RangeError(
+      `evaluateLogNonCentralStudentTCdfIntegralWithDiagnostics requires finite relativeTolerance > 0, received ${String(targetRelativeTolerance)}`,
+    );
+  }
+
   const a = t / Math.sqrt(df);
   if (!Number.isFinite(a) || Math.abs(a) > 1e140) {
     return Object.freeze({
@@ -2762,12 +2891,23 @@ export function evaluateLogNonCentralStudentTCdfIntegralWithDiagnostics(
       leftBound: 0,
       rightBound: 0,
       scaledIntegral: 0,
+      leftTailDeltaPsi: Number.NEGATIVE_INFINITY,
+      rightTailDeltaPsi: Number.NEGATIVE_INFINITY,
+      leftTailLogRelativeBound: Number.NEGATIVE_INFINITY,
+      rightTailLogRelativeBound: Number.NEGATIVE_INFINITY,
       leftTailRelativeBound: 0,
       rightTailRelativeBound: 0,
+      kahanSummationRelativeBound: 0,
+      evaluationRoundingRelativeEstimate: 0,
       quadratureRelativeErrorEstimate: 0,
       roundingRelativeBound: 0,
+      rigorousRelativeBound: 0,
+      empiricalRelativeEstimate: 0,
       totalRelativeErrorBudget: 0,
       totalLogErrorBudget: 0,
+      targetRelativeTolerance,
+      errorGuaranteeClassification:
+        'analytical-tails-and-summation-only-empirical-quadrature-and-eval',
       panelEvaluations: 0,
     });
   }
@@ -2837,12 +2977,23 @@ export function evaluateLogNonCentralStudentTCdfIntegralWithDiagnostics(
       leftBound: 0,
       rightBound: 0,
       scaledIntegral: 0,
+      leftTailDeltaPsi: Number.NEGATIVE_INFINITY,
+      rightTailDeltaPsi: Number.NEGATIVE_INFINITY,
+      leftTailLogRelativeBound: Number.NEGATIVE_INFINITY,
+      rightTailLogRelativeBound: Number.NEGATIVE_INFINITY,
       leftTailRelativeBound: 0,
       rightTailRelativeBound: 0,
+      kahanSummationRelativeBound: 0,
+      evaluationRoundingRelativeEstimate: 0,
       quadratureRelativeErrorEstimate: 0,
       roundingRelativeBound: 0,
+      rigorousRelativeBound: 0,
+      empiricalRelativeEstimate: 0,
       totalRelativeErrorBudget: 0,
       totalLogErrorBudget: 0,
+      targetRelativeTolerance,
+      errorGuaranteeClassification:
+        'analytical-tails-and-summation-only-empirical-quadrature-and-eval',
       panelEvaluations: 0,
     });
   }
@@ -2878,55 +3029,106 @@ export function evaluateLogNonCentralStudentTCdfIntegralWithDiagnostics(
   const boundarySlopeStar = zStar === 0 && df === 1 ? Math.abs(a * lambdaStar) : 0;
   const sigmaStar = 1 / (boundarySlopeStar + Math.sqrt(Math.max(1, negD2PsiStar)));
 
-  // B. Rigorous analytical right-tail upper bound on int_{zR}^inf exp(deltaPsi(z)) dz [IME / ANC]
-  function computeRightTailUpperBound(zR: number): number {
+  // B. Logarithmic right-tail upper bound on ln(int_{zR}^inf exp(deltaPsi(z)) dz) [IME]:
+  //    Maintained strictly in log-space so underflow of exp(dP) never turns a positive tail into 0.
+  function computeRightTailLogUpperBound(zR: number): number {
     const sR = -dPsi(zR);
-    if (!(sR > 0)) {
+    if (!(sR > 0) || !Number.isFinite(sR)) {
       return Number.POSITIVE_INFINITY;
     }
     const dP = deltaPsi(zR);
-    if (dP <= LN_ROUND_TO_ZERO_THRESHOLD_BINARY64) {
-      return 0;
+    if (!Number.isFinite(dP) || Number.isNaN(dP)) {
+      return Number.POSITIVE_INFINITY;
     }
-    const erfcxFactor = SQRT_HALF_PI * erfcx(sR * Math.SQRT1_2);
-    const decayFactor = Math.min(1 / sR, erfcxFactor);
-    return succNonNegativeBinary64(
-      succNonNegativeBinary64(Math.exp(dP)) * succNonNegativeBinary64(decayFactor),
-    );
+    const erfcxArg = sR * Math.SQRT1_2;
+    const logErfcxFactor =
+      erfcxArg < 1e150
+        ? HALF_LN_HALF_PI + Math.log(erfcx(erfcxArg))
+        : -Math.log(sR);
+    const logDecay = Math.min(-Math.log(sR), logErfcxFactor);
+    return succSignedBinary64(dP + succSignedBinary64(logDecay));
   }
 
-  // A. Rigorous analytical left-tail upper bound on int_0^{zL} exp(deltaPsi(z)) dz [IME / ANC]
-  function computeLeftTailUpperBound(zL: number): number {
+  // A. Logarithmic left-tail upper bound on ln(int_0^{zL} exp(deltaPsi(z)) dz) [IME]:
+  //    Returns -Infinity ONLY when zL <= 0 (where the interval (0, 0) is mathematically empty).
+  //    For all 0 < zL < zStar, returns a finite logarithmic upper bound even when exp(dP) === 0.
+  function computeLeftTailLogUpperBound(zL: number): number {
     if (zL <= 0) {
-      return 0;
+      return Number.NEGATIVE_INFINITY;
     }
     const sL = dPsi(zL);
-    if (!(sL > 0)) {
+    if (!(sL > 0) || !Number.isFinite(sL)) {
       return Number.POSITIVE_INFINITY;
     }
     const dP = deltaPsi(zL);
-    if (dP <= LN_ROUND_TO_ZERO_THRESHOLD_BINARY64) {
-      return 0;
+    if (!Number.isFinite(dP) || Number.isNaN(dP)) {
+      return Number.POSITIVE_INFINITY;
     }
-    const erfcxFactor = SQRT_HALF_PI * erfcx(sL * Math.SQRT1_2);
-    const decayFactor = Math.min(zL, 1 / sL, erfcxFactor);
-    return succNonNegativeBinary64(
-      succNonNegativeBinary64(Math.exp(dP)) * succNonNegativeBinary64(decayFactor),
-    );
+    const erfcxArg = sL * Math.SQRT1_2;
+    const logErfcxFactor =
+      erfcxArg < 1e150
+        ? HALF_LN_HALF_PI + Math.log(erfcx(erfcxArg))
+        : -Math.log(sL);
+    const logDecay = Math.min(Math.log(zL), -Math.log(sL), logErfcxFactor);
+    return succSignedBinary64(dP + succSignedBinary64(logDecay));
   }
 
-  const tailScaleTarget = 1e-16 * sigmaStar;
-  let rightStep = 2 * sigmaStar;
-  for (let iter = 0; iter < 120; iter++) {
-    if (computeRightTailUpperBound(zStar + rightStep) <= tailScaleTarget) {
-      break;
+  // Target log-space tail bound relative to sigmaStar:
+  const logTailScaleTarget =
+    Math.log(Math.min(1e-16, 0.05 * targetRelativeTolerance)) + Math.log(sigmaStar);
+
+  let rightBound: number;
+  if (options?.rightTailCutoff !== undefined) {
+    if (
+      typeof options.rightTailCutoff !== 'number' ||
+      !Number.isFinite(options.rightTailCutoff) ||
+      Number.isNaN(options.rightTailCutoff) ||
+      options.rightTailCutoff <= zStar
+    ) {
+      throw new RangeError(
+        `evaluateLogNonCentralStudentTCdfIntegralWithDiagnostics requires finite rightTailCutoff > zStar (${zStar}), received ${String(options.rightTailCutoff)}`,
+      );
     }
-    rightStep *= 1.5;
+    rightBound = options.rightTailCutoff;
+  } else {
+    let rightStep = 2 * sigmaStar;
+    let rightTailConverged = false;
+    for (let iter = 0; iter < 120; iter++) {
+      if (computeRightTailLogUpperBound(zStar + rightStep) <= logTailScaleTarget) {
+        rightTailConverged = true;
+        break;
+      }
+      rightStep *= 1.5;
+    }
+    rightBound = zStar + rightStep;
+    if (!rightTailConverged) {
+      throw new NumericConvergenceError(
+        'nonCentralStudentTCdf[RightTailTruncation]',
+        120,
+        conservativePositiveLinearUpperBoundFromLog(
+          computeRightTailLogUpperBound(rightBound) - Math.log(sigmaStar),
+        ),
+        targetRelativeTolerance,
+        `failed to bound right tail in log-space at zR=${rightBound}`,
+      );
+    }
   }
-  const rightBound = zStar + rightStep;
 
   let leftBound = 0;
-  if (zStar > 4 * sigmaStar) {
+  if (options?.leftTailCutoff !== undefined) {
+    if (
+      typeof options.leftTailCutoff !== 'number' ||
+      !Number.isFinite(options.leftTailCutoff) ||
+      Number.isNaN(options.leftTailCutoff) ||
+      options.leftTailCutoff < 0 ||
+      (zStar > 0 ? options.leftTailCutoff >= zStar : options.leftTailCutoff > 0)
+    ) {
+      throw new RangeError(
+        `evaluateLogNonCentralStudentTCdfIntegralWithDiagnostics requires finite leftTailCutoff in [0, zStar) (zStar=${zStar}), received ${String(options.leftTailCutoff)}`,
+      );
+    }
+    leftBound = options.leftTailCutoff;
+  } else if (zStar > 4 * sigmaStar) {
     let leftStep = 2 * sigmaStar;
     for (let iter = 0; iter < 120; iter++) {
       const candidateLeft = zStar - leftStep;
@@ -2934,7 +3136,7 @@ export function evaluateLogNonCentralStudentTCdfIntegralWithDiagnostics(
         leftBound = 0;
         break;
       }
-      if (computeLeftTailUpperBound(candidateLeft) <= tailScaleTarget) {
+      if (computeLeftTailLogUpperBound(candidateLeft) <= logTailScaleTarget) {
         leftBound = candidateLeft;
         break;
       }
@@ -3021,14 +3223,16 @@ export function evaluateLogNonCentralStudentTCdfIntegralWithDiagnostics(
       'nonCentralStudentTCdf[AdaptiveGL8]',
       panelEvaluations,
       1,
-      1e-12,
+      targetRelativeTolerance,
       `iteration budget maxIterations=${userMaxIterations} insufficient for initial 2-level Gauss-Legendre verification`,
     );
   }
 
   const acceptedPanels: number[] = [];
   const panelErrors: number[] = [];
+  const panelConditioningTerms: number[] = [];
   const MAX_DEPTH = 24;
+  const localRelTol = Math.min(1e-14, 0.1 * targetRelativeTolerance);
 
   while (stack.length > 0) {
     const cur = stack.pop()!;
@@ -3038,7 +3242,7 @@ export function evaluateLogNonCentralStudentTCdfIntegralWithDiagnostics(
         'nonCentralStudentTCdf[AdaptiveGL8]',
         panelEvaluations,
         Math.abs(cur.coarse) / Math.max(1e-300, coarseTotalEstimate),
-        1e-14,
+        localRelTol,
         'subinterval collapsed to zero binary64 width before meeting quadrature tolerance',
       );
     }
@@ -3048,18 +3252,23 @@ export function evaluateLogNonCentralStudentTCdfIntegralWithDiagnostics(
     panelEvaluations += 2;
     const fine = leftVal + rightVal;
     const diff = Math.abs(fine - cur.coarse);
-    const panelTolerance = 1e-14 * Math.max(coarseTotalEstimate / initialPanels, fine);
+    const panelTolerance = localRelTol * Math.max(coarseTotalEstimate / initialPanels, fine);
 
     if (diff <= panelTolerance) {
       acceptedPanels.push(fine);
       panelErrors.push(diff);
+      const zMid = useQuarticSub ? mid * mid * mid * mid : mid;
+      const absDeltaPsiMid = zMid > 0 ? Math.abs(deltaPsi(zMid)) : 0;
+      panelConditioningTerms.push(
+        fine * (Number.isFinite(absDeltaPsiMid) ? absDeltaPsiMid : 0),
+      );
     } else {
       if (cur.depth >= MAX_DEPTH || panelEvaluations + 2 > maxPanelEvaluations) {
         throw new NumericConvergenceError(
           'nonCentralStudentTCdf[AdaptiveGL8]',
           panelEvaluations,
           diff / Math.max(1e-300, coarseTotalEstimate),
-          1e-14,
+          localRelTol,
           `failed to converge at depth=${cur.depth}`,
         );
       }
@@ -3070,62 +3279,101 @@ export function evaluateLogNonCentralStudentTCdfIntegralWithDiagnostics(
 
   const scaledIntegral = kahanNeumaierSum(acceptedPanels);
   if (!(scaledIntegral > 0) || !Number.isFinite(scaledIntegral)) {
-    return Object.freeze({
-      logProbability: Number.NEGATIVE_INFINITY,
-      zStar,
-      leftBound,
-      rightBound,
-      scaledIntegral: 0,
-      leftTailRelativeBound: 0,
-      rightTailRelativeBound: 0,
-      quadratureRelativeErrorEstimate: 0,
-      roundingRelativeBound: 0,
-      totalRelativeErrorBudget: 0,
-      totalLogErrorBudget: 0,
+    throw new NumericConvergenceError(
+      'nonCentralStudentTCdf[AdaptiveGL8]',
       panelEvaluations,
-    });
+      1,
+      targetRelativeTolerance,
+      'scaled integral evaluated to non-positive or non-finite value',
+    );
   }
 
-  const leftTailAbsBound = computeLeftTailUpperBound(leftBound);
-  const rightTailAbsBound = computeRightTailUpperBound(rightBound);
+  const logScaledIntegral = Math.log(scaledIntegral);
+  const leftTailDeltaPsi = leftBound <= 0 ? Number.NEGATIVE_INFINITY : deltaPsi(leftBound);
+  const rightTailDeltaPsi = deltaPsi(rightBound);
+  const leftTailLogAbsBound = computeLeftTailLogUpperBound(leftBound);
+  const rightTailLogAbsBound = computeRightTailLogUpperBound(rightBound);
+
+  // Compare and maintain tail bounds in logarithmic space before converting to linear space:
+  const leftTailLogRelativeBound =
+    leftTailLogAbsBound === Number.NEGATIVE_INFINITY
+      ? Number.NEGATIVE_INFINITY
+      : succSignedBinary64(leftTailLogAbsBound - predSignedBinary64(logScaledIntegral));
+  const rightTailLogRelativeBound = succSignedBinary64(
+    rightTailLogAbsBound - predSignedBinary64(logScaledIntegral),
+  );
+
+  // Convert to conservative positive linear bounds (never 0 when logBound > -Infinity):
   const leftTailRelativeBound =
-    leftTailAbsBound === 0 ? 0 : succNonNegativeBinary64(leftTailAbsBound / scaledIntegral);
+    conservativePositiveLinearUpperBoundFromLog(leftTailLogRelativeBound);
   const rightTailRelativeBound =
-    rightTailAbsBound === 0 ? 0 : succNonNegativeBinary64(rightTailAbsBound / scaledIntegral);
+    conservativePositiveLinearUpperBoundFromLog(rightTailLogRelativeBound);
+
   const quadratureAbsError = kahanNeumaierSum(panelErrors);
   const quadratureRelativeErrorEstimate = succNonNegativeBinary64(
     quadratureAbsError / scaledIntegral,
   );
 
-  // D. IEEE 754 binary64 rounding & Kahan-Neumaier accumulation bound:
-  //    - Kahan-Neumaier accumulation of M = acceptedPanels.length positive panels: gamma_2 + M * u^2
-  //    - Per-node integrand evaluation exp(deltaPsi(z)): gamma_16 * (1 + |wStar| + (df - 1)) * u_mach
-  const totalNodeEvaluations = acceptedPanels.length * 16;
-  const sumRoundingRel =
-    gammaBinary64(2) +
-    totalNodeEvaluations * (0.5 * Number.EPSILON) * (0.5 * Number.EPSILON);
-  const evalRoundingRel = gammaBinary64(16);
-  const roundingRelativeBound = succNonNegativeBinary64(sumRoundingRel + evalRoundingRel);
-
-  const totalRelativeErrorBudget = succNonNegativeBinary64(
-    leftTailRelativeBound +
-      rightTailRelativeBound +
-      quadratureRelativeErrorEstimate +
-      roundingRelativeBound,
+  // D1. Rigorous Kahan-Neumaier summation rounding bound for M positive binary64 panels [ANC]:
+  const numAcceptedPanels = acceptedPanels.length;
+  const uMach = 0.5 * Number.EPSILON;
+  const kahanSummationRelativeBound = succNonNegativeBinary64(
+    gammaBinary64(2) + numAcceptedPanels * uMach * uMach,
   );
 
+  // D2. Empirical conditioning estimate for ECMAScript Math.* & special functions in scaledIntegral [EBM]:
+  const meanAbsDeltaPsi = kahanNeumaierSum(panelConditioningTerms) / scaledIntegral;
+  const evaluationRoundingRelativeEstimate = succNonNegativeBinary64(
+    16 * uMach * (1 + meanAbsDeltaPsi),
+  );
+
+  const roundingRelativeBound = succNonNegativeBinary64(
+    kahanNeumaierSum([kahanSummationRelativeBound, evaluationRoundingRelativeEstimate]),
+  );
+
+  // Rigorous analytical + basic-arithmetic bound vs. empirical quadrature + evaluation estimate:
+  const rigorousRelativeBound = succNonNegativeBinary64(
+    kahanNeumaierSum([
+      leftTailRelativeBound,
+      rightTailRelativeBound,
+      kahanSummationRelativeBound,
+    ]),
+  );
+  const empiricalRelativeEstimate = succNonNegativeBinary64(
+    kahanNeumaierSum([
+      quadratureRelativeErrorEstimate,
+      evaluationRoundingRelativeEstimate,
+    ]),
+  );
+
+  // Combined total relative error budget accumulated via Kahan-Neumaier summation ([EBM]):
+  const totalRelativeErrorBudget = succNonNegativeBinary64(
+    kahanNeumaierSum([
+      leftTailRelativeBound,
+      rightTailRelativeBound,
+      kahanSummationRelativeBound,
+      quadratureRelativeErrorEstimate,
+      evaluationRoundingRelativeEstimate,
+    ]),
+  );
+
+  const logTargetTolerance = Math.log(targetRelativeTolerance);
   if (
-    leftTailRelativeBound > 1e-12 ||
-    rightTailRelativeBound > 1e-12 ||
-    quadratureRelativeErrorEstimate > 1e-12 ||
-    totalRelativeErrorBudget >= 1e-10
+    leftTailLogRelativeBound > logTargetTolerance ||
+    rightTailLogRelativeBound > logTargetTolerance ||
+    leftTailRelativeBound > targetRelativeTolerance ||
+    rightTailRelativeBound > targetRelativeTolerance ||
+    quadratureRelativeErrorEstimate > targetRelativeTolerance ||
+    rigorousRelativeBound > targetRelativeTolerance ||
+    empiricalRelativeEstimate > targetRelativeTolerance ||
+    totalRelativeErrorBudget > targetRelativeTolerance
   ) {
     throw new NumericConvergenceError(
       'nonCentralStudentTCdf[ErrorBudget]',
       panelEvaluations,
       totalRelativeErrorBudget,
-      1e-12,
-      `error budget exceeded (left=${leftTailRelativeBound}, right=${rightTailRelativeBound}, quad=${quadratureRelativeErrorEstimate})`,
+      targetRelativeTolerance,
+      `error budget ${totalRelativeErrorBudget} exceeded targetRelativeTolerance ${targetRelativeTolerance} (leftLog=${leftTailLogRelativeBound}, rightLog=${rightTailLogRelativeBound}, rigorous=${rigorousRelativeBound}, empirical=${empiricalRelativeEstimate})`,
     );
   }
 
@@ -3134,12 +3382,15 @@ export function evaluateLogNonCentralStudentTCdfIntegralWithDiagnostics(
     logPhiStar,
     zStar > 0 && df !== 1 ? (df - 1) * Math.log(zStar) : 0,
     zStar > 0 ? -0.5 * zStar * zStar : 0,
-    Math.log(scaledIntegral),
+    logScaledIntegral,
   ]);
   const logProbability = Math.min(0, logProbabilityRaw);
-  const logSumRounding = gammaBinary64(6) * Math.abs(logProbability);
+  const logSumConditioning = 6 * uMach * Math.abs(logProbability);
   const totalLogErrorBudget = succNonNegativeBinary64(
-    -Math.log1p(-Math.min(0.5, totalRelativeErrorBudget)) + logSumRounding,
+    kahanNeumaierSum([
+      -Math.log1p(-Math.min(0.5, totalRelativeErrorBudget)),
+      logSumConditioning,
+    ]),
   );
 
   return Object.freeze({
@@ -3148,12 +3399,23 @@ export function evaluateLogNonCentralStudentTCdfIntegralWithDiagnostics(
     leftBound,
     rightBound,
     scaledIntegral,
+    leftTailDeltaPsi,
+    rightTailDeltaPsi,
+    leftTailLogRelativeBound,
+    rightTailLogRelativeBound,
     leftTailRelativeBound,
     rightTailRelativeBound,
+    kahanSummationRelativeBound,
+    evaluationRoundingRelativeEstimate,
     quadratureRelativeErrorEstimate,
     roundingRelativeBound,
+    rigorousRelativeBound,
+    empiricalRelativeEstimate,
     totalRelativeErrorBudget,
     totalLogErrorBudget,
+    targetRelativeTolerance,
+    errorGuaranteeClassification:
+      'analytical-tails-and-summation-only-empirical-quadrature-and-eval',
     panelEvaluations,
   });
 }
@@ -3195,14 +3457,15 @@ function validateNonCentralStudentTParams(
  * Evaluates both the lower-tail CDF `F_{t_nu(delta)}(t)` and the upper-tail
  * survival probability `1 - F_{t_nu(delta)}(t) = F_{t_nu(-delta)}(-t)` as a
  * coherent `DualChannelProbability` without catastrophic `1 - CDF` reflection
- * cancellation in either tail [IME / ANC / EBM].
+ * cancellation in either tail [IME / EBM].
  *
  * Epistemological classification:
  *   - `[IME]`: Exact distributional reflection `1 - F_{t_nu(delta)}(t) = F_{t_nu(-delta)}(-t)`
- *     and analytical left/right tail truncation bounds from strong log-concavity `psi''(z) <= -1`.
- *   - `[ANC]`: Kahan-Neumaier accumulation and IEEE 754 `binary64` dual-channel construction.
- *   - `[EBM]`: Interior adaptive two-level 8-point Gauss-Legendre quadrature error control,
- *     empirically validated against 80-to-120-digit arbitrary-precision references.
+ *     and analytical log-space left/right tail truncation bounds from `psi''(z) <= -1`.
+ *   - `[EBM]`: Interior adaptive two-level 8-point Gauss-Legendre quadrature and host
+ *     transcendental (`Math.*`, `erfcx`, `lnGamma`) evaluation error estimates, empirically
+ *     validated against 80-to-120-digit arbitrary-precision references (with `[ANC]`
+ *     applicable only to the Kahan-Neumaier summation step and dual-channel ULP representation).
  */
 export function nonCentralStudentTDualCdf(
   t: number,
@@ -3275,9 +3538,10 @@ export function nonCentralStudentTDualCdf(
  *      - For all opposite-sign (`t < 0, ncp > 0` and `t > 0, ncp < 0`), Quadrant-III (`t < 0, ncp < 0`),
  *        and deep lower-tail cases (such as `F_{t_10(10)}(-20) = 3.8869760048338704e-39`),
  *        evaluates the smaller tail directly in log-space via `nonCentralStudentTDualCdf`,
- *        combining analytical log-concavity left/right tail truncation bounds (`[IME / ANC]`),
- *        Kahan-Neumaier rounding/accumulation bounds (`[ANC]`), and adaptive two-level 8-point
- *        Gauss-Legendre interior quadrature (`[EBM]`).
+ *        combining analytical log-concavity left/right tail truncation bounds (`[IME]`),
+ *        Kahan-Neumaier summation bounds (`[ANC]`), and empirically validated adaptive
+ *        two-level 8-point Gauss-Legendre interior quadrature and transcendental evaluation
+ *        error estimates (`[EBM]`).
  */
 export function nonCentralStudentTCdf(
   t: number,

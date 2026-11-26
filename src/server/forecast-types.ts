@@ -418,12 +418,16 @@ export interface ForecastDistributionOutput {
 }
 
 /**
- * Optional iteration budget override for iterative special-function evaluations.
- * Enables deterministic testing of non-convergence failure paths without
- * weakening production convergence thresholds.
+ * Optional iteration and error-budget overrides for iterative special-function
+ * evaluations. Enables deterministic testing of non-convergence and error-budget
+ * failure paths without weakening production convergence thresholds.
  */
 export interface NumericEvaluationOptions {
   readonly maxIterations?: number;
+  readonly relativeTolerance?: number;
+  readonly absoluteTolerance?: number;
+  readonly leftTailCutoff?: number;
+  readonly rightTailCutoff?: number;
 }
 
 /* -------------------------------------------------------------------------

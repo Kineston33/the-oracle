@@ -418,6 +418,51 @@ describe('Stage 2A-1 — Numeric Primitives & Forecast Contracts (v4.4.3)', () =
       expect(() => evaluateLaplaceStieltjesEnclosure(2.0, 2)).toThrow(NumericConvergenceError);
     });
 
+    it('enforces certified interval width rather than nominal algebraicWidth and prevents premature return when certified precision is insufficient', () => {
+      // At u = 200, nominal convergents collapse to identical binary64 floats by k = 5
+      // (upperConvergent - lowerConvergent === 0), while the outward-rounded + Higham
+      // certified interval retains positive width (~1.26e-17, certifiedRelativeError ~ 2.602e-15).
+      const encAt5 = evaluateLaplaceStieltjesEnclosure(200.0, {
+        maxIterations: 5,
+        relativeTolerance: 1e-13,
+      });
+      const nominalAlgebraicWidth = encAt5.upperConvergent - encAt5.lowerConvergent;
+      expect(nominalAlgebraicWidth).toBe(0);
+      expect(encAt5.certifiedWidth).toBeGreaterThan(nominalAlgebraicWidth);
+      expect(encAt5.certifiedLowerBound).toBeLessThanOrEqual(encAt5.value);
+      expect(encAt5.value).toBeLessThanOrEqual(encAt5.certifiedUpperBound);
+      expect(encAt5.certifiedRelativeError).toBeGreaterThan(2e-15);
+      expect(encAt5.certifiedRelativeError).toBeLessThanOrEqual(1e-13);
+
+      // Default call does not stop prematurely at k = 5 on nominal algebraicWidth === 0;
+      // it verifies stabilization of the certified width at k = 6:
+      const encDefault = evaluateLaplaceStieltjesEnclosure(200.0);
+      expect(encDefault.iterations).toBeGreaterThanOrEqual(6);
+      expect(encDefault.certifiedLowerBound).toBeLessThanOrEqual(encDefault.value);
+      expect(encDefault.value).toBeLessThanOrEqual(encDefault.certifiedUpperBound);
+      expect(encDefault.certifiedRelativeError).toBeLessThanOrEqual(1e-13);
+
+      // When a relativeTolerance (1e-15) tighter than the certified interval relative error (~2.602e-15)
+      // is requested, evaluateLaplaceStieltjesEnclosure MUST NOT return prematurely even though
+      // nominal algebraicWidth === 0; it must continue iterating and throw NumericConvergenceError:
+      expect(() =>
+        evaluateLaplaceStieltjesEnclosure(200.0, {
+          maxIterations: 30,
+          relativeTolerance: 1e-15,
+        }),
+      ).toThrow(NumericConvergenceError);
+
+      // Similarly at u = 2.0, intermediate iterations (e.g. maxIterations = 24) have certified
+      // relative error ~1.68e-9 > 1e-13 and must throw NumericConvergenceError rather than
+      // returning an uncertified enclosure:
+      expect(() =>
+        evaluateLaplaceStieltjesEnclosure(2.0, {
+          maxIterations: 24,
+          relativeTolerance: 1e-13,
+        }),
+      ).toThrow(NumericConvergenceError);
+    });
+
     it('evaluates erfcxDiffPositive with relative error <= 1e-13 across direct, Stieltjes CF, and asymptotic regimes', () => {
       // Exact zero and infinite upper bound
       expect(erfcxDiffPositive(2.5, 2.5)).toBe(0);
@@ -1013,6 +1058,151 @@ describe('Stage 2A-1 — Numeric Primitives & Forecast Contracts (v4.4.3)', () =
       expect(() => nonCentralStudentTCdf(1.0, 10, 55.0)).toThrow(RangeError);
       expect(() => nonCentralStudentTCdf(1.0, 0.5, 2.0)).toThrow(RangeError);
       expect(() => nonCentralStudentTCdf(Number.NaN, 10, 2.0)).toThrow(RangeError);
+    });
+
+    it('preserves non-zero log-space and conservative positive linear tail bounds when intermediate Math.exp(dP) falls into subnormal or underflow (0) regimes', () => {
+      // 1. Subnormal lower and upper tails (LN_ROUND_TO_ZERO_THRESHOLD_BINARY64 < dP < LN_MIN_NORMAL_BINARY64)
+      const diagSubnormal = evaluateLogNonCentralStudentTCdfIntegralWithDiagnostics(
+        -2,
+        1800,
+        -5,
+        {
+          leftTailCutoff: 19.1,
+          rightTailCutoff: 71.4,
+        },
+      );
+      expect(diagSubnormal.leftBound).toBe(19.1);
+      expect(diagSubnormal.rightBound).toBe(71.4);
+      expect(diagSubnormal.leftTailDeltaPsi).toBeGreaterThan(
+        LN_ROUND_TO_ZERO_THRESHOLD_BINARY64,
+      );
+      expect(diagSubnormal.leftTailDeltaPsi).toBeLessThan(LN_MIN_NORMAL_BINARY64);
+      expect(diagSubnormal.rightTailDeltaPsi).toBeGreaterThan(
+        LN_ROUND_TO_ZERO_THRESHOLD_BINARY64,
+      );
+      expect(diagSubnormal.rightTailDeltaPsi).toBeLessThan(LN_MIN_NORMAL_BINARY64);
+      expect(Math.exp(diagSubnormal.leftTailDeltaPsi)).toBeGreaterThan(0);
+      expect(Math.exp(diagSubnormal.leftTailDeltaPsi)).toBeLessThan(2 ** -1022);
+      expect(Math.exp(diagSubnormal.rightTailDeltaPsi)).toBeGreaterThan(0);
+      expect(Math.exp(diagSubnormal.rightTailDeltaPsi)).toBeLessThan(2 ** -1022);
+      expect(Number.isFinite(diagSubnormal.leftTailLogRelativeBound)).toBe(true);
+      expect(Number.isFinite(diagSubnormal.rightTailLogRelativeBound)).toBe(true);
+      expect(diagSubnormal.leftTailRelativeBound).toBeGreaterThan(0);
+      expect(diagSubnormal.leftTailRelativeBound).toBeLessThan(2 ** -1022);
+      expect(diagSubnormal.rightTailRelativeBound).toBeGreaterThan(0);
+      expect(diagSubnormal.rightTailRelativeBound).toBeLessThan(2 ** -1022);
+
+      // 2. Underflowing positive lower and upper tails (dP <= LN_ROUND_TO_ZERO_THRESHOLD_BINARY64,
+      //    so Math.exp(dP) === 0 while the mathematical tail integral is strictly positive):
+      const diagUnderflow = evaluateLogNonCentralStudentTCdfIntegralWithDiagnostics(
+        -2,
+        1800,
+        -5,
+        {
+          leftTailCutoff: 10.0,
+          rightTailCutoff: 85.0,
+        },
+      );
+      expect(diagUnderflow.leftBound).toBe(10.0);
+      expect(diagUnderflow.rightBound).toBe(85.0);
+      expect(diagUnderflow.leftTailDeltaPsi).toBeLessThanOrEqual(
+        LN_ROUND_TO_ZERO_THRESHOLD_BINARY64,
+      );
+      expect(diagUnderflow.rightTailDeltaPsi).toBeLessThanOrEqual(
+        LN_ROUND_TO_ZERO_THRESHOLD_BINARY64,
+      );
+      expect(Math.exp(diagUnderflow.leftTailDeltaPsi)).toBe(0);
+      expect(Math.exp(diagUnderflow.rightTailDeltaPsi)).toBe(0);
+
+      // Log-space tail bounds remain finite and strictly ordered, and linear bounds use the
+      // conservative positive upper bound Number.MIN_VALUE (never 0 for a non-empty positive tail):
+      expect(Number.isFinite(diagUnderflow.leftTailLogRelativeBound)).toBe(true);
+      expect(Number.isFinite(diagUnderflow.rightTailLogRelativeBound)).toBe(true);
+      expect(diagUnderflow.leftTailLogRelativeBound).toBeLessThan(
+        diagSubnormal.leftTailLogRelativeBound,
+      );
+      expect(diagUnderflow.rightTailLogRelativeBound).toBeLessThan(
+        diagSubnormal.rightTailLogRelativeBound,
+      );
+      expect(diagUnderflow.leftTailRelativeBound).toBe(Number.MIN_VALUE);
+      expect(diagUnderflow.rightTailRelativeBound).toBe(Number.MIN_VALUE);
+      expect(diagUnderflow.leftTailRelativeBound).toBeGreaterThan(0);
+      expect(diagUnderflow.rightTailRelativeBound).toBeGreaterThan(0);
+
+      // Only when leftBound === 0 (empty interval (0, 0)) is leftTailRelativeBound === 0
+      // and leftTailLogRelativeBound === -Infinity:
+      const diagZeroLeft = evaluateLogNonCentralStudentTCdfIntegralWithDiagnostics(-20, 10, 10);
+      expect(diagZeroLeft.leftBound).toBe(0);
+      expect(diagZeroLeft.leftTailLogRelativeBound).toBe(Number.NEGATIVE_INFINITY);
+      expect(diagZeroLeft.leftTailRelativeBound).toBe(0);
+      expect(diagZeroLeft.rightTailRelativeBound).toBeGreaterThan(0);
+
+      // 3. Rejects results when either the lower or upper tail cannot be proven within the error budget:
+      expect(() =>
+        evaluateLogNonCentralStudentTCdfIntegralWithDiagnostics(-2, 1800, -5, {
+          leftTailCutoff: 41.0,
+        }),
+      ).toThrow(NumericConvergenceError);
+      expect(() =>
+        evaluateLogNonCentralStudentTCdfIntegralWithDiagnostics(-2, 1800, -5, {
+          rightTailCutoff: 43.8,
+        }),
+      ).toThrow(NumericConvergenceError);
+    });
+
+    it('separates rigorous bounds from empirical estimates, sums total error budget via Kahan-Neumaier, and rejects when total budget exceeds targetRelativeTolerance', () => {
+      const diag = evaluateLogNonCentralStudentTCdfIntegralWithDiagnostics(-20, 10, 10);
+
+      // Explicit epistemological classification separating rigorous analytical/summation bounds
+      // from empirical quadrature and host transcendental evaluation estimates:
+      expect(diag.errorGuaranteeClassification).toBe(
+        'analytical-tails-and-summation-only-empirical-quadrature-and-eval',
+      );
+      expect(diag.targetRelativeTolerance).toBe(1e-12);
+
+      // Rigorous bound combines analytical tail bounds and Kahan-Neumaier summation rounding (gamma_2 + M*u^2):
+      expect(diag.kahanSummationRelativeBound).toBeGreaterThan(0);
+      expect(diag.kahanSummationRelativeBound).toBeLessThan(1e-15);
+      const expectedRigorousSum = kahanNeumaierSum([
+        diag.leftTailRelativeBound,
+        diag.rightTailRelativeBound,
+        diag.kahanSummationRelativeBound,
+      ]);
+      expect(diag.rigorousRelativeBound).toBeGreaterThanOrEqual(expectedRigorousSum);
+
+      // Empirical estimate combines two-level Gauss-Legendre refinement discrepancy and transcendental conditioning:
+      expect(diag.evaluationRoundingRelativeEstimate).toBeGreaterThan(0);
+      expect(diag.quadratureRelativeErrorEstimate).toBeGreaterThanOrEqual(0);
+      const expectedEmpiricalSum = kahanNeumaierSum([
+        diag.quadratureRelativeErrorEstimate,
+        diag.evaluationRoundingRelativeEstimate,
+      ]);
+      expect(diag.empiricalRelativeEstimate).toBeGreaterThanOrEqual(expectedEmpiricalSum);
+
+      // Total relative error budget is accumulated via Kahan-Neumaier summation and checked against
+      // the unified targetRelativeTolerance (1e-12):
+      const expectedTotalSum = kahanNeumaierSum([
+        diag.leftTailRelativeBound,
+        diag.rightTailRelativeBound,
+        diag.kahanSummationRelativeBound,
+        diag.quadratureRelativeErrorEstimate,
+        diag.evaluationRoundingRelativeEstimate,
+      ]);
+      expect(diag.totalRelativeErrorBudget).toBeGreaterThanOrEqual(expectedTotalSum);
+      expect(diag.totalRelativeErrorBudget).toBeLessThanOrEqual(diag.targetRelativeTolerance);
+
+      // When targetRelativeTolerance is set tighter than totalRelativeErrorBudget (e.g. 1e-16),
+      // the function throws NumericConvergenceError rather than accepting an out-of-budget result:
+      expect(() =>
+        evaluateLogNonCentralStudentTCdfIntegralWithDiagnostics(-20, 10, 10, {
+          relativeTolerance: 1e-16,
+        }),
+      ).toThrow(NumericConvergenceError);
+      expect(() =>
+        nonCentralStudentTDualCdf(-20, 10, 10, {
+          relativeTolerance: 1e-16,
+        }),
+      ).toThrow(NumericConvergenceError);
     });
   });
 
