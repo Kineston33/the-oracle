@@ -2758,12 +2758,15 @@ const HALF_LN_HALF_PI = 0.5 * Math.log(0.5 * Math.PI);
 export const DEFAULT_NONCENTRAL_T_INTEGRAL_REL_TOL = 1e-12;
 
 /**
- * Converts a logarithmic upper bound `logBound` into a conservative non-negative
- * `binary64` linear upper bound without turning a mathematically positive tail
- * (`logBound > -Infinity`) into `0` upon `binary64` underflow [IME / ANC]:
+ * Converts a logarithmic tail bound estimate `logBound` into a conservative non-negative
+ * `binary64` linear value without turning a mathematically positive tail
+ * (`logBound > -Infinity`) into `0` upon `binary64` underflow [EBM]:
  *   - `logBound === -Infinity` (empty integration interval `(0, 0)`) -> `0` (exact)
  *   - `logBound > -Infinity` with `Math.exp(logBound) === 0` (underflow) -> `Number.MIN_VALUE` (`2^-1074 > 0`)
  *   - `logBound > -Infinity` with `Math.exp(logBound) > 0` -> `succNonNegativeBinary64(Math.exp(logBound))`
+ * Note: Because `logBound` and `Math.exp(logBound)` rely on ECMAScript `Math.*` transcendental
+ * functions and rational approximations (`erfcx`) without a 1-ULP or directed-rounding specification,
+ * the resulting linear value is an empirical bound estimate (`[EBM]`), not a certified `[ANC]` bound.
  */
 function conservativePositiveLinearUpperBoundFromLog(logBound: number): number {
   if (logBound === Number.NEGATIVE_INFINITY) {
@@ -2778,7 +2781,7 @@ function conservativePositiveLinearUpperBoundFromLog(logBound: number): number {
 
 /**
  * Computes `ln Phi(w) - ln Phi(wStar)` where `deltaW = w - wStar` without
- * `-0.5 * w^2` subtraction cancellation when `w <= 0` and `wStar <= 0` [IME].
+ * `-0.5 * w^2` subtraction cancellation when `w <= 0` and `wStar <= 0` [IME / EBM].
  */
 function diffLogStandardNormalCdf(w: number, wStar: number, deltaW: number): number {
   if (w <= 0 && wStar <= 0) {
@@ -2797,31 +2800,37 @@ function diffLogStandardNormalCdf(w: number, wStar: number, deltaW: number): num
 
 /**
  * Diagnostic breakdown of the error controls in `evaluateLogNonCentralStudentTCdfIntegralWithDiagnostics`,
- * explicitly separating rigorously proven analytical/summation bounds from empirically
- * benchmarked quadrature and transcendental evaluation estimates:
+ * strictly separating the certified IEEE 754 summation bound (`rigorousRelativeBound`, `[ANC]`)
+ * from empirically evaluated analytical-tail, quadrature, and transcendental conditioning
+ * estimates (`empiricalRelativeEstimate`, `[EBM]`):
  *
- *   1. Rigorous analytical & basic-arithmetic bounds (`rigorousRelativeBound`):
- *      - `leftTailLogRelativeBound` & `leftTailRelativeBound` (`[IME]`): analytical log-concavity
- *        upper bound on `int_0^{z_L} exp(psi(z) - psi(z_*)) dz / I_mid` from `psi''(z) <= -1`,
- *        evaluated in log-space and bounded linearly by `>= Number.MIN_VALUE` whenever `z_L > 0`.
- *      - `rightTailLogRelativeBound` & `rightTailRelativeBound` (`[IME]`): analytical log-concavity
- *        upper bound on `int_{z_R}^inf exp(psi(z) - psi(z_*)) dz / I_mid` from `psi''(z) <= -1`,
- *        evaluated in log-space and bounded linearly by `>= Number.MIN_VALUE`.
+ *   1. Certified IEEE 754 basic-operation bound (`rigorousRelativeBound`, `[ANC]`):
  *      - `kahanSummationRelativeBound` (`[ANC]`): Higham `gamma_2 + M * u^2` bound for Kahan-Neumaier
- *        accumulation of the `M` positive `binary64` panel integrals using only `+` and `-`.
+ *        accumulation of the `M` positive `binary64` panel integrals using only IEEE 754 `+` and `-`.
+ *      - `rigorousRelativeBound` equals `kahanSummationRelativeBound` and excludes `leftTailRelativeBound`
+ *        and `rightTailRelativeBound`.
  *
  *   2. Empirically validated numerical estimates (`empiricalRelativeEstimate`, `[EBM]`):
+ *      - `leftTailLogRelativeBound` & `leftTailRelativeBound` (analytical inequality: `[IME]`;
+ *        numerical evaluation: `[EBM]`): while the log-concavity inequality from `psi''(z) <= -1`
+ *        holds in exact real arithmetic (`[IME]`), its floating-point evaluation in
+ *        `computeLeftTailLogUpperBound` and `conservativePositiveLinearUpperBoundFromLog` invokes
+ *        `dPsi`, `deltaPsi`, `diffLogStandardNormalCdf`, `erfcx`, `Math.log`, `Math.log1p`,
+ *        `Math.exp`, `Math.sqrt`, the numerical root `z_*`, and `scaledIntegral`. Because ECMAScript
+ *        does not guarantee 1-ULP or directed rounding for `Math.*` and `erfcx` is a rational
+ *        approximation, `succSignedBinary64` does not certify the transcendental evaluation; the
+ *        evaluated tail bound is therefore classified as `[EBM]` and included in `empiricalRelativeEstimate`.
+ *      - `rightTailLogRelativeBound` & `rightTailRelativeBound` (analytical inequality: `[IME]`;
+ *        numerical evaluation: `[EBM]`): same distinction between the exact real-arithmetic log-concavity
+ *        inequality (`[IME]`) and its floating-point transcendental evaluation (`[EBM]`).
  *      - `quadratureRelativeErrorEstimate` (`[EBM]`): a posteriori two-level 8-point Gauss-Legendre
  *        refinement discrepancy `sum_p |I_{fine,p} - I_{coarse,p}| / I_mid`.
  *      - `evaluationRoundingRelativeEstimate` (`[EBM]`): conditioning estimate for ECMAScript
- *        `Math.exp`, `Math.log`, `Math.log1p`, `erfcx`, `lnGamma`, and numerical `z_*` location
- *        (since IEEE 754 / Higham `gamma_n` basic-operation theorems do not certify host library
- *        transcendental functions).
+ *        `Math.exp`, `Math.log`, `Math.log1p`, `erfcx`, `lnGamma`, and numerical `z_*` location.
  *
  *   3. Combined error budget (`totalRelativeErrorBudget`, `totalLogErrorBudget`, `[EBM]`):
- *      - Accumulated via `kahanNeumaierSum` and checked against the unified `targetRelativeTolerance`
- *        (default `1e-12`). Because it incorporates `empiricalRelativeEstimate`, the combined budget
- *        is classified as an empirically benchmarked error budget (`[EBM]`), not a certified `[ANC]` bound.
+ *      - Accumulated via `kahanNeumaierSum` over `rigorousRelativeBound` and all four components of
+ *        `empiricalRelativeEstimate`, checked against the unified `targetRelativeTolerance` (default `1e-12`).
  */
 export interface NonCentralStudentTIntegralDiagnostics {
   readonly logProbability: number;
@@ -2844,7 +2853,9 @@ export interface NonCentralStudentTIntegralDiagnostics {
   readonly totalRelativeErrorBudget: number;
   readonly totalLogErrorBudget: number;
   readonly targetRelativeTolerance: number;
-  readonly errorGuaranteeClassification: 'analytical-tails-and-summation-only-empirical-quadrature-and-eval';
+  readonly tailInequalityClassification: 'IME-exact-real-arithmetic-inequality';
+  readonly tailEvaluationClassification: 'EBM-empirical-transcendental-evaluation';
+  readonly errorGuaranteeClassification: 'summation-only-rigorous-tails-quadrature-and-eval-empirical';
   readonly panelEvaluations: number;
 }
 
@@ -2854,8 +2865,9 @@ export interface NonCentralStudentTIntegralDiagnostics {
  *
  *   `F_{t_nu(delta)}(t) = int_0^inf Phi((t / sqrt(nu)) * z - delta) * (2^(1 - nu/2) / Gamma(nu/2)) * z^(nu - 1) * exp(-z^2 / 2) dz`
  *
- * with independent log-space tail truncation bounds (`[IME]`), Kahan-Neumaier summation
- * rounding bounds (`[ANC]`), and empirically validated adaptive 8-point Gauss-Legendre
+ * combining analytical log-concavity tail inequalities (`[IME]`) whose floating-point
+ * transcendental evaluation is classified as empirical (`[EBM]`), a certified Kahan-Neumaier
+ * panel summation bound (`[ANC]`), and empirically validated adaptive 8-point Gauss-Legendre
  * quadrature and transcendental evaluation error estimates (`[EBM]`).
  */
 export function evaluateLogNonCentralStudentTCdfIntegralWithDiagnostics(
@@ -2906,8 +2918,10 @@ export function evaluateLogNonCentralStudentTCdfIntegralWithDiagnostics(
       totalRelativeErrorBudget: 0,
       totalLogErrorBudget: 0,
       targetRelativeTolerance,
+      tailInequalityClassification: 'IME-exact-real-arithmetic-inequality',
+      tailEvaluationClassification: 'EBM-empirical-transcendental-evaluation',
       errorGuaranteeClassification:
-        'analytical-tails-and-summation-only-empirical-quadrature-and-eval',
+        'summation-only-rigorous-tails-quadrature-and-eval-empirical',
       panelEvaluations: 0,
     });
   }
@@ -2992,13 +3006,15 @@ export function evaluateLogNonCentralStudentTCdfIntegralWithDiagnostics(
       totalRelativeErrorBudget: 0,
       totalLogErrorBudget: 0,
       targetRelativeTolerance,
+      tailInequalityClassification: 'IME-exact-real-arithmetic-inequality',
+      tailEvaluationClassification: 'EBM-empirical-transcendental-evaluation',
       errorGuaranteeClassification:
-        'analytical-tails-and-summation-only-empirical-quadrature-and-eval',
+        'summation-only-rigorous-tails-quadrature-and-eval-empirical',
       panelEvaluations: 0,
     });
   }
 
-  // Cancellation-free incremental evaluation of deltaPsi(z) = psi(z) - psi(zStar)
+  // Cancellation-free incremental evaluation of deltaPsi(z) = psi(z) - psi(zStar) [IME / EBM]
   function deltaPsi(z: number): number {
     if (z <= 0) {
       return df === 1
@@ -3029,8 +3045,13 @@ export function evaluateLogNonCentralStudentTCdfIntegralWithDiagnostics(
   const boundarySlopeStar = zStar === 0 && df === 1 ? Math.abs(a * lambdaStar) : 0;
   const sigmaStar = 1 / (boundarySlopeStar + Math.sqrt(Math.max(1, negD2PsiStar)));
 
-  // B. Logarithmic right-tail upper bound on ln(int_{zR}^inf exp(deltaPsi(z)) dz) [IME]:
-  //    Maintained strictly in log-space so underflow of exp(dP) never turns a positive tail into 0.
+  // B. Logarithmic right-tail bound formula on ln(int_{zR}^inf exp(deltaPsi(z)) dz) [IME formula / EBM evaluation]:
+  //    - Mathematical inequality [IME]: in exact real arithmetic, psi''(z) <= -1 implies
+  //      int_{zR}^inf exp(psi(z)-psi(z_*)) dz <= exp(psi(zR)-psi(z_*)) * min(1/sR, sqrt(pi/2)*erfcx(sR/sqrt(2))).
+  //    - Numerical evaluation [EBM]: evaluates dPsi, deltaPsi, erfcx, and Math.log in binary64;
+  //      because ECMAScript does not guarantee 1-ULP or directed rounding for Math.* and erfcx is a
+  //      rational approximation, succSignedBinary64 only prevents 1-ULP loss in the final additions
+  //      and does not make the evaluated float a certified [ANC] bound.
   function computeRightTailLogUpperBound(zR: number): number {
     const sR = -dPsi(zR);
     if (!(sR > 0) || !Number.isFinite(sR)) {
@@ -3049,9 +3070,11 @@ export function evaluateLogNonCentralStudentTCdfIntegralWithDiagnostics(
     return succSignedBinary64(dP + succSignedBinary64(logDecay));
   }
 
-  // A. Logarithmic left-tail upper bound on ln(int_0^{zL} exp(deltaPsi(z)) dz) [IME]:
-  //    Returns -Infinity ONLY when zL <= 0 (where the interval (0, 0) is mathematically empty).
-  //    For all 0 < zL < zStar, returns a finite logarithmic upper bound even when exp(dP) === 0.
+  // A. Logarithmic left-tail bound formula on ln(int_0^{zL} exp(deltaPsi(z)) dz) [IME formula / EBM evaluation]:
+  //    - Mathematical inequality [IME]: in exact real arithmetic, psi''(z) <= -1 implies
+  //      int_0^{zL} exp(psi(z)-psi(z_*)) dz <= exp(psi(zL)-psi(z_*)) * min(zL, 1/sL, sqrt(pi/2)*erfcx(sL/sqrt(2))).
+  //    - Numerical evaluation [EBM]: returns -Infinity ONLY when zL <= 0 (empty interval (0, 0)),
+  //      and a finite logarithmic bound estimate for all 0 < zL < zStar even when Math.exp(dP) === 0.
   function computeLeftTailLogUpperBound(zL: number): number {
     if (zL <= 0) {
       return Number.NEGATIVE_INFINITY;
@@ -3331,16 +3354,17 @@ export function evaluateLogNonCentralStudentTCdfIntegralWithDiagnostics(
     kahanNeumaierSum([kahanSummationRelativeBound, evaluationRoundingRelativeEstimate]),
   );
 
-  // Rigorous analytical + basic-arithmetic bound vs. empirical quadrature + evaluation estimate:
-  const rigorousRelativeBound = succNonNegativeBinary64(
+  // Strict separation between the IEEE 754 basic-operation Kahan-Neumaier summation bound ([ANC])
+  // and empirically evaluated tail-bound, quadrature, and transcendental conditioning estimates ([EBM]):
+  //   - rigorousRelativeBound ([ANC]): ONLY kahanSummationRelativeBound (gamma_2 + M * u^2).
+  //   - empiricalRelativeEstimate ([EBM]): leftTailRelativeBound + rightTailRelativeBound +
+  //     quadratureRelativeErrorEstimate + evaluationRoundingRelativeEstimate (because the
+  //     numerical evaluation of the [IME] tail inequalities relies on Math.* and erfcx).
+  const rigorousRelativeBound = kahanSummationRelativeBound;
+  const empiricalRelativeEstimate = succNonNegativeBinary64(
     kahanNeumaierSum([
       leftTailRelativeBound,
       rightTailRelativeBound,
-      kahanSummationRelativeBound,
-    ]),
-  );
-  const empiricalRelativeEstimate = succNonNegativeBinary64(
-    kahanNeumaierSum([
       quadratureRelativeErrorEstimate,
       evaluationRoundingRelativeEstimate,
     ]),
@@ -3349,9 +3373,9 @@ export function evaluateLogNonCentralStudentTCdfIntegralWithDiagnostics(
   // Combined total relative error budget accumulated via Kahan-Neumaier summation ([EBM]):
   const totalRelativeErrorBudget = succNonNegativeBinary64(
     kahanNeumaierSum([
+      rigorousRelativeBound,
       leftTailRelativeBound,
       rightTailRelativeBound,
-      kahanSummationRelativeBound,
       quadratureRelativeErrorEstimate,
       evaluationRoundingRelativeEstimate,
     ]),
@@ -3414,8 +3438,10 @@ export function evaluateLogNonCentralStudentTCdfIntegralWithDiagnostics(
     totalRelativeErrorBudget,
     totalLogErrorBudget,
     targetRelativeTolerance,
+    tailInequalityClassification: 'IME-exact-real-arithmetic-inequality',
+    tailEvaluationClassification: 'EBM-empirical-transcendental-evaluation',
     errorGuaranteeClassification:
-      'analytical-tails-and-summation-only-empirical-quadrature-and-eval',
+      'summation-only-rigorous-tails-quadrature-and-eval-empirical',
     panelEvaluations,
   });
 }
@@ -3461,11 +3487,11 @@ function validateNonCentralStudentTParams(
  *
  * Epistemological classification:
  *   - `[IME]`: Exact distributional reflection `1 - F_{t_nu(delta)}(t) = F_{t_nu(-delta)}(-t)`
- *     and analytical log-space left/right tail truncation bounds from `psi''(z) <= -1`.
- *   - `[EBM]`: Interior adaptive two-level 8-point Gauss-Legendre quadrature and host
- *     transcendental (`Math.*`, `erfcx`, `lnGamma`) evaluation error estimates, empirically
- *     validated against 80-to-120-digit arbitrary-precision references (with `[ANC]`
- *     applicable only to the Kahan-Neumaier summation step and dual-channel ULP representation).
+ *     and exact real-arithmetic log-concavity tail inequalities from `psi''(z) <= -1`.
+ *   - `[EBM]`: Numerical evaluation of the tail bounds (via `Math.*` and `erfcx`), interior
+ *     adaptive two-level 8-point Gauss-Legendre quadrature, and host transcendental conditioning
+ *     estimates, empirically validated against 80-to-120-digit arbitrary-precision references
+ *     (with `[ANC]` applicable strictly to the Kahan-Neumaier summation step and dual-channel ULP representation).
  */
 export function nonCentralStudentTDualCdf(
   t: number,
@@ -3538,10 +3564,10 @@ export function nonCentralStudentTDualCdf(
  *      - For all opposite-sign (`t < 0, ncp > 0` and `t > 0, ncp < 0`), Quadrant-III (`t < 0, ncp < 0`),
  *        and deep lower-tail cases (such as `F_{t_10(10)}(-20) = 3.8869760048338704e-39`),
  *        evaluates the smaller tail directly in log-space via `nonCentralStudentTDualCdf`,
- *        combining analytical log-concavity left/right tail truncation bounds (`[IME]`),
- *        Kahan-Neumaier summation bounds (`[ANC]`), and empirically validated adaptive
- *        two-level 8-point Gauss-Legendre interior quadrature and transcendental evaluation
- *        error estimates (`[EBM]`).
+ *        combining analytical log-concavity tail inequalities (`[IME]`) whose numerical
+ *        evaluation is classified as empirical (`[EBM]`), Kahan-Neumaier panel summation
+ *        bounds (`[ANC]`), and empirically validated adaptive two-level 8-point
+ *        Gauss-Legendre interior quadrature and transcendental evaluation error estimates (`[EBM]`).
  */
 export function nonCentralStudentTCdf(
   t: number,

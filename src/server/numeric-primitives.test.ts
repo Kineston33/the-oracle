@@ -1153,46 +1153,81 @@ describe('Stage 2A-1 — Numeric Primitives & Forecast Contracts (v4.4.3)', () =
     it('separates rigorous bounds from empirical estimates, sums total error budget via Kahan-Neumaier, and rejects when total budget exceeds targetRelativeTolerance', () => {
       const diag = evaluateLogNonCentralStudentTCdfIntegralWithDiagnostics(-20, 10, 10);
 
-      // Explicit epistemological classification separating rigorous analytical/summation bounds
-      // from empirical quadrature and host transcendental evaluation estimates:
+      // 1. Explicit epistemological classification distinguishing the analytical log-concavity
+      //    inequality ([IME]) from its floating-point transcendental evaluation ([EBM]):
+      expect(diag.tailInequalityClassification).toBe(
+        'IME-exact-real-arithmetic-inequality',
+      );
+      expect(diag.tailEvaluationClassification).toBe(
+        'EBM-empirical-transcendental-evaluation',
+      );
       expect(diag.errorGuaranteeClassification).toBe(
-        'analytical-tails-and-summation-only-empirical-quadrature-and-eval',
+        'summation-only-rigorous-tails-quadrature-and-eval-empirical',
       );
       expect(diag.targetRelativeTolerance).toBe(1e-12);
 
-      // Rigorous bound combines analytical tail bounds and Kahan-Neumaier summation rounding (gamma_2 + M*u^2):
+      // 2. Rigorous bound ([ANC]) equals strictly kahanSummationRelativeBound (gamma_2 + M*u^2)
+      //    and excludes leftTailRelativeBound and rightTailRelativeBound:
       expect(diag.kahanSummationRelativeBound).toBeGreaterThan(0);
       expect(diag.kahanSummationRelativeBound).toBeLessThan(1e-15);
-      const expectedRigorousSum = kahanNeumaierSum([
-        diag.leftTailRelativeBound,
-        diag.rightTailRelativeBound,
-        diag.kahanSummationRelativeBound,
-      ]);
-      expect(diag.rigorousRelativeBound).toBeGreaterThanOrEqual(expectedRigorousSum);
+      expect(diag.rigorousRelativeBound).toBe(diag.kahanSummationRelativeBound);
 
-      // Empirical estimate combines two-level Gauss-Legendre refinement discrepancy and transcendental conditioning:
+      // 3. Empirical estimate ([EBM]) accumulates leftTailRelativeBound, rightTailRelativeBound,
+      //    quadratureRelativeErrorEstimate, and evaluationRoundingRelativeEstimate via Kahan-Neumaier:
       expect(diag.evaluationRoundingRelativeEstimate).toBeGreaterThan(0);
       expect(diag.quadratureRelativeErrorEstimate).toBeGreaterThanOrEqual(0);
       const expectedEmpiricalSum = kahanNeumaierSum([
+        diag.leftTailRelativeBound,
+        diag.rightTailRelativeBound,
         diag.quadratureRelativeErrorEstimate,
         diag.evaluationRoundingRelativeEstimate,
       ]);
       expect(diag.empiricalRelativeEstimate).toBeGreaterThanOrEqual(expectedEmpiricalSum);
 
-      // Total relative error budget is accumulated via Kahan-Neumaier summation and checked against
-      // the unified targetRelativeTolerance (1e-12):
+      // 4. Verify with non-trivial left/right tail contributions (~1e-14 to 1e-13) that
+      //    leftTailRelativeBound and rightTailRelativeBound are excluded from rigorousRelativeBound
+      //    and accounted for in empiricalRelativeEstimate and totalRelativeErrorBudget:
+      const diagWithActiveTails = evaluateLogNonCentralStudentTCdfIntegralWithDiagnostics(
+        -2,
+        1800,
+        -5,
+        {
+          leftTailCutoff: 37.0,
+          rightTailCutoff: 47.8,
+        },
+      );
+      expect(diagWithActiveTails.leftTailRelativeBound).toBeGreaterThan(1e-15);
+      expect(diagWithActiveTails.rightTailRelativeBound).toBeGreaterThan(1e-15);
+      expect(diagWithActiveTails.rigorousRelativeBound).toBe(
+        diagWithActiveTails.kahanSummationRelativeBound,
+      );
+      expect(diagWithActiveTails.rigorousRelativeBound).toBeLessThan(
+        diagWithActiveTails.leftTailRelativeBound + diagWithActiveTails.rightTailRelativeBound,
+      );
+      const expectedActiveEmpiricalSum = kahanNeumaierSum([
+        diagWithActiveTails.leftTailRelativeBound,
+        diagWithActiveTails.rightTailRelativeBound,
+        diagWithActiveTails.quadratureRelativeErrorEstimate,
+        diagWithActiveTails.evaluationRoundingRelativeEstimate,
+      ]);
+      expect(diagWithActiveTails.empiricalRelativeEstimate).toBeGreaterThanOrEqual(
+        expectedActiveEmpiricalSum,
+      );
+
+      // 5. Total relative error budget is accumulated via Kahan-Neumaier summation over
+      //    rigorousRelativeBound and all empirical components, and checked against targetRelativeTolerance:
       const expectedTotalSum = kahanNeumaierSum([
+        diag.rigorousRelativeBound,
         diag.leftTailRelativeBound,
         diag.rightTailRelativeBound,
-        diag.kahanSummationRelativeBound,
         diag.quadratureRelativeErrorEstimate,
         diag.evaluationRoundingRelativeEstimate,
       ]);
       expect(diag.totalRelativeErrorBudget).toBeGreaterThanOrEqual(expectedTotalSum);
       expect(diag.totalRelativeErrorBudget).toBeLessThanOrEqual(diag.targetRelativeTolerance);
 
-      // When targetRelativeTolerance is set tighter than totalRelativeErrorBudget (e.g. 1e-16),
-      // the function throws NumericConvergenceError rather than accepting an out-of-budget result:
+      // 6. When targetRelativeTolerance is set tighter than totalRelativeErrorBudget (e.g. 1e-16),
+      //    the function throws NumericConvergenceError rather than accepting an out-of-budget result:
       expect(() =>
         evaluateLogNonCentralStudentTCdfIntegralWithDiagnostics(-20, 10, 10, {
           relativeTolerance: 1e-16,
