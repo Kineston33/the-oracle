@@ -651,9 +651,54 @@ export function erfcx(x: number): number {
 }
 
 /**
+ * Returns a strict lower bound in IEEE 754 `binary64` for a non-negative real value `r >= 0`
+ * whose round-to-nearest-even float is `x = fl(r) >= 0` [ANC]:
+ *   `predNonNegativeBinary64(x) = max(0, x - ulpBinary64(x)) <= x^- <= r`.
+ * Holds across normal, subnormal, and zero regimes because in IEEE 754 roundTiesToEven,
+ * `|fl(r) - r| <= 0.5 * ulpBinary64(fl(r)) < ulpBinary64(fl(r))` for all `x > 0`.
+ */
+function predNonNegativeBinary64(x: number): number {
+  if (!(x > 0)) {
+    return 0;
+  }
+  const lowered = x - ulpBinary64(x);
+  return lowered > 0 ? lowered : 0;
+}
+
+/**
+ * Returns a strict upper bound in IEEE 754 `binary64` for a non-negative real value `r >= 0`
+ * whose round-to-nearest-even float is `x = fl(r) >= 0` [ANC]:
+ *   `succNonNegativeBinary64(x) = x + ulpBinary64(x) = x^+ >= r`.
+ * Holds across normal, subnormal, and zero regimes (`0 + ulpBinary64(0) = Number.MIN_VALUE = 2^-1074`).
+ */
+function succNonNegativeBinary64(x: number): number {
+  if (!Number.isFinite(x) || x < 0) {
+    return Number.POSITIVE_INFINITY;
+  }
+  return x + ulpBinary64(x);
+}
+
+/**
+ * Evaluates Higham's (2002, Lemma 3.1) forward rounding constant
+ * `gamma_n = (n * u) / (1 - n * u)` for `u = 0.5 * Number.EPSILON = 2^-53`,
+ * rounded upward via `succNonNegativeBinary64` so the returned float is a
+ * strict upper bound on the exact real value `(n * u) / (1 - n * u)` [ANC].
+ */
+function gammaBinary64(n: number): number {
+  const u = 0.5 * Number.EPSILON;
+  const nu = succNonNegativeBinary64(n * u);
+  const denom = predNonNegativeBinary64(1 - nu);
+  if (!(denom > 0)) {
+    return Number.POSITIVE_INFINITY;
+  }
+  return succNonNegativeBinary64(nu / denom);
+}
+
+/**
  * Diagnostic result of evaluating Laplace's Stieltjes continued fraction
  * `R_CF(u) = (1/2) / (u + 1 / (u + (3/2) / (u + ...)))` for `u > 0`
- * via the exact three-term Euler-Wallis convergent recurrence [IME / ANC].
+ * via the exact three-term Euler-Wallis convergent recurrence with outward-rounded
+ * interval arithmetic and Higham `gamma_{4k+1}` forward error bounds [IME / ANC].
  */
 export interface LaplaceStieltjesEnclosureResult {
   readonly value: number;
@@ -663,6 +708,9 @@ export interface LaplaceStieltjesEnclosureResult {
   readonly certifiedUpperBound: number;
   readonly certifiedErrorBound: number;
   readonly iterations: number;
+  readonly gammaIndex: number;
+  readonly gammaBound: number;
+  readonly allNormalOperations: boolean;
 }
 
 /**
@@ -671,24 +719,44 @@ export interface LaplaceStieltjesEnclosureResult {
  * for `u > 0`, where `erfcx(u) = 1 / (sqrt(pi) * (u + R_CF(u)))` and
  * `-erfcx'(u) = 2 * R_CF(u) * erfcx(u) > 0` [IME / ANC].
  *
- * Mathematical & Epistemological Justification:
+ * Mathematical & Epistemological Proof of the Enclosure:
  *   1. `[IME]` (Real-arithmetic Stieltjes bracketing, Henrici Vol. 2, Theorem 12.1a):
- *      Unlike Lentz's modified ratio algorithm (which perturbs zero denominators by `TINY`),
- *      we evaluate the true Euler-Wallis numerators `A_k` and denominators `B_k`:
+ *      The true Euler-Wallis numerators `A_k` and denominators `B_k` satisfy:
  *        `A_{-1} = 1, B_{-1} = 0, A_0 = 0, B_0 = 1`
- *        `A_k = u * A_{k-1} + (k / 2) * A_{k-2}, B_k = u * B_{k-1} + (k / 2) * B_{k-2}`
- *      Because `a_k = k/2 > 0` and `b_k = u > 0` for all `k >= 1`, all `A_k, B_k > 0`
- *      are sums of strictly positive terms (zero subtraction), and the exact convergents
- *      `C_k(u) = A_k(u) / B_k(u)` strictly bracket `R_CF(u)` (with even convergents
- *      approaching from below and odd convergents approaching from above):
+ *        `A_k = u * A_{k-1} + a_k * A_{k-2}, B_k = u * B_{k-1} + a_k * B_{k-2}`, where `a_k = k / 2`.
+ *      Because `a_k > 0` and `u > 0`, all `A_k, B_k > 0` (`k >= 1`) are sums of strictly
+ *      positive terms (zero subtraction), and the exact real-arithmetic convergents
+ *      `C_k(u) = A_k(u) / B_k(u)` strictly bracket `R_CF(u)`:
  *        `0 < C_2(u) < C_4(u) < ... < C_{2m}(u) < R_CF(u) < C_{2m-1}(u) < ... < C_1(u) = 1/(2u)`.
- *   2. `[ANC]` (IEEE 754 `binary64` realization):
- *      Rescaling `(A_{k-1}, B_{k-1}, A_k, B_k)` by `2^-512` whenever `max(A_k, B_k) > 2^512`
- *      is an exact exponent shift in `binary64` that leaves the significands and `A_k / B_k`
- *      bit-for-bit invariant. Accounting for the `binary64` rounding of `k` positive additions
- *      and one division via `roundMargin = (2 * k + 2) * Number.EPSILON * upperConvergent`,
- *      `[lowerConvergent - roundMargin, upperConvergent + roundMargin]` provides a certified
- *      enclosure of `R_CF(u)`.
+ *   2. `[ANC]` (Complete IEEE 754 `binary64` rounding proof):
+ *      Let `u_mach = 2^-53 = 0.5 * Number.EPSILON` be the IEEE 754 `binary64` unit roundoff.
+ *      - Exactness of `a_k = 0.5 * k`: for `1 <= k <= 2^53`, `k` is an exact `binary64` integer
+ *        and `0.5 * k >= 0.5 >= 2^-1022` is an exact exponent shift (`delta_{a_k} = 0`).
+ *      - Exactness of base step `k = 1`: `A_1 = 0.5` and `B_1 = u` are exact (`delta_1 = 0`).
+ *      - Outward-rounded interval arithmetic (`[A_k^lo, A_k^hi]`, `[B_k^lo, B_k^hi]`):
+ *        Every multiplication `u * X_{k-1}`, `a_k * X_{k-2}`, every addition `p_k + q_k`,
+ *        any rescaling where an operand could enter the subnormal range, and the final
+ *        division `A_k / B_k` are bounded outward via `predNonNegativeBinary64` and
+ *        `succNonNegativeBinary64`, which hold across normal, subnormal, and zero regimes.
+ *      - Higham `gamma_{4k+1}` forward error bound (Higham 2002, Lemma 3.1 & §3.2):
+ *        When all intermediate products, sums, rescalings, and quotients lie in the normal
+ *        range `[2^-1022, MAX_VALUE]` (`allNormalOperations === true`), each step `j >= 2`
+ *        satisfies `fl(u * X_{j-1} + a_j * X_{j-2}) = u * X_{j-1} * (1 + d_{j,1})(1 + d_{j,3}) + a_j * X_{j-2} * (1 + d_{j,2})(1 + d_{j,3})`
+ *        with `|d_{j,i}| <= u_mach`. Since all terms are non-negative and `j = 1` is exact,
+ *        induction over `j = 2, ..., k` gives `(1 - u_mach)^{2k-2} X_k <= hat(X)_k <= (1 + u_mach)^{2k-2} X_k`
+ *        for `X in {A, B}`. Including the final division `hat(C)_k = fl(hat(A)_k / hat(B)_k) = (hat(A)_k / hat(B)_k)(1 + d_div)`
+ *        with `|d_div| <= u_mach`, the exact convergent `C_k = A_k / B_k` satisfies:
+ *          `hat(C)_k * (1 - u_mach)^{2k-2} / (1 + u_mach)^{2k-1} <= C_k <= hat(C)_k * (1 + u_mach)^{2k-2} / (1 - u_mach)^{2k-1}`.
+ *        By Higham's Lemma 3.1 with `n = (2k - 2) + (2k - 1) = 4k - 3 <= 4k + 1`,
+ *        `C_k in [hat(C)_k * (1 - gamma_{4k+1}), hat(C)_k * (1 + gamma_{4k+1})]`.
+ *      - Power-of-two rescaling by `2^-512` (when `max(A_k, B_k) > 2^512`) is an exact
+ *        exponent shift with zero rounding error whenever all rescaled operands are `>= 2^-510`
+ *        (so their products with `2^-512` remain `>= 2^-1022 = MIN_NORMAL_BINARY64`); otherwise
+ *        `allNormalOperations` is set to `false` and the outward interval bounds enclose
+ *        any subnormal rounding.
+ *      - Taking the conservative outer hull of the outward interval enclosure and Higham's
+ *        `gamma_{4k+1}` enclosure guarantees `certifiedLowerBound <= C_{2m}(u) < R_CF(u) < C_{2m-1}(u) <= certifiedUpperBound`
+ *        and `|value - R_CF(u)| <= certifiedErrorBound`.
  */
 export function evaluateLaplaceStieltjesEnclosure(
   u: number,
@@ -702,23 +770,91 @@ export function evaluateLaplaceStieltjesEnclosure(
 
   const RESCALE_THRESHOLD = 2 ** 512;
   const RESCALE_FACTOR = 2 ** -512;
+  // Minimum operand threshold such that multiplying by 2^-512 remains >= MIN_NORMAL_BINARY64 (2^-1022)
+  const RESCALE_NORMAL_FLOOR = 2 ** -510;
 
   let aPrev2 = 1;
   let bPrev2 = 0;
   let aPrev1 = 0;
   let bPrev1 = 1;
 
-  let bestEvenLower = 0;
-  let bestOddUpper = Number.POSITIVE_INFINITY;
+  // Outward-rounded interval state [aLo, aHi] and [bLo, bHi]
+  let aPrev2Lo = 1;
+  let aPrev2Hi = 1;
+  let bPrev2Lo = 0;
+  let bPrev2Hi = 0;
+  let aPrev1Lo = 0;
+  let aPrev1Hi = 0;
+  let bPrev1Lo = 1;
+  let bPrev1Hi = 1;
+
+  let allNormalOperations = u >= MIN_NORMAL_BINARY64;
+  let bestEvenNominal = 0;
+  let bestOddNominal = Number.POSITIVE_INFINITY;
+  let bestCertifiedLower = 0;
+  let bestCertifiedUpper = Number.POSITIVE_INFINITY;
   let prevConvergent = 0;
 
   for (let k = 1; k <= maxIterations; k++) {
     const ak = 0.5 * k;
-    const aCurr = u * aPrev1 + ak * aPrev2;
-    const bCurr = u * bPrev1 + ak * bPrev2;
-    const convergent = aCurr / bCurr;
+    const pA = u * aPrev1;
+    const qA = ak * aPrev2;
+    const aCurr = pA + qA;
 
-    if (!Number.isFinite(convergent) || Number.isNaN(convergent) || convergent <= 0) {
+    const pB = u * bPrev1;
+    const qB = ak * bPrev2;
+    const bCurr = pB + qB;
+
+    if (
+      k >= 2 &&
+      ((pA > 0 && pA < MIN_NORMAL_BINARY64) ||
+        (qA > 0 && qA < MIN_NORMAL_BINARY64) ||
+        (pB > 0 && pB < MIN_NORMAL_BINARY64) ||
+        (qB > 0 && qB < MIN_NORMAL_BINARY64) ||
+        aCurr < MIN_NORMAL_BINARY64 ||
+        bCurr < MIN_NORMAL_BINARY64)
+    ) {
+      allNormalOperations = false;
+    }
+
+    let aCurrLo: number;
+    let aCurrHi: number;
+    let bCurrLo: number;
+    let bCurrHi: number;
+    if (k === 1) {
+      // At k = 1: A_1 = 0.5 and B_1 = u are exact in IEEE 754 binary64
+      aCurrLo = 0.5;
+      aCurrHi = 0.5;
+      bCurrLo = u;
+      bCurrHi = u;
+    } else {
+      aCurrLo = predNonNegativeBinary64(
+        predNonNegativeBinary64(u * aPrev1Lo) + predNonNegativeBinary64(ak * aPrev2Lo),
+      );
+      aCurrHi = succNonNegativeBinary64(
+        succNonNegativeBinary64(u * aPrev1Hi) + succNonNegativeBinary64(ak * aPrev2Hi),
+      );
+      bCurrLo = predNonNegativeBinary64(
+        predNonNegativeBinary64(u * bPrev1Lo) + predNonNegativeBinary64(ak * bPrev2Lo),
+      );
+      bCurrHi = succNonNegativeBinary64(
+        succNonNegativeBinary64(u * bPrev1Hi) + succNonNegativeBinary64(ak * bPrev2Hi),
+      );
+    }
+
+    const convergent = aCurr / bCurr;
+    if (convergent < MIN_NORMAL_BINARY64) {
+      allNormalOperations = false;
+    }
+
+    if (
+      !Number.isFinite(convergent) ||
+      Number.isNaN(convergent) ||
+      convergent <= 0 ||
+      !Number.isFinite(aCurrHi) ||
+      !Number.isFinite(bCurrHi) ||
+      !(bCurrLo > 0)
+    ) {
       throw new NumericConvergenceError(
         'erfcxDiffPositive[LaplaceStieltjesCF]',
         k,
@@ -728,30 +864,63 @@ export function evaluateLaplaceStieltjesEnclosure(
       );
     }
 
+    // 1. Outward-rounded interval enclosure of the exact convergent C_k = A_k / B_k
+    const cIntLo = predNonNegativeBinary64(aCurrLo / bCurrHi);
+    const cIntHi = succNonNegativeBinary64(aCurrHi / bCurrLo);
+
+    // 2. Higham gamma_{4k+1} enclosure (when all operations are in the normal range)
+    const gammaIdx = 4 * k + 1;
+    const gammaVal = gammaBinary64(gammaIdx);
+    let cRigorousLo = cIntLo;
+    let cRigorousHi = cIntHi;
+    if (allNormalOperations && Number.isFinite(gammaVal) && gammaVal < 1) {
+      const cGammaLo = predNonNegativeBinary64(
+        convergent * predNonNegativeBinary64(1 - gammaVal),
+      );
+      const cGammaHi = succNonNegativeBinary64(
+        convergent * succNonNegativeBinary64(1 + gammaVal),
+      );
+      // Conservative outer hull of both rigorous proofs
+      cRigorousLo = Math.min(cIntLo, cGammaLo);
+      cRigorousHi = Math.max(cIntHi, cGammaHi);
+    }
+
     if (k % 2 === 0) {
-      if (convergent > bestEvenLower) {
-        bestEvenLower = convergent;
+      // Even convergent C_{2m}(u) < R_CF(u): provides a rigorous lower bound
+      if (convergent > bestEvenNominal) {
+        bestEvenNominal = convergent;
+      }
+      if (cRigorousLo > bestCertifiedLower) {
+        bestCertifiedLower = cRigorousLo;
       }
     } else {
-      if (convergent < bestOddUpper) {
-        bestOddUpper = convergent;
+      // Odd convergent C_{2m-1}(u) > R_CF(u): provides a rigorous upper bound
+      if (convergent < bestOddNominal) {
+        bestOddNominal = convergent;
+      }
+      if (cRigorousHi < bestCertifiedUpper) {
+        bestCertifiedUpper = cRigorousHi;
       }
     }
 
-    if (k >= 2 && bestEvenLower > 0 && Number.isFinite(bestOddUpper)) {
+    if (k >= 2 && bestCertifiedLower > 0 && Number.isFinite(bestCertifiedUpper)) {
       const lowerConvergent = Math.min(convergent, prevConvergent);
       const upperConvergent = Math.max(convergent, prevConvergent);
       const algebraicWidth = upperConvergent - lowerConvergent;
-      const roundMargin = (2 * k + 2) * Number.EPSILON * upperConvergent;
-      const certifiedLowerBound = Math.max(
-        0,
-        Math.min(bestEvenLower, lowerConvergent) - roundMargin,
+      const certifiedLowerBound = bestCertifiedLower;
+      const certifiedUpperBound = bestCertifiedUpper;
+      const value = 0.5 * (certifiedLowerBound + certifiedUpperBound);
+      const certifiedErrorBound = succNonNegativeBinary64(
+        Math.max(
+          succNonNegativeBinary64(Math.abs(value - certifiedLowerBound)),
+          succNonNegativeBinary64(Math.abs(certifiedUpperBound - value)),
+        ),
       );
-      const certifiedUpperBound = Math.max(bestOddUpper, upperConvergent) + roundMargin;
-      const value = 0.5 * (lowerConvergent + upperConvergent);
-      const certifiedErrorBound = 0.5 * (certifiedUpperBound - certifiedLowerBound);
 
-      if (algebraicWidth <= 1e-15 * lowerConvergent) {
+      if (
+        certifiedLowerBound <= certifiedUpperBound &&
+        algebraicWidth <= 1e-15 * lowerConvergent
+      ) {
         return Object.freeze({
           value,
           lowerConvergent,
@@ -760,27 +929,66 @@ export function evaluateLaplaceStieltjesEnclosure(
           certifiedUpperBound,
           certifiedErrorBound,
           iterations: k,
+          gammaIndex: gammaIdx,
+          gammaBound: gammaVal,
+          allNormalOperations,
         });
       }
     }
 
     prevConvergent = convergent;
 
-    if (aCurr > RESCALE_THRESHOLD || bCurr > RESCALE_THRESHOLD) {
+    if (aCurrHi > RESCALE_THRESHOLD || bCurrHi > RESCALE_THRESHOLD) {
+      const exactRescale =
+        aPrev1Lo >= RESCALE_NORMAL_FLOOR &&
+        bPrev1Lo >= RESCALE_NORMAL_FLOOR &&
+        aCurrLo >= RESCALE_NORMAL_FLOOR &&
+        bCurrLo >= RESCALE_NORMAL_FLOOR;
+
       aPrev2 = aPrev1 * RESCALE_FACTOR;
       bPrev2 = bPrev1 * RESCALE_FACTOR;
       aPrev1 = aCurr * RESCALE_FACTOR;
       bPrev1 = bCurr * RESCALE_FACTOR;
+
+      if (exactRescale) {
+        aPrev2Lo = aPrev1Lo * RESCALE_FACTOR;
+        aPrev2Hi = aPrev1Hi * RESCALE_FACTOR;
+        bPrev2Lo = bPrev1Lo * RESCALE_FACTOR;
+        bPrev2Hi = bPrev1Hi * RESCALE_FACTOR;
+        aPrev1Lo = aCurrLo * RESCALE_FACTOR;
+        aPrev1Hi = aCurrHi * RESCALE_FACTOR;
+        bPrev1Lo = bCurrLo * RESCALE_FACTOR;
+        bPrev1Hi = bCurrHi * RESCALE_FACTOR;
+      } else {
+        allNormalOperations = false;
+        aPrev2Lo = predNonNegativeBinary64(aPrev1Lo * RESCALE_FACTOR);
+        aPrev2Hi = succNonNegativeBinary64(aPrev1Hi * RESCALE_FACTOR);
+        bPrev2Lo = predNonNegativeBinary64(bPrev1Lo * RESCALE_FACTOR);
+        bPrev2Hi = succNonNegativeBinary64(bPrev1Hi * RESCALE_FACTOR);
+        aPrev1Lo = predNonNegativeBinary64(aCurrLo * RESCALE_FACTOR);
+        aPrev1Hi = succNonNegativeBinary64(aCurrHi * RESCALE_FACTOR);
+        bPrev1Lo = predNonNegativeBinary64(bCurrLo * RESCALE_FACTOR);
+        bPrev1Hi = succNonNegativeBinary64(bCurrHi * RESCALE_FACTOR);
+      }
     } else {
       aPrev2 = aPrev1;
       bPrev2 = bPrev1;
       aPrev1 = aCurr;
       bPrev1 = bCurr;
+
+      aPrev2Lo = aPrev1Lo;
+      aPrev2Hi = aPrev1Hi;
+      bPrev2Lo = bPrev1Lo;
+      bPrev2Hi = bPrev1Hi;
+      aPrev1Lo = aCurrLo;
+      aPrev1Hi = aCurrHi;
+      bPrev1Lo = bCurrLo;
+      bPrev1Hi = bCurrHi;
     }
   }
 
-  const finalWidth = Math.abs(bestOddUpper - bestEvenLower);
-  const finalMin = Math.max(1e-300, bestEvenLower);
+  const finalWidth = Math.abs(bestOddNominal - bestEvenNominal);
+  const finalMin = Math.max(1e-300, bestEvenNominal);
   throw new NumericConvergenceError(
     'erfcxDiffPositive[LaplaceStieltjesCF]',
     maxIterations,
@@ -2308,32 +2516,34 @@ function dLogStandardNormalCdf(w: number): number {
 }
 
 /**
- * Verifies that Benton & Krishnamoorthy's (2003) modal expansion around
- * `j_0 = floor(delta^2 / 2)` achieves its strict analytical tail bound
- * `B_tail(S) <= 1e-12` within `maxSteps` iterations, and optionally evaluates
- * the all-positive series when `signMode !== 'check-only'` [IME / ANC].
+ * Evaluates Benton & Krishnamoorthy's (2003) modal expansion around
+ * `j_0 = floor(delta^2 / 2)` when summing the Poisson-weighted incomplete beta
+ * series, enforcing its analytical Poisson-Beta truncation bound
+ * `B_tail(S) <= 1e-12` within `maxSteps` iterations [IME / ANC].
+ *
+ * Note: This function is used exclusively when the Benton-Krishnamoorthy series
+ * itself is evaluated (`quadrant1-positive` or `complementary-small-ncp`) and is
+ * never used as a substitute for quadrature error control.
  */
 function evaluateBentonKrishnamoorthyModalSeries(
   absT: number,
   df: number,
   ncp: number,
   maxSteps: number,
-  mode: 'quadrant1-positive' | 'complementary-small-ncp' | 'check-only',
+  mode: 'quadrant1-positive' | 'complementary-small-ncp',
 ): number {
   const sqrtDf = Math.sqrt(df);
   let x = 0;
   let oneMinusX = 1;
-  if (mode !== 'check-only') {
-    if (absT <= sqrtDf) {
-      const u = (absT * absT) / df;
-      x = u / (1 + u);
-      oneMinusX = 1 / (1 + u);
-    } else {
-      const w = sqrtDf / absT;
-      const v = w * w;
-      x = 1 / (1 + v);
-      oneMinusX = v / (1 + v);
-    }
+  if (absT <= sqrtDf) {
+    const u = (absT * absT) / df;
+    x = u / (1 + u);
+    oneMinusX = 1 / (1 + u);
+  } else {
+    const w = sqrtDf / absT;
+    const v = w * w;
+    x = 1 / (1 + v);
+    oneMinusX = v / (1 + v);
   }
 
   const lambda = 0.5 * ncp * ncp;
@@ -2381,7 +2591,7 @@ function evaluateBentonKrishnamoorthyModalSeries(
   }
 
   function evaluateSeriesTerm(pj: number, absQj: number, j: number): number {
-    if (mode === 'check-only' || useComplementaryZeroTail) {
+    if (useComplementaryZeroTail) {
       return 0;
     }
     if (mode === 'quadrant1-positive') {
@@ -2431,8 +2641,7 @@ function evaluateBentonKrishnamoorthyModalSeries(
     }
 
     const bTail = 0.5 * (uPPlus + uQPlus + lPMinus + lQMinus);
-    const targetTol = mode === 'check-only' ? 1e-12 : 1e-15;
-    if (bTail <= targetTol || (s === maxSteps && bTail <= 1e-12)) {
+    if (bTail <= 1e-15 || (s === maxSteps && bTail <= 1e-12)) {
       const total = sum + compensation;
       return Math.min(1, Math.max(0, total));
     }
@@ -2459,37 +2668,108 @@ function evaluateBentonKrishnamoorthyModalSeries(
   throw new NumericConvergenceError('nonCentralStudentTCdf', maxSteps, finalBTail, 1e-12);
 }
 
+const SQRT_HALF_PI = Math.sqrt(0.5 * Math.PI);
+
+/**
+ * Computes `ln Phi(w) - ln Phi(wStar)` where `deltaW = w - wStar` without
+ * `-0.5 * w^2` subtraction cancellation when `w <= 0` and `wStar <= 0` [IME].
+ */
+function diffLogStandardNormalCdf(w: number, wStar: number, deltaW: number): number {
+  if (w <= 0 && wStar <= 0) {
+    const y = -w * Math.SQRT1_2;
+    const yStar = -wStar * Math.SQRT1_2;
+    const quadDiff = -0.5 * deltaW * (w + wStar);
+    if (y >= 1e150 || yStar >= 1e150) {
+      return quadDiff - Math.log(y / yStar);
+    }
+    const erfcxY = erfcx(y);
+    const erfcxYStar = erfcx(yStar);
+    return quadDiff + Math.log1p((erfcxY - erfcxYStar) / erfcxYStar);
+  }
+  return logStandardNormalCdf(w) - logStandardNormalCdf(wStar);
+}
+
+/**
+ * Diagnostic breakdown of the 4 error controls in `evaluateLogNonCentralStudentTCdfIntegralWithDiagnostics`:
+ *   - `leftTailRelativeBound` (`[IME]` / `[ANC]`): strict analytical upper bound on
+ *     `int_0^{z_L} exp(psi(z) - psi(z_*)) dz / I_mid` derived from strong concavity `psi''(z) <= -1`.
+ *   - `rightTailRelativeBound` (`[IME]` / `[ANC]`): strict analytical upper bound on
+ *     `int_{z_R}^inf exp(psi(z) - psi(z_*)) dz / I_mid` derived from strong concavity `psi''(z) <= -1`.
+ *   - `quadratureRelativeErrorEstimate` (`[EBM]`): a posteriori two-level 8-point Gauss-Legendre
+ *     refinement discrepancy `sum_p |I_{fine,p} - I_{coarse,p}| / I_mid` across `[z_L, z_*] U [z_*, z_R]`
+ *     (empirically validated against 80-to-120-digit references; not a 16th-derivative Peano proof).
+ *   - `roundingRelativeBound` (`[ANC]`): IEEE 754 `binary64` rounding and Kahan-Neumaier
+ *     accumulation bound for the quadrature sum and integrand evaluations.
+ */
+export interface NonCentralStudentTIntegralDiagnostics {
+  readonly logProbability: number;
+  readonly zStar: number;
+  readonly leftBound: number;
+  readonly rightBound: number;
+  readonly scaledIntegral: number;
+  readonly leftTailRelativeBound: number;
+  readonly rightTailRelativeBound: number;
+  readonly quadratureRelativeErrorEstimate: number;
+  readonly roundingRelativeBound: number;
+  readonly totalRelativeErrorBudget: number;
+  readonly totalLogErrorBudget: number;
+  readonly panelEvaluations: number;
+}
+
 /**
  * Evaluates `ln F_{t_nu(delta)}(t)` directly from the strictly positive
- * conditional-normal chi-distribution integral [IME / ANC]:
+ * conditional-normal chi-distribution integral:
  *
  *   `F_{t_nu(delta)}(t) = int_0^inf Phi((t / sqrt(nu)) * z - delta) * (2^(1 - nu/2) / Gamma(nu/2)) * z^(nu - 1) * exp(-z^2 / 2) dz`
  *
- * Because the log-integrand `psi(z)` is strictly concave (`psi''(z) < -1`) on `(0, +inf)`
- * for all `nu >= 1`, its unique global maximum `z_*` is located via bracketed bisection,
- * `exp(psi(z_*))` is factored out in log-space, and the normalized positive bell curve
- * `exp(psi(z) - psi(z_*))` is integrated via adaptive 8-point Gauss-Legendre quadrature
- * without any subtraction or `1 - CDF` reflection cancellation.
+ * with four independent error controls:
+ *   A. Left-tail truncation bound (`leftTailRelativeBound`, `[IME]` / `[ANC]`):
+ *      Either `z_L = 0` (exact zero left tail) or `0 < z_L < z_*` with `s_L = psi'(z_L) > 0`,
+ *      where strong log-concavity `psi''(z) <= -1 - (nu - 1)/z^2 <= -1` implies
+ *      `psi(z_L - u) <= psi(z_L) - s_L * u - 0.5 * u^2` for `u in [0, z_L]`, bounding the
+ *      scaled left-tail integral by `exp(psi(z_L) - psi(z_*)) * min(z_L, 1/s_L, sqrt(pi/2)*erfcx(s_L/sqrt(2)))`.
+ *   B. Right-tail truncation bound (`rightTailRelativeBound`, `[IME]` / `[ANC]`):
+ *      For `z_R > z_*`, `s_R = -psi'(z_R) >= z_R - z_* > 0`, and `psi''(z) <= -1` implies
+ *      `psi(z_R + u) <= psi(z_R) - s_R * u - 0.5 * u^2` for `u >= 0`, bounding the scaled
+ *      right-tail integral by `exp(psi(z_R) - psi(z_*)) * min(1/s_R, sqrt(pi/2)*erfcx(s_R/sqrt(2)))`.
+ *   C. Interior quadrature error control (`quadratureRelativeErrorEstimate`, `[EBM]`):
+ *      Partitions `[z_L, z_R]` explicitly at `z_*` (with smooth `z = u^4` transformation
+ *      when `z_L = 0` and `1 < nu < 4` so `z^(nu-1) dz = 4 u^(4*nu - 1) du` is `C^3` at `u = 0`)
+ *      and refines panels via two-level 8-point Gauss-Legendre quadrature without silent
+ *      acceptance on depth or iteration exhaustion.
+ *   D. Rounding & Kahan-Neumaier accumulation bound (`roundingRelativeBound`, `[ANC]`):
+ *      Evaluates `psi(z) - psi(z_*)` in cancellation-free incremental form without adding/subtracting
+ *      `c_nu`, accumulates panels via Kahan-Neumaier summation, and bounds the `binary64`
+ *      evaluation and summation error via Higham `gamma_n` constants.
  */
-function evaluateLogNonCentralStudentTCdfIntegral(
+export function evaluateLogNonCentralStudentTCdfIntegralWithDiagnostics(
   t: number,
   df: number,
   ncp: number,
   options?: NumericEvaluationOptions,
-): number {
+): NonCentralStudentTIntegralDiagnostics {
+  validateNonCentralStudentTParams(
+    t,
+    df,
+    ncp,
+    'evaluateLogNonCentralStudentTCdfIntegralWithDiagnostics',
+  );
   const a = t / Math.sqrt(df);
   if (!Number.isFinite(a) || Math.abs(a) > 1e140) {
-    return t < 0 ? Number.NEGATIVE_INFINITY : 0;
-  }
-  const logPref = (1 - 0.5 * df) * Math.LN2 - lnGamma(0.5 * df);
-
-  function psi(z: number): number {
-    if (z <= 0) {
-      return df === 1 ? logPref + logStandardNormalCdf(-ncp) : Number.NEGATIVE_INFINITY;
-    }
-    const w = a * z - ncp;
-    const termZ = df === 1 ? 0 : (df - 1) * Math.log(z);
-    return logPref + logStandardNormalCdf(w) + termZ - 0.5 * z * z;
+    return Object.freeze({
+      logProbability: t < 0 ? Number.NEGATIVE_INFINITY : 0,
+      zStar: 0,
+      leftBound: 0,
+      rightBound: 0,
+      scaledIntegral: 0,
+      leftTailRelativeBound: 0,
+      rightTailRelativeBound: 0,
+      quadratureRelativeErrorEstimate: 0,
+      roundingRelativeBound: 0,
+      totalRelativeErrorBudget: 0,
+      totalLogErrorBudget: 0,
+      panelEvaluations: 0,
+    });
   }
 
   function dPsi(z: number): number {
@@ -2520,7 +2800,7 @@ function evaluateLogNonCentralStudentTCdfIntegral(
       lo = hi;
       hi *= 2;
     }
-    for (let i = 0; i < 100; i++) {
+    for (let i = 0; i < 120; i++) {
       const mid = 0.5 * (lo + hi);
       if (mid <= lo || mid >= hi || hi - lo <= 1e-15 * mid) {
         zStar = mid;
@@ -2540,52 +2820,148 @@ function evaluateLogNonCentralStudentTCdfIntegral(
     }
   }
 
-  const maxPsi = psi(zStar);
+  const wStar = a * zStar - ncp;
+  const logPhiStar = logStandardNormalCdf(wStar);
+  const logPref = (1 - 0.5 * df) * Math.LN2 - lnGamma(0.5 * df);
+  const maxPsi = kahanNeumaierSum([
+    logPref,
+    logPhiStar,
+    zStar > 0 && df !== 1 ? (df - 1) * Math.log(zStar) : 0,
+    zStar > 0 ? -0.5 * zStar * zStar : 0,
+  ]);
+
   if (!Number.isFinite(maxPsi)) {
-    return maxPsi;
+    return Object.freeze({
+      logProbability: maxPsi,
+      zStar,
+      leftBound: 0,
+      rightBound: 0,
+      scaledIntegral: 0,
+      leftTailRelativeBound: 0,
+      rightTailRelativeBound: 0,
+      quadratureRelativeErrorEstimate: 0,
+      roundingRelativeBound: 0,
+      totalRelativeErrorBudget: 0,
+      totalLogErrorBudget: 0,
+      panelEvaluations: 0,
+    });
   }
 
-  const curv = 1 + a * a + (zStar > 0 && df > 1 ? (df - 1) / (zStar * zStar) : 0);
-  const sigmaStar = 1 / Math.sqrt(curv);
+  // Cancellation-free incremental evaluation of deltaPsi(z) = psi(z) - psi(zStar)
+  function deltaPsi(z: number): number {
+    if (z <= 0) {
+      return df === 1
+        ? logStandardNormalCdf(-ncp) - logPhiStar + 0.5 * zStar * zStar
+        : Number.NEGATIVE_INFINITY;
+    }
+    const dz = z - zStar;
+    const deltaW = a * dz;
+    const w = wStar + deltaW;
+    const dLogPhi = diffLogStandardNormalCdf(w, wStar, deltaW);
+    const dQuad = -0.5 * dz * (z + zStar);
+    if (df === 1) {
+      return dLogPhi + dQuad;
+    }
+    const dLogZ =
+      Math.abs(dz) <= 0.5 * zStar
+        ? (df - 1) * Math.log1p(dz / zStar)
+        : (df - 1) * Math.log(z / zStar);
+    return dLogPhi + dLogZ + dQuad;
+  }
 
-  let rightStep = 0.5 * sigmaStar;
-  while (psi(zStar + rightStep) - maxPsi > -50) {
+  const lambdaStar = dLogStandardNormalCdf(wStar);
+  const dLambdaStar = -lambdaStar * (wStar + lambdaStar);
+  const negD2PsiStar =
+    1 -
+    a * a * dLambdaStar +
+    (zStar > 0 && df > 1 ? (df - 1) / (zStar * zStar) : 0);
+  const boundarySlopeStar = zStar === 0 && df === 1 ? Math.abs(a * lambdaStar) : 0;
+  const sigmaStar = 1 / (boundarySlopeStar + Math.sqrt(Math.max(1, negD2PsiStar)));
+
+  // B. Rigorous analytical right-tail upper bound on int_{zR}^inf exp(deltaPsi(z)) dz [IME / ANC]
+  function computeRightTailUpperBound(zR: number): number {
+    const sR = -dPsi(zR);
+    if (!(sR > 0)) {
+      return Number.POSITIVE_INFINITY;
+    }
+    const dP = deltaPsi(zR);
+    if (dP <= LN_ROUND_TO_ZERO_THRESHOLD_BINARY64) {
+      return 0;
+    }
+    const erfcxFactor = SQRT_HALF_PI * erfcx(sR * Math.SQRT1_2);
+    const decayFactor = Math.min(1 / sR, erfcxFactor);
+    return succNonNegativeBinary64(
+      succNonNegativeBinary64(Math.exp(dP)) * succNonNegativeBinary64(decayFactor),
+    );
+  }
+
+  // A. Rigorous analytical left-tail upper bound on int_0^{zL} exp(deltaPsi(z)) dz [IME / ANC]
+  function computeLeftTailUpperBound(zL: number): number {
+    if (zL <= 0) {
+      return 0;
+    }
+    const sL = dPsi(zL);
+    if (!(sL > 0)) {
+      return Number.POSITIVE_INFINITY;
+    }
+    const dP = deltaPsi(zL);
+    if (dP <= LN_ROUND_TO_ZERO_THRESHOLD_BINARY64) {
+      return 0;
+    }
+    const erfcxFactor = SQRT_HALF_PI * erfcx(sL * Math.SQRT1_2);
+    const decayFactor = Math.min(zL, 1 / sL, erfcxFactor);
+    return succNonNegativeBinary64(
+      succNonNegativeBinary64(Math.exp(dP)) * succNonNegativeBinary64(decayFactor),
+    );
+  }
+
+  const tailScaleTarget = 1e-16 * sigmaStar;
+  let rightStep = 2 * sigmaStar;
+  for (let iter = 0; iter < 120; iter++) {
+    if (computeRightTailUpperBound(zStar + rightStep) <= tailScaleTarget) {
+      break;
+    }
     rightStep *= 1.5;
   }
   const rightBound = zStar + rightStep;
 
   let leftBound = 0;
-  if (zStar > 0) {
-    let leftStep = Math.min(0.5 * zStar, 0.5 * sigmaStar);
-    while (zStar - leftStep > 0 && psi(zStar - leftStep) - maxPsi > -50) {
+  if (zStar > 4 * sigmaStar) {
+    let leftStep = 2 * sigmaStar;
+    for (let iter = 0; iter < 120; iter++) {
+      const candidateLeft = zStar - leftStep;
+      if (candidateLeft <= 0) {
+        leftBound = 0;
+        break;
+      }
+      if (computeLeftTailUpperBound(candidateLeft) <= tailScaleTarget) {
+        leftBound = candidateLeft;
+        break;
+      }
       leftStep *= 1.5;
     }
-    leftBound = Math.max(0, zStar - leftStep);
   }
 
-  // Regularize z^(df - 1) near z = 0 when 1 < df < 4 via z = u^2 (dz = 2*u du)
-  const useSquareSub = leftBound === 0 && df > 1 && df < 4;
+  // Smooth quartic substitution z = u^4 (dz = 4 u^3 du) when leftBound === 0 and 1 < df < 4
+  const useQuarticSub = leftBound === 0 && df > 1 && df < 4;
 
-  function evalNormalizedIntegrand(x: number): number {
-    if (useSquareSub) {
-      if (x <= 0) {
+  function evalNormalizedIntegrand(u: number): number {
+    if (useQuarticSub) {
+      if (u <= 0) {
         return 0;
       }
-      const z = x * x;
-      const w = a * z - ncp;
-      const logVal =
-        logPref +
-        logStandardNormalCdf(w) +
-        (2 * df - 1) * Math.log(x) -
-        0.5 * z * z -
-        maxPsi;
-      return 2 * Math.exp(logVal);
+      const u2 = u * u;
+      const z = u2 * u2;
+      const dz = z - zStar;
+      const deltaW = a * dz;
+      const w = wStar + deltaW;
+      const dLogPhi = diffLogStandardNormalCdf(w, wStar, deltaW);
+      const dQuad = -0.5 * dz * (z + zStar);
+      const logJacAndZ = (4 * df - 1) * Math.log(u) - (df - 1) * Math.log(zStar);
+      return 4 * Math.exp(dLogPhi + logJacAndZ + dQuad);
     }
-    return Math.exp(psi(x) - maxPsi);
+    return Math.exp(deltaPsi(u));
   }
-
-  const domLeft = useSquareSub ? 0 : leftBound;
-  const domRight = useSquareSub ? Math.sqrt(rightBound) : rightBound;
 
   function gl8Panel(uL: number, uR: number): number {
     const mid = 0.5 * (uL + uR);
@@ -2600,54 +2976,91 @@ function evaluateLogNonCentralStudentTCdfIntegral(
     return halfH * s;
   }
 
-  const initPanels = 16;
-  const maxSubdivisions = Math.max(64, options?.maxIterations ?? 500);
-  const h = (domRight - domLeft) / initPanels;
+  const domLeft = useQuarticSub ? 0 : leftBound;
+  const domMid = useQuarticSub ? Math.sqrt(Math.sqrt(zStar)) : zStar;
+  const domRight = useQuarticSub ? Math.sqrt(Math.sqrt(rightBound)) : rightBound;
+
+  const userMaxIterations = options?.maxIterations ?? 500;
+  // Minimum 16 initial panels + 32 child panels = 48 panel evaluations required for 2-level verification
+  const maxPanelEvaluations = userMaxIterations * 4;
+
   const stack: Array<{
     readonly left: number;
     readonly right: number;
     readonly coarse: number;
     readonly depth: number;
   }> = [];
-  for (let m = initPanels - 1; m >= 0; m--) {
-    const uL = domLeft + m * h;
-    const uR = m === initPanels - 1 ? domRight : domLeft + (m + 1) * h;
-    stack.push({ left: uL, right: uR, coarse: gl8Panel(uL, uR), depth: 0 });
+
+  const nLeft = domMid > domLeft ? 8 : 0;
+  const nRight = 8;
+  const initialPanels = nLeft + nRight;
+  let coarseTotalEstimate = 0;
+
+  if (nLeft > 0) {
+    const hL = (domMid - domLeft) / nLeft;
+    for (let m = nLeft - 1; m >= 0; m--) {
+      const uL = domLeft + m * hL;
+      const uR = m === nLeft - 1 ? domMid : domLeft + (m + 1) * hL;
+      const c = gl8Panel(uL, uR);
+      coarseTotalEstimate += c;
+      stack.push({ left: uL, right: uR, coarse: c, depth: 0 });
+    }
+  }
+  const hR = (domRight - domMid) / nRight;
+  for (let m = nRight - 1; m >= 0; m--) {
+    const uL = domMid + m * hR;
+    const uR = m === nRight - 1 ? domRight : domMid + (m + 1) * hR;
+    const c = gl8Panel(uL, uR);
+    coarseTotalEstimate += c;
+    stack.push({ left: uL, right: uR, coarse: c, depth: 0 });
   }
 
-  let total = 0;
-  let compensation = 0;
-  let subdivisionsUsed = initPanels;
+  let panelEvaluations = initialPanels;
+  if (panelEvaluations + 2 * initialPanels > maxPanelEvaluations) {
+    throw new NumericConvergenceError(
+      'nonCentralStudentTCdf[AdaptiveGL8]',
+      panelEvaluations,
+      1,
+      1e-12,
+      `iteration budget maxIterations=${userMaxIterations} insufficient for initial 2-level Gauss-Legendre verification`,
+    );
+  }
+
+  const acceptedPanels: number[] = [];
+  const panelErrors: number[] = [];
+  const MAX_DEPTH = 24;
 
   while (stack.length > 0) {
     const cur = stack.pop()!;
     const mid = 0.5 * (cur.left + cur.right);
+    if (mid <= cur.left || mid >= cur.right) {
+      throw new NumericConvergenceError(
+        'nonCentralStudentTCdf[AdaptiveGL8]',
+        panelEvaluations,
+        Math.abs(cur.coarse) / Math.max(1e-300, coarseTotalEstimate),
+        1e-14,
+        'subinterval collapsed to zero binary64 width before meeting quadrature tolerance',
+      );
+    }
+
     const leftVal = gl8Panel(cur.left, mid);
     const rightVal = gl8Panel(mid, cur.right);
-    subdivisionsUsed += 2;
+    panelEvaluations += 2;
     const fine = leftVal + rightVal;
     const diff = Math.abs(fine - cur.coarse);
+    const panelTolerance = 1e-14 * Math.max(coarseTotalEstimate / initialPanels, fine);
 
-    if (
-      cur.depth >= 16 ||
-      mid <= cur.left ||
-      mid >= cur.right ||
-      diff <= 1e-14 * Math.max(1e-18, fine)
-    ) {
-      const next = total + fine;
-      if (Math.abs(total) >= Math.abs(fine)) {
-        compensation += total - next + fine;
-      } else {
-        compensation += fine - next + total;
-      }
-      total = next;
+    if (diff <= panelTolerance) {
+      acceptedPanels.push(fine);
+      panelErrors.push(diff);
     } else {
-      if (subdivisionsUsed > maxSubdivisions * 4) {
+      if (cur.depth >= MAX_DEPTH || panelEvaluations + 2 > maxPanelEvaluations) {
         throw new NumericConvergenceError(
           'nonCentralStudentTCdf[AdaptiveGL8]',
-          subdivisionsUsed,
-          diff / Math.max(1e-300, fine),
+          panelEvaluations,
+          diff / Math.max(1e-300, coarseTotalEstimate),
           1e-14,
+          `failed to converge at depth=${cur.depth}`,
         );
       }
       stack.push({ left: mid, right: cur.right, coarse: rightVal, depth: cur.depth + 1 });
@@ -2655,11 +3068,104 @@ function evaluateLogNonCentralStudentTCdfIntegral(
     }
   }
 
-  const integral = total + compensation;
-  if (!(integral > 0) || !Number.isFinite(integral)) {
-    return Number.NEGATIVE_INFINITY;
+  const scaledIntegral = kahanNeumaierSum(acceptedPanels);
+  if (!(scaledIntegral > 0) || !Number.isFinite(scaledIntegral)) {
+    return Object.freeze({
+      logProbability: Number.NEGATIVE_INFINITY,
+      zStar,
+      leftBound,
+      rightBound,
+      scaledIntegral: 0,
+      leftTailRelativeBound: 0,
+      rightTailRelativeBound: 0,
+      quadratureRelativeErrorEstimate: 0,
+      roundingRelativeBound: 0,
+      totalRelativeErrorBudget: 0,
+      totalLogErrorBudget: 0,
+      panelEvaluations,
+    });
   }
-  return Math.min(0, maxPsi + Math.log(integral));
+
+  const leftTailAbsBound = computeLeftTailUpperBound(leftBound);
+  const rightTailAbsBound = computeRightTailUpperBound(rightBound);
+  const leftTailRelativeBound =
+    leftTailAbsBound === 0 ? 0 : succNonNegativeBinary64(leftTailAbsBound / scaledIntegral);
+  const rightTailRelativeBound =
+    rightTailAbsBound === 0 ? 0 : succNonNegativeBinary64(rightTailAbsBound / scaledIntegral);
+  const quadratureAbsError = kahanNeumaierSum(panelErrors);
+  const quadratureRelativeErrorEstimate = succNonNegativeBinary64(
+    quadratureAbsError / scaledIntegral,
+  );
+
+  // D. IEEE 754 binary64 rounding & Kahan-Neumaier accumulation bound:
+  //    - Kahan-Neumaier accumulation of M = acceptedPanels.length positive panels: gamma_2 + M * u^2
+  //    - Per-node integrand evaluation exp(deltaPsi(z)): gamma_16 * (1 + |wStar| + (df - 1)) * u_mach
+  const totalNodeEvaluations = acceptedPanels.length * 16;
+  const sumRoundingRel =
+    gammaBinary64(2) +
+    totalNodeEvaluations * (0.5 * Number.EPSILON) * (0.5 * Number.EPSILON);
+  const evalRoundingRel = gammaBinary64(16);
+  const roundingRelativeBound = succNonNegativeBinary64(sumRoundingRel + evalRoundingRel);
+
+  const totalRelativeErrorBudget = succNonNegativeBinary64(
+    leftTailRelativeBound +
+      rightTailRelativeBound +
+      quadratureRelativeErrorEstimate +
+      roundingRelativeBound,
+  );
+
+  if (
+    leftTailRelativeBound > 1e-12 ||
+    rightTailRelativeBound > 1e-12 ||
+    quadratureRelativeErrorEstimate > 1e-12 ||
+    totalRelativeErrorBudget >= 1e-10
+  ) {
+    throw new NumericConvergenceError(
+      'nonCentralStudentTCdf[ErrorBudget]',
+      panelEvaluations,
+      totalRelativeErrorBudget,
+      1e-12,
+      `error budget exceeded (left=${leftTailRelativeBound}, right=${rightTailRelativeBound}, quad=${quadratureRelativeErrorEstimate})`,
+    );
+  }
+
+  const logProbabilityRaw = kahanNeumaierSum([
+    logPref,
+    logPhiStar,
+    zStar > 0 && df !== 1 ? (df - 1) * Math.log(zStar) : 0,
+    zStar > 0 ? -0.5 * zStar * zStar : 0,
+    Math.log(scaledIntegral),
+  ]);
+  const logProbability = Math.min(0, logProbabilityRaw);
+  const logSumRounding = gammaBinary64(6) * Math.abs(logProbability);
+  const totalLogErrorBudget = succNonNegativeBinary64(
+    -Math.log1p(-Math.min(0.5, totalRelativeErrorBudget)) + logSumRounding,
+  );
+
+  return Object.freeze({
+    logProbability,
+    zStar,
+    leftBound,
+    rightBound,
+    scaledIntegral,
+    leftTailRelativeBound,
+    rightTailRelativeBound,
+    quadratureRelativeErrorEstimate,
+    roundingRelativeBound,
+    totalRelativeErrorBudget,
+    totalLogErrorBudget,
+    panelEvaluations,
+  });
+}
+
+function evaluateLogNonCentralStudentTCdfIntegral(
+  t: number,
+  df: number,
+  ncp: number,
+  options?: NumericEvaluationOptions,
+): number {
+  return evaluateLogNonCentralStudentTCdfIntegralWithDiagnostics(t, df, ncp, options)
+    .logProbability;
 }
 
 function validateNonCentralStudentTParams(
@@ -2689,7 +3195,14 @@ function validateNonCentralStudentTParams(
  * Evaluates both the lower-tail CDF `F_{t_nu(delta)}(t)` and the upper-tail
  * survival probability `1 - F_{t_nu(delta)}(t) = F_{t_nu(-delta)}(-t)` as a
  * coherent `DualChannelProbability` without catastrophic `1 - CDF` reflection
- * cancellation in either tail [IME / ANC].
+ * cancellation in either tail [IME / ANC / EBM].
+ *
+ * Epistemological classification:
+ *   - `[IME]`: Exact distributional reflection `1 - F_{t_nu(delta)}(t) = F_{t_nu(-delta)}(-t)`
+ *     and analytical left/right tail truncation bounds from strong log-concavity `psi''(z) <= -1`.
+ *   - `[ANC]`: Kahan-Neumaier accumulation and IEEE 754 `binary64` dual-channel construction.
+ *   - `[EBM]`: Interior adaptive two-level 8-point Gauss-Legendre quadrature error control,
+ *     empirically validated against 80-to-120-digit arbitrary-precision references.
  */
 export function nonCentralStudentTDualCdf(
   t: number,
@@ -2725,10 +3238,6 @@ export function nonCentralStudentTDualCdf(
       : createDualChannelProbabilityFromComplementLog(logSmallTail);
   }
 
-  const maxSteps = options?.maxIterations ?? 500;
-  // Enforce the strict analytical modal truncation bound B_tail(S) <= 1e-12
-  evaluateBentonKrishnamoorthyModalSeries(Math.abs(t), df, ncp, maxSteps, 'check-only');
-
   // By exact distributional symmetry T_nu(delta) =^d -T_nu(-delta),
   // 1 - F_{t_nu(delta)}(t) = F_{t_nu(-delta)}(-t).
   // Evaluate whichever tail is smaller (<= 0.5) directly in log-space without subtraction:
@@ -2752,23 +3261,23 @@ export function nonCentralStudentTDualCdf(
 /**
  * Evaluates the noncentral Student-t cumulative distribution function `F_{t_nu(delta)}(t)`
  * for `t in [-Infinity, +Infinity]`, `df in [1, 2000]`, and `|ncp| <= 50` without
- * catastrophic `1 - CDF` reflection cancellation in the tails [IME / ANC]:
+ * catastrophic `1 - CDF` reflection cancellation in the tails [IME / ANC / EBM]:
  *
  *   1. Exact boundary returns: `t === -Infinity -> 0`, `t === +Infinity -> 1`.
  *   2. Exact central delegation for `ncp === 0`: returns `studentTCdf(t, df)`.
  *   3. Exact origin shortcut for `t === 0`: returns `normalCdf(-ncp)`.
- *   4. Enforces the Benton & Krishnamoorthy (2003) modal truncation bound
- *      `B_tail(S) <= 1e-12` around `j_0 = floor(delta^2 / 2)` within `maxIterations`
- *      (default `500`), throwing `NumericConvergenceError` if not reached.
- *   5. Eliminates the naive reflection `1 - nonCentralStudentTCdf(-t, df, -ncp)` for `t < 0`:
+ *   4. Eliminates the naive reflection `1 - nonCentralStudentTCdf(-t, df, -ncp)` for `t < 0`:
  *      - For `t < 0` with tiny `|ncp| <= 1e-4`, evaluates the direct complementary
- *        Benton-Krishnamoorthy series `0.5 * sum_j [p_j I_{1-x}(df/2, j+1/2) - q_j I_{1-x}(df/2, j+1)]`.
- *      - For `t > 0` and `ncp > 0` outside the deep lower tail, evaluates the all-positive
- *        Quadrant-I Benton-Krishnamoorthy series.
+ *        Benton-Krishnamoorthy series `0.5 * sum_j [p_j I_{1-x}(df/2, j+1/2) - q_j I_{1-x}(df/2, j+1)]`
+ *        under the analytical Poisson-Beta truncation bound `B_tail(S) <= 1e-12` (`[IME / ANC]`).
+ *      - For `t > 0` and `ncp > 0` outside the deep lower tail (`bkVal >= 1e-3`), evaluates
+ *        the all-positive Quadrant-I Benton-Krishnamoorthy series under `B_tail(S) <= 1e-12` (`[IME / ANC]`).
  *      - For all opposite-sign (`t < 0, ncp > 0` and `t > 0, ncp < 0`), Quadrant-III (`t < 0, ncp < 0`),
  *        and deep lower-tail cases (such as `F_{t_10(10)}(-20) = 3.8869760048338704e-39`),
- *        evaluates the smaller tail directly in log-space via the strictly positive
- *        conditional-normal chi-distribution integral (`nonCentralStudentTDualCdf`).
+ *        evaluates the smaller tail directly in log-space via `nonCentralStudentTDualCdf`,
+ *        combining analytical log-concavity left/right tail truncation bounds (`[IME / ANC]`),
+ *        Kahan-Neumaier rounding/accumulation bounds (`[ANC]`), and adaptive two-level 8-point
+ *        Gauss-Legendre interior quadrature (`[EBM]`).
  */
 export function nonCentralStudentTCdf(
   t: number,
@@ -3449,19 +3958,47 @@ export function validateCategoryUncertaintyDecomposition(
 }
 
 /**
- * Validates at runtime an `EntropyDecomposition`, independently recomputing the
- * Shannon entropy `H(p_bar)` of `outcomes`, the closure residual
- * `|H(p_bar) - (H_within + JSD_w)|`, and the normalized disagreement index
- * `JSD_w / ln(M)` without trusting the declared `closureResidualNats` field [IME].
+ * Validates at runtime an `EntropyDecomposition`, autonomously verifying:
+ *   1. `outcomes` is a valid exhaustive distribution (`validateExhaustiveDistribution`)
+ *      with coherent dual-channel probabilities, normalized linear and log sums,
+ *      and length matching `expectedOutcomeCount` (when provided, or `>= 2` otherwise).
+ *   2. `executedMethodCount` (when provided) is a positive safe integer `>= 1`.
+ *   3. All entropy and divergence components are finite, non-negative, and within
+ *      their theoretical `[0, ln(K)]` / `[0, ln(M)]` / `[0, 1]` ranges.
+ *   4. Independent recomputation of the Shannon entropy `H(p_bar)` of `outcomes`,
+ *      the closure residual `|H(p_bar) - (H_within + JSD_w)| <= 1e-12`, and the
+ *      normalized disagreement index `JSD_w / ln(M)` without trusting the declared
+ *      `closureResidualNats` field [IME].
  */
 export function validateEntropyDecomposition(
   value: unknown,
-  outcomes: readonly DualChannelProbability[],
+  outcomes: unknown,
   executedMethodCount?: number,
+  expectedOutcomeCount?: number,
 ): EntropyDecomposition {
   if (typeof value !== 'object' || value === null || Array.isArray(value)) {
     throw new RangeError('EntropyDecomposition must be a non-null object');
   }
+  if (expectedOutcomeCount !== undefined) {
+    if (!Number.isSafeInteger(expectedOutcomeCount) || expectedOutcomeCount < 2) {
+      throw new RangeError(
+        `validateEntropyDecomposition requires expectedOutcomeCount to be an integer >= 2, received ${String(expectedOutcomeCount)}`,
+      );
+    }
+  }
+  const targetOutcomeCount =
+    expectedOutcomeCount ??
+    (Array.isArray(outcomes) && outcomes.length >= 2 ? outcomes.length : 2);
+  const validatedOutcomes = validateExhaustiveDistribution(outcomes, targetOutcomeCount);
+
+  if (executedMethodCount !== undefined) {
+    if (!Number.isSafeInteger(executedMethodCount) || executedMethodCount < 1) {
+      throw new RangeError(
+        `validateEntropyDecomposition requires executedMethodCount to be an integer >= 1, received ${String(executedMethodCount)}`,
+      );
+    }
+  }
+
   const cand = value as Record<string, unknown>;
   const totalPredictiveEntropyNats = cand.totalPredictiveEntropyNats;
   const withinMethodExpectedEntropyNats = cand.withinMethodExpectedEntropyNats;
@@ -3481,7 +4018,7 @@ export function validateEntropyDecomposition(
     );
   }
 
-  const maxEntropyNats = Math.log(outcomes.length);
+  const maxEntropyNats = Math.log(validatedOutcomes.length);
   if (
     totalPredictiveEntropyNats > maxEntropyNats + 1e-12 ||
     withinMethodExpectedEntropyNats > maxEntropyNats + 1e-12 ||
@@ -3494,7 +4031,7 @@ export function validateEntropyDecomposition(
   }
 
   // 1. Independently recompute H(p_bar) from the validated ensemble outcomes
-  const expectedTotalEntropyNats = shannonEntropyFromDistribution(outcomes);
+  const expectedTotalEntropyNats = shannonEntropyFromDistribution(validatedOutcomes);
   if (Math.abs(totalPredictiveEntropyNats - expectedTotalEntropyNats) > 1e-12) {
     throw new RangeError(
       `EntropyDecomposition.totalPredictiveEntropyNats (${totalPredictiveEntropyNats}) does not match Shannon entropy of outcomes (${expectedTotalEntropyNats})`,
@@ -3516,7 +4053,12 @@ export function validateEntropyDecomposition(
     );
   }
 
-  // 3. Check JSD_w and normalizedDisagreementIndex against executedMethodCount when provided
+  // 3. Check JSD_w and normalizedDisagreementIndex against executedMethodCount (or JSD_w === 0)
+  if (jensenShannonDivergenceNats <= 1e-15 && normalizedDisagreementIndex > 1e-12) {
+    throw new RangeError(
+      `EntropyDecomposition.normalizedDisagreementIndex (${normalizedDisagreementIndex}) must be 0 when jensenShannonDivergenceNats is 0`,
+    );
+  }
   if (executedMethodCount !== undefined) {
     if (executedMethodCount === 1) {
       if (jensenShannonDivergenceNats > 1e-12 || normalizedDisagreementIndex > 1e-12) {

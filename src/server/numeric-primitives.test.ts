@@ -25,6 +25,7 @@ import {
   erfcxDerivativePositive,
   erfcxDiffPositive,
   evaluateLaplaceStieltjesEnclosure,
+  evaluateLogNonCentralStudentTCdfIntegralWithDiagnostics,
   inverseNormalCdf,
   inverseRegularizedGammaQ,
   inverseRegularizedIncompleteBeta,
@@ -389,12 +390,28 @@ describe('Stage 2A-1 — Numeric Primitives & Forecast Contracts (v4.4.3)', () =
       for (const [u, exactRCf, exactDErfcx] of stieltjesReferences) {
         const enc = evaluateLaplaceStieltjesEnclosure(u);
         expect(enc.lowerConvergent).toBeLessThanOrEqual(enc.upperConvergent);
+        expect(enc.certifiedLowerBound).toBeLessThanOrEqual(enc.lowerConvergent);
+        expect(enc.certifiedUpperBound).toBeGreaterThanOrEqual(enc.upperConvergent);
         expect(enc.certifiedLowerBound).toBeLessThanOrEqual(exactRCf);
         expect(enc.certifiedUpperBound).toBeGreaterThanOrEqual(exactRCf);
         expect(Math.abs(enc.value - exactRCf)).toBeLessThanOrEqual(enc.certifiedErrorBound);
+        expect(enc.gammaIndex).toBe(4 * enc.iterations + 1);
+        expect(enc.gammaBound).toBeGreaterThan(0);
+        expect(enc.gammaBound).toBeLessThan(1e-12);
+        expect(enc.allNormalOperations).toBe(true);
         expectRelativeErrorWithin(enc.value, exactRCf, 2e-15);
         expectRelativeErrorWithin(erfcxDerivativePositive(u), exactDErfcx, 5e-15);
       }
+
+      // High-u regime (u = 200 -> exact Decimal(80) R_CF(200) = 2.499937503905888714959594e-3)
+      const encHighU = evaluateLaplaceStieltjesEnclosure(200.0);
+      const exactHighURCf = 2.49993750390588871496e-3;
+      expect(encHighU.certifiedLowerBound).toBeLessThanOrEqual(exactHighURCf);
+      expect(encHighU.certifiedUpperBound).toBeGreaterThanOrEqual(exactHighURCf);
+      expect(Math.abs(encHighU.value - exactHighURCf)).toBeLessThanOrEqual(
+        encHighU.certifiedErrorBound,
+      );
+      expect(encHighU.allNormalOperations).toBe(true);
 
       expect(() => evaluateLaplaceStieltjesEnclosure(0)).toThrow(RangeError);
       expect(() => evaluateLaplaceStieltjesEnclosure(-1)).toThrow(RangeError);
@@ -914,15 +931,85 @@ describe('Stage 2A-1 — Numeric Primitives & Forecast Contracts (v4.4.3)', () =
         expect(dLower.probability).toBe(dUpper.complementProbability);
         expect(dLower.logProbability).toBe(dUpper.logComplementProbability);
       }
+
+      // 5. 4-part error budget & 100-digit Decimal reference suite across varied df,
+      //    positive/negative ncp, extreme small tails (1e-146), boundary peaks (zStar = 0
+      //    and zStar ~ 4.95e-4), and high asymmetry:
+      const deepDiagnosticReferences: ReadonlyArray<
+        readonly [number, number, number, number, number]
+      > = [
+        // Boundary peak at zStar === 0 (df = 1, t = -20, ncp = 10)
+        [-20, 1, 10, 2.98184832880101550229e-26, -58.7746690650359354541],
+        // Peak very close to z = 0 boundary: zStar ~ 4.95e-4 (df = 1.1, t = -20, ncp = 10)
+        [-20, 1.1, 10, 1.8598447942472127221e-26, -59.2467193775548296835],
+        // Non-integer df in (1, 4) with quartic smoothing z = u^4 (df = 2.5, t = -20, ncp = 10)
+        [-20, 2.5, 10, 4.89053621817927801541e-29, -65.1876657432829494661],
+        // High asymmetry & fractional df (df = 1.5, t = -5, ncp = 8)
+        [-5, 1.5, 8, 2.72392583982206566376e-18, -40.4444575107110807007],
+        // Moderate df & negative ncp (df = 4, t = -10, ncp = -5)
+        [-10, 4, -5, 1.01760469305847410521e-1, -2.2851335675117359995],
+        // Reference case F_t(10, ncp=10)(-20)
+        [-20, 10, 10, 3.88697600483387041735e-39, -88.4431871481007295702],
+        // Extreme deep lower tail ~ 7.10e-146 with high df = 100 and ncp = 15
+        [-30, 100, 15, 7.09607899906349709887e-146, -334.2178811992846434734],
+      ];
+
+      for (const [t, df, ncp, expectedProb, expectedLn] of deepDiagnosticReferences) {
+        const diag = evaluateLogNonCentralStudentTCdfIntegralWithDiagnostics(t, df, ncp);
+        expect(diag.leftTailRelativeBound).toBeGreaterThanOrEqual(0);
+        expect(diag.leftTailRelativeBound).toBeLessThanOrEqual(1e-12);
+        expect(diag.rightTailRelativeBound).toBeGreaterThan(0);
+        expect(diag.rightTailRelativeBound).toBeLessThanOrEqual(1e-12);
+        expect(diag.quadratureRelativeErrorEstimate).toBeGreaterThanOrEqual(0);
+        expect(diag.quadratureRelativeErrorEstimate).toBeLessThanOrEqual(1e-12);
+        expect(diag.roundingRelativeBound).toBeGreaterThan(0);
+        expect(diag.roundingRelativeBound).toBeLessThanOrEqual(1e-12);
+        expect(Math.abs(diag.logProbability - expectedLn)).toBeLessThanOrEqual(
+          diag.totalLogErrorBudget,
+        );
+        expectRelativeErrorWithin(nonCentralStudentTCdf(t, df, ncp), expectedProb, 1e-13);
+
+        const dual = nonCentralStudentTDualCdf(t, df, ncp);
+        expect(validateDualChannelProbability(dual)).toEqual(dual);
+        expectRelativeErrorWithin(dual.probability, expectedProb, 1e-13);
+      }
+
+      // Verify boundary peak location zStar === 0 when df === 1 and t < 0:
+      const diagDf1 = evaluateLogNonCentralStudentTCdfIntegralWithDiagnostics(-20, 1, 10);
+      expect(diagDf1.zStar).toBe(0);
+      expect(diagDf1.leftBound).toBe(0);
+      expect(diagDf1.leftTailRelativeBound).toBe(0);
+
+      // Verify positive small zStar near boundary when df = 1.1 and t = -20:
+      const diagDf11 = evaluateLogNonCentralStudentTCdfIntegralWithDiagnostics(-20, 1.1, 10);
+      expect(diagDf11.zStar).toBeGreaterThan(0);
+      expect(diagDf11.zStar).toBeLessThan(1e-3);
+      expect(diagDf11.leftBound).toBe(0);
+      expect(diagDf11.leftTailRelativeBound).toBe(0);
     });
 
-    it('throws NumericConvergenceError when truncation bound B_tail(S) <= 1e-12 is not reached within maxIterations', () => {
+    it('throws NumericConvergenceError when series truncation bound or integral error budget cannot be met within maxIterations', () => {
+      // 1. Benton-Krishnamoorthy series branch (Quadrant I: t = 55 > 0, ncp = 50 > 0)
       expect(() => nonCentralStudentTCdf(55.0, 20, 50.0, { maxIterations: 5 })).toThrow(
         NumericConvergenceError,
       );
       expect(() => nonCentralStudentTCdf(55.0, 20, 50.0, { maxIterations: 5 })).toThrow(
         RangeError,
       );
+
+      // 2. Adaptive Gauss-Legendre integral branch (deep lower tail: t = -20, df = 10, ncp = 10)
+      expect(() => nonCentralStudentTCdf(-20.0, 10, 10.0, { maxIterations: 5 })).toThrow(
+        NumericConvergenceError,
+      );
+      expect(() => nonCentralStudentTDualCdf(-20.0, 10, 10.0, { maxIterations: 5 })).toThrow(
+        NumericConvergenceError,
+      );
+      expect(() =>
+        evaluateLogNonCentralStudentTCdfIntegralWithDiagnostics(-20.0, 10, 10.0, {
+          maxIterations: 5,
+        }),
+      ).toThrow(NumericConvergenceError);
+
       expect(() => nonCentralStudentTCdf(1.0, 10, 55.0)).toThrow(RangeError);
       expect(() => nonCentralStudentTCdf(1.0, 0.5, 2.0)).toThrow(RangeError);
       expect(() => nonCentralStudentTCdf(Number.NaN, 10, 2.0)).toThrow(RangeError);
@@ -1575,6 +1662,55 @@ describe('Stage 2A-1 — Numeric Primitives & Forecast Contracts (v4.4.3)', () =
           [pYes, pNo],
           1,
         ),
+      ).toThrow(RangeError);
+
+      // (g2) Autonomous validation in validateEntropyDecomposition without prior validateForecastDistributionContract:
+      //  - Reject non-array, empty, or single-element outcomes
+      expect(() => validateEntropyDecomposition(entropyDecomp, null, 1)).toThrow(RangeError);
+      expect(() => validateEntropyDecomposition(entropyDecomp, [], 1)).toThrow(RangeError);
+      expect(() => validateEntropyDecomposition(entropyDecomp, [pYes], 1)).toThrow(RangeError);
+
+      //  - Reject manipulated dual-channel probabilities inside outcomes
+      expect(() =>
+        validateEntropyDecomposition(
+          entropyDecomp,
+          [{ ...pSubnormal, probability: 1e-16 }, pExactOne],
+          1,
+        ),
+      ).toThrow(RangeError);
+      expect(() =>
+        validateEntropyDecomposition(
+          entropyDecomp,
+          [{ ...pSaturated, complementProbability: 1e-16 }, pExactZero],
+          1,
+        ),
+      ).toThrow(RangeError);
+
+      //  - Reject unnormalized outcomes (probabilities summing to 1.3 != 1)
+      expect(() =>
+        validateEntropyDecomposition(entropyDecomp, [pYes, pYes], 1),
+      ).toThrow(RangeError);
+
+      //  - Reject wrong outcome count when expectedOutcomeCount is specified
+      expect(() =>
+        validateEntropyDecomposition(entropyDecomp, [pYes, pNo], 1, 3),
+      ).toThrow(RangeError);
+      expect(() =>
+        validateEntropyDecomposition(entropyDecomp, [pYes, pNo], 1, 1),
+      ).toThrow(RangeError);
+
+      //  - Reject invalid executedMethodCount (0, negative, non-integer, NaN)
+      expect(() =>
+        validateEntropyDecomposition(entropyDecomp, [pYes, pNo], 0),
+      ).toThrow(RangeError);
+      expect(() =>
+        validateEntropyDecomposition(entropyDecomp, [pYes, pNo], -2),
+      ).toThrow(RangeError);
+      expect(() =>
+        validateEntropyDecomposition(entropyDecomp, [pYes, pNo], 1.5),
+      ).toThrow(RangeError);
+      expect(() =>
+        validateEntropyDecomposition(entropyDecomp, [pYes, pNo], Number.NaN),
       ).toThrow(RangeError);
 
       // (h) Invalid contrastReport weightsByMethod or effectiveIndependentMethodCount
