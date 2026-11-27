@@ -48,10 +48,23 @@ describe('Stage 2A-2.1 — Scientific Method Registry (src/server/method-registr
     ).toThrow(RangeError);
   });
 
-  it('truthfully declares hasExecutableImplementation: false and registered-specification-only for all 7 core methods in Stage 2A-2.1', () => {
+  it('truthfully declares hasExecutableImplementation and implementationStatus for Stage 2A-2.2 (5 implemented, 2 unimplemented)', () => {
+    expect(SCIENTIFIC_METHOD_REGISTRY_VERSION).toBe('2A-2.2.0');
+    const implementedIds = new Set([
+      'beta-binomial-conjugate',
+      'weighted-kish-effective-binomial',
+      'poisson-gamma-hazard',
+      'dirichlet-multinomial-symmetry',
+      'structural-uniform-baseline',
+    ]);
     for (const desc of DEFAULT_SCIENTIFIC_METHOD_REGISTRY.listAll()) {
-      expect(desc.hasExecutableImplementation).toBe(false);
-      expect(desc.implementationStatus).toBe('registered-specification-only');
+      if (implementedIds.has(desc.methodId)) {
+        expect(desc.hasExecutableImplementation).toBe(true);
+        expect(desc.implementationStatus).toBe('implemented-and-verified');
+      } else {
+        expect(desc.hasExecutableImplementation).toBe(false);
+        expect(desc.implementationStatus).toBe('registered-specification-only');
+      }
     }
   });
 

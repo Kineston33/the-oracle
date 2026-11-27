@@ -1,5 +1,5 @@
 /**
- * THE ORACLE — Stage 2A-2.1: Scientific Method Registry
+ * THE ORACLE — Stage 2A-2.1 / 2A-2.2: Scientific Method Registry
  *
  * Maintains a deterministic, deeply immutable catalog of scientific and
  * mathematical forecasting methods, their statistical assumptions, input
@@ -7,12 +7,17 @@
  * computational cost profiles, epistemological claim classifications,
  * dependence/correlation structures, and truthful implementation status.
  *
- * Architectural boundaries (Stage 2A-2.1):
- *   1. Specification vs. execution honesty: registering a scientific method
- *      descriptor does NOT claim that its forecasting execution adapter is
- *      implemented. All seven core descriptors in Stage 2A-2.1 explicitly
- *      declare `hasExecutableImplementation: false` and
- *      `implementationStatus: 'registered-specification-only'`.
+ * Architectural boundaries:
+ *   1. Specification vs. execution honesty: in Stage 2A-2.2, the five
+ *      foundational descriptors (`beta-binomial-conjugate`,
+ *      `weighted-kish-effective-binomial`, `poisson-gamma-hazard`,
+ *      `dirichlet-multinomial-symmetry`, and `structural-uniform-baseline`)
+ *      have verified executable adapters (`hasExecutableImplementation: true`,
+ *      `implementationStatus: 'implemented-and-verified'`), while the two
+ *      continuous diffusion / barrier descriptors (`student-t-terminal-diffusion`
+ *      and `first-passage-barrier-diffusion`) remain explicitly unimplemented
+ *      (`hasExecutableImplementation: false`,
+ *      `implementationStatus: 'registered-specification-only'`).
  *   2. Deep immutability & strict validation: the default registry and any
  *      custom registry constructed via `createScientificMethodRegistry` are
  *      recursively frozen (`Object.freeze`) and reject duplicate method
@@ -43,7 +48,7 @@ import {
   type ScientificMethodOutput,
 } from './forecast-types.ts';
 
-export const SCIENTIFIC_METHOD_REGISTRY_VERSION = '2A-2.1.0' as const;
+export const SCIENTIFIC_METHOD_REGISTRY_VERSION = '2A-2.2.0' as const;
 
 export const PREDICTION_CATEGORIES: readonly PredictionCategory[] = Object.freeze([
   'geopolitics',
@@ -1176,8 +1181,8 @@ const CORE_METHOD_DESCRIPTORS_RAW: readonly ScientificMethodDescriptor[] = [
       independenceWarning:
         'Shares the historical binary reference class with weighted-kish-effective-binomial and is algebraically related on binary outcome spaces (K = 2) to dirichlet-multinomial-symmetry; downstream synthesis must never treat these methods as independent votes.',
     },
-    hasExecutableImplementation: false,
-    implementationStatus: 'registered-specification-only',
+    hasExecutableImplementation: true,
+    implementationStatus: 'implemented-and-verified',
   },
   {
     methodId: 'weighted-kish-effective-binomial',
@@ -1286,8 +1291,8 @@ const CORE_METHOD_DESCRIPTORS_RAW: readonly ScientificMethodDescriptor[] = [
       independenceWarning:
         'Strongly correlated with beta-binomial-conjugate when both operate on the same underlying binary trial corpus.',
     },
-    hasExecutableImplementation: false,
-    implementationStatus: 'registered-specification-only',
+    hasExecutableImplementation: true,
+    implementationStatus: 'implemented-and-verified',
   },
   {
     methodId: 'poisson-gamma-hazard',
@@ -1391,8 +1396,8 @@ const CORE_METHOD_DESCRIPTORS_RAW: readonly ScientificMethodDescriptor[] = [
       independenceWarning:
         'When Poisson event counts are derived by thresholding the same underlying time series used by diffusion models, cross-family dependence must be audited.',
     },
-    hasExecutableImplementation: false,
-    implementationStatus: 'registered-specification-only',
+    hasExecutableImplementation: true,
+    implementationStatus: 'implemented-and-verified',
   },
   {
     methodId: 'dirichlet-multinomial-symmetry',
@@ -1490,8 +1495,8 @@ const CORE_METHOD_DESCRIPTORS_RAW: readonly ScientificMethodDescriptor[] = [
       independenceWarning:
         'For binary outcome spaces (K = 2), the 2-category Dirichlet-Multinomial model is mathematically related to Beta-Binomial and may produce equivalent predictive distributions when observing identical binary counts under compatible priors; never treat both as independent votes.',
     },
-    hasExecutableImplementation: false,
-    implementationStatus: 'registered-specification-only',
+    hasExecutableImplementation: true,
+    implementationStatus: 'implemented-and-verified',
   },
   {
     methodId: 'student-t-terminal-diffusion',
@@ -1832,8 +1837,8 @@ const CORE_METHOD_DESCRIPTORS_RAW: readonly ScientificMethodDescriptor[] = [
       independenceWarning:
         'Carries zero empirical sample size; must be kept separate from evidence-driven methods and must never inflate effectiveIndependentMethodCount.',
     },
-    hasExecutableImplementation: false,
-    implementationStatus: 'registered-specification-only',
+    hasExecutableImplementation: true,
+    implementationStatus: 'implemented-and-verified',
   },
 ];
 
