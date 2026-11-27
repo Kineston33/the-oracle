@@ -5070,15 +5070,62 @@ export function validateForecastDistributionContract(
         }
       }
 
-      const validatedCert = validateStatisticalIndependenceCertification(rawCert, {
+      const certContext = {
         expectedParticipatingMethodIds: [...ensembleSet] as ScientificMethodId[],
         correlatedMethodSets,
         ...(typeof wPolicy?.evidenceConnectedComponentCount === 'number'
           ? { maxIndependentComponents: wPolicy.evidenceConnectedComponentCount }
           : {}),
-      });
+      };
+      const validatedCert = validateStatisticalIndependenceCertification(
+        rawCert,
+        certContext,
+      );
+
+      if (
+        (rawCert as { readonly verificationStatus?: unknown })
+          .verificationStatus !== 'declared-unverified-assertion'
+      ) {
+        throw new RangeError(
+          `contrastReport.independenceCertification.verificationStatus must be 'declared-unverified-assertion' when no trusted verification authority has authenticated the certification, received '${String((rawCert as { readonly verificationStatus?: unknown }).verificationStatus)}'`,
+        );
+      }
 
       if (rawSemantics !== undefined) {
+        if (
+          contrastReport.independenceCertification === undefined &&
+          rawSemantics.independenceCertification !== undefined
+        ) {
+          throw new RangeError(
+            'contrastReport.independenceSemantics.independenceCertification cannot be present when contrastReport.independenceCertification is absent',
+          );
+        }
+        if (rawSemantics.independenceCertification !== undefined) {
+          const validatedSemCert = validateStatisticalIndependenceCertification(
+            rawSemantics.independenceCertification,
+            certContext,
+          );
+          if (
+            (
+              rawSemantics.independenceCertification as {
+                readonly verificationStatus?: unknown;
+              }
+            ).verificationStatus !== 'declared-unverified-assertion'
+          ) {
+            throw new RangeError(
+              `contrastReport.independenceSemantics.independenceCertification.verificationStatus must be 'declared-unverified-assertion' when no trusted verification authority has authenticated the certification, received '${String((rawSemantics.independenceCertification as { readonly verificationStatus?: unknown }).verificationStatus)}'`,
+            );
+          }
+          if (
+            validatedSemCert.certificationId !== validatedCert.certificationId ||
+            validatedSemCert.claimedVerificationStatus !==
+              validatedCert.claimedVerificationStatus
+          ) {
+            throw new RangeError(
+              'contrastReport.independenceSemantics.independenceCertification is inconsistent with contrastReport.independenceCertification',
+            );
+          }
+        }
         if (
           rawSemantics.certificationTier !== undefined &&
           rawSemantics.certificationTier !== 'declared'

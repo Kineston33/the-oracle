@@ -1268,9 +1268,19 @@ describe('Stage 2A-2.3 — Dependence-Aware Multi-Method Aggregation & Forecast 
         verificationStatus: 'empirically-verified-orthogonal-residuals',
       };
 
-      // 1. Valid declared certification is preserved in diagnostics with certificationTier = 'declared'
-      // and declaredIndependentGroupCount = 2, while keeping statisticalIndependenceVerified = false
-      // and effectiveIndependentMethodCount = 1 (because no trusted authentication mechanism exists in Stage 2A-2.3):
+      // 1. Valid declared certification is preserved in diagnostics with certificationTier = 'declared',
+      // declaredIndependentGroupCount = 2, authoritative verificationStatus = 'declared-unverified-assertion',
+      // and caller-supplied status preserved in claimedVerificationStatus, while keeping
+      // statisticalIndependenceVerified = false and effectiveIndependentMethodCount = 1:
+      const expectedNormalizedCertification: StatisticalIndependenceCertification =
+        {
+          ...validCertification,
+          verificationStatus: 'declared-unverified-assertion',
+          claimedVerificationStatus:
+            'empirically-verified-orthogonal-residuals',
+          tier: 'declared',
+        };
+
       const declaredResult = synthesizeForecastDistribution({
         plan,
         methodOutputs: allFour,
@@ -1285,7 +1295,18 @@ describe('Stage 2A-2.3 — Dependence-Aware Multi-Method Aggregation & Forecast 
       ).toBe(1);
       expect(
         declaredResult.contrastReport.independenceCertification,
-      ).toEqual(validCertification);
+      ).toEqual(expectedNormalizedCertification);
+      expect(
+        declaredResult.contrastReport.independenceCertification
+          ?.verificationStatus,
+      ).toBe('declared-unverified-assertion');
+      expect(
+        declaredResult.contrastReport.independenceCertification
+          ?.claimedVerificationStatus,
+      ).toBe('empirically-verified-orthogonal-residuals');
+      expect(
+        declaredResult.contrastReport.independenceCertification?.tier,
+      ).toBe('declared');
       expect(
         declaredResult.contrastReport.independenceSemantics?.certificationTier,
       ).toBe('declared');
@@ -1304,37 +1325,61 @@ describe('Stage 2A-2.3 — Dependence-Aware Multi-Method Aggregation & Forecast 
       expect(
         declaredResult.contrastReport.independenceSemantics
           ?.independenceCertification,
-      ).toEqual(validCertification);
+      ).toEqual(expectedNormalizedCertification);
       expect(
         validateForecastDistributionContract(declaredResult),
       ).toBe(declaredResult);
       assertDeeplyFrozen(declaredResult);
 
-      // A self-declared verificationStatus string (whether 'empirically-verified-orthogonal-residuals',
-      // 'structurally-verified-disjoint-information-sets', or 'declared-unverified-assertion')
-      // cannot promote an unauthenticated certification into a verified independence claim:
-      const declaredWithExplicitUnverifiedStatus =
-        synthesizeForecastDistribution({
+      // 1b. Every caller-supplied verificationStatus value ('empirically-verified-orthogonal-residuals',
+      // 'structurally-verified-disjoint-information-sets', and 'declared-unverified-assertion')
+      // produces authoritative verificationStatus === 'declared-unverified-assertion', preserves
+      // claimedVerificationStatus, keeps tier === 'declared', and never elevates
+      // statisticalIndependenceVerified or effectiveIndependentMethodCount:
+      for (const suppliedStatus of INDEPENDENCE_CERTIFICATION_VERIFICATION_STATUSES) {
+        const res = synthesizeForecastDistribution({
           plan,
           methodOutputs: allFour,
           footingTier: 'methodologically-sound-moderate-evidence',
           independenceCertification: {
             ...validCertification,
-            verificationStatus: 'declared-unverified-assertion',
+            verificationStatus: suppliedStatus,
           },
         });
-      expect(
-        declaredWithExplicitUnverifiedStatus.contrastReport
-          .statisticalIndependenceVerified,
-      ).toBe(false);
-      expect(
-        declaredWithExplicitUnverifiedStatus.contrastReport
-          .effectiveIndependentMethodCount,
-      ).toBe(1);
-      expect(
-        declaredWithExplicitUnverifiedStatus.contrastReport
-          .independenceSemantics?.certificationTier,
-      ).toBe('declared');
+        expect(res.contrastReport.statisticalIndependenceVerified).toBe(false);
+        expect(res.contrastReport.effectiveIndependentMethodCount).toBe(1);
+        expect(res.contrastReport.independenceCertification?.tier).toBe(
+          'declared',
+        );
+        expect(
+          res.contrastReport.independenceCertification?.verificationStatus,
+        ).toBe('declared-unverified-assertion');
+        expect(
+          res.contrastReport.independenceCertification
+            ?.claimedVerificationStatus,
+        ).toBe(suppliedStatus);
+        expect(
+          res.contrastReport.independenceSemantics?.certificationTier,
+        ).toBe('declared');
+        expect(
+          res.contrastReport.independenceSemantics
+            ?.statisticalIndependenceVerified,
+        ).toBe(false);
+        expect(
+          res.contrastReport.independenceSemantics
+            ?.effectiveIndependentMethodCount,
+        ).toBe(1);
+        expect(
+          res.contrastReport.independenceSemantics?.independenceCertification
+            ?.verificationStatus,
+        ).toBe('declared-unverified-assertion');
+        expect(
+          res.contrastReport.independenceSemantics?.independenceCertification
+            ?.claimedVerificationStatus,
+        ).toBe(suppliedStatus);
+        expect(validateForecastDistributionContract(res)).toBe(res);
+        assertDeeplyFrozen(res);
+      }
 
       // 2. Rejects unsupported attempts to promote a declared certification to 'verified'
       // via tier: 'verified', statisticalIndependenceVerified: true, or verifiedIndependentMethodCount:
@@ -1370,7 +1415,8 @@ describe('Stage 2A-2.3 — Dependence-Aware Multi-Method Aggregation & Forecast 
         }),
       ).toThrow(/verifiedIndependentMethodCount cannot be supplied in Stage 2A-2\.3/);
 
-      // 2b. validateForecastDistributionContract also rejects forged verified independence claims on contracts:
+      // 2b. validateForecastDistributionContract also rejects forged verified independence claims
+      // or contradictory verification semantics on contracts:
       expect(() =>
         validateForecastDistributionContract({
           ...declaredResult,
@@ -1416,6 +1462,76 @@ describe('Stage 2A-2.3 — Dependence-Aware Multi-Method Aggregation & Forecast 
           },
         }),
       ).toThrow(/declaredIndependentGroupCount \(3\) does not match certifiedIndependentGroups\.length \(2\)/);
+
+      expect(() =>
+        validateForecastDistributionContract({
+          ...declaredResult,
+          contrastReport: {
+            ...declaredResult.contrastReport,
+            independenceCertification: {
+              ...declaredResult.contrastReport.independenceCertification!,
+              verificationStatus: 'empirically-verified-orthogonal-residuals',
+            },
+          },
+        }),
+      ).toThrow(
+        /contrastReport\.independenceCertification\.verificationStatus must be 'declared-unverified-assertion'/,
+      );
+
+      expect(() =>
+        validateForecastDistributionContract({
+          ...declaredResult,
+          contrastReport: {
+            ...declaredResult.contrastReport,
+            independenceSemantics: {
+              ...declaredResult.contrastReport.independenceSemantics!,
+              independenceCertification: {
+                ...declaredResult.contrastReport.independenceSemantics!
+                  .independenceCertification!,
+                verificationStatus: 'empirically-verified-orthogonal-residuals',
+              },
+            },
+          },
+        }),
+      ).toThrow(
+        /contrastReport\.independenceSemantics\.independenceCertification\.verificationStatus must be 'declared-unverified-assertion'/,
+      );
+
+      expect(() =>
+        validateForecastDistributionContract({
+          ...declaredResult,
+          contrastReport: {
+            ...declaredResult.contrastReport,
+            independenceSemantics: {
+              ...declaredResult.contrastReport.independenceSemantics!,
+              independenceCertification: {
+                ...declaredResult.contrastReport.independenceSemantics!
+                  .independenceCertification!,
+                claimedVerificationStatus:
+                  'structurally-verified-disjoint-information-sets',
+              },
+            },
+          },
+        }),
+      ).toThrow(
+        /contrastReport\.independenceSemantics\.independenceCertification is inconsistent with contrastReport\.independenceCertification/,
+      );
+
+      expect(() =>
+        synthesizeForecastDistribution({
+          plan,
+          methodOutputs: allFour,
+          footingTier: 'methodologically-sound-moderate-evidence',
+          independenceCertification: {
+            ...validCertification,
+            verificationStatus: 'empirically-verified-orthogonal-residuals',
+            claimedVerificationStatus:
+              'structurally-verified-disjoint-information-sets',
+          },
+        }),
+      ).toThrow(
+        /claimedVerificationStatus .* conflicts with caller-supplied verificationStatus/,
+      );
 
       // 3. Rejects empty or whitespace-padded certificationId, evidenceReference, or methodologicalJustification:
       expect(() =>

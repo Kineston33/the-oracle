@@ -467,7 +467,22 @@ export interface StatisticalIndependenceCertification {
   readonly certifiedIndependentGroups: readonly CertifiedIndependentMethodGroup[];
   readonly certifiedRelationships: readonly CertifiedIndependenceRelationship[];
   readonly methodologicalJustification: string;
+  /**
+   * Effective, authoritative verification status of this certification record.
+   * Whenever no trusted verification authority authenticates the certification
+   * at runtime (including throughout Stage 2A-2.3), the authoritative
+   * `verificationStatus` is forced to `'declared-unverified-assertion'` so
+   * downstream consumers never mistake a declared assertion for a verified result.
+   */
   readonly verificationStatus: IndependenceCertificationVerificationStatus;
+  /**
+   * Untrusted caller-supplied verification status claim preserved for audit
+   * provenance only. This field records what the caller asserted (for example,
+   * `'empirically-verified-orthogonal-residuals'` or
+   * `'structurally-verified-disjoint-information-sets'`), and MUST NOT be
+   * interpreted as an authenticated or runtime-verified independence result.
+   */
+  readonly claimedVerificationStatus?: IndependenceCertificationVerificationStatus;
   /**
    * Explicit distinction between a caller-supplied structured assertion
    * (`'declared'`) and a certification authenticated by a trusted runtime
@@ -895,6 +910,31 @@ export function validateStatisticalIndependenceCertification(
     );
   }
 
+  let claimedVerificationStatus: IndependenceCertificationVerificationStatus =
+    verificationStatus as IndependenceCertificationVerificationStatus;
+  if (value.claimedVerificationStatus !== undefined) {
+    if (
+      typeof value.claimedVerificationStatus !== 'string' ||
+      !INDEPENDENCE_CERTIFICATION_VERIFICATION_STATUSES.includes(
+        value.claimedVerificationStatus as IndependenceCertificationVerificationStatus,
+      )
+    ) {
+      throw new RangeError(
+        `independenceCertification.claimedVerificationStatus must be one of [${INDEPENDENCE_CERTIFICATION_VERIFICATION_STATUSES.join(', ')}], received '${String(value.claimedVerificationStatus)}'`,
+      );
+    }
+    if (
+      verificationStatus !== 'declared-unverified-assertion' &&
+      verificationStatus !== value.claimedVerificationStatus
+    ) {
+      throw new RangeError(
+        `independenceCertification.claimedVerificationStatus ('${value.claimedVerificationStatus}') conflicts with caller-supplied verificationStatus ('${verificationStatus}')`,
+      );
+    }
+    claimedVerificationStatus =
+      value.claimedVerificationStatus as IndependenceCertificationVerificationStatus;
+  }
+
   if (
     !Array.isArray(value.participatingMethodIds) ||
     value.participatingMethodIds.length < 2
@@ -1149,8 +1189,8 @@ export function validateStatisticalIndependenceCertification(
     certifiedIndependentGroups: Object.freeze(validatedGroups),
     certifiedRelationships: Object.freeze(validatedRelationships),
     methodologicalJustification,
-    verificationStatus:
-      verificationStatus as IndependenceCertificationVerificationStatus,
+    verificationStatus: 'declared-unverified-assertion' as const,
+    claimedVerificationStatus,
     tier: 'declared' as const,
   });
 }

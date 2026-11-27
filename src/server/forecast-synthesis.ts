@@ -1597,7 +1597,7 @@ export function synthesizeForecastDistribution(
 
   if (validatedIndependenceCertification !== undefined) {
     addLimitation(
-      `Declared independence certification ('${validatedIndependenceCertification.certificationId}', declared status: '${validatedIndependenceCertification.verificationStatus}', ${validatedIndependenceCertification.certifiedIndependentGroups.length} declared independent groups) was structurally validated and recorded with tier = 'declared'. Because no trusted runtime certification-verification mechanism exists in Stage 2A-2.3 to authenticate external evidence references, statisticalIndependenceVerified remains false and effectiveIndependentMethodCount remains 1.`,
+      `Declared independence certification ('${validatedIndependenceCertification.certificationId}', authoritative verificationStatus = '${validatedIndependenceCertification.verificationStatus}', caller claimedVerificationStatus = '${validatedIndependenceCertification.claimedVerificationStatus ?? validatedIndependenceCertification.verificationStatus}', ${validatedIndependenceCertification.certifiedIndependentGroups.length} declared independent groups) was structurally validated and recorded with tier = 'declared'. Because no trusted runtime certification-verification mechanism exists in Stage 2A-2.3 to authenticate external evidence references, statisticalIndependenceVerified remains false and effectiveIndependentMethodCount remains 1.`,
     );
   }
 
@@ -1624,7 +1624,7 @@ export function synthesizeForecastDistribution(
     effectiveIndependentMethodCount,
     explanation:
       validatedIndependenceCertification !== undefined
-        ? `Independence certification '${validatedIndependenceCertification.certificationId}' (${validatedIndependenceCertification.certifiedIndependentGroups.length} declared independent group(s)) is recorded as tier 'declared' (not authenticated by a trusted runtime verification mechanism); statisticalIndependenceVerified remains false and effectiveIndependentMethodCount is conservatively fixed at 1.`
+        ? `Independence certification '${validatedIndependenceCertification.certificationId}' (${validatedIndependenceCertification.certifiedIndependentGroups.length} declared independent group(s), caller claimedVerificationStatus = '${validatedIndependenceCertification.claimedVerificationStatus ?? validatedIndependenceCertification.verificationStatus}') is recorded as tier 'declared' with authoritative verificationStatus 'declared-unverified-assertion' (not authenticated by a trusted runtime verification mechanism); statisticalIndependenceVerified remains false and effectiveIndependentMethodCount is conservatively fixed at 1.`
         : `Statistical independence across the ${eligibleEvidenceMethodIds.length} participating evidence-driven method(s) (${weightingPolicy.evidenceConnectedComponentCount} declared dependence component(s)) is not established; effectiveIndependentMethodCount is conservatively fixed at 1 so correlated or unverified methods are never counted as multiple independent votes.`,
   });
 
