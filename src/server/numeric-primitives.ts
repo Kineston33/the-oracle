@@ -3817,6 +3817,43 @@ function validateAndNormalizeEnsembleWeights(
   return normalized;
 }
 
+function createWeightedMixtureDualChannelProbability(
+  logWeightedProbs: readonly number[],
+  logWeightedComps: readonly number[],
+): DualChannelProbability {
+  const rawLogPBar = logSumExp(logWeightedProbs);
+  const rawLogQBar = logSumExp(logWeightedComps);
+  // In a linear pool p_bar = sum_m w_m p_m, evaluating logSumExp(log w_m + log(1 - p_m))
+  // when p_bar < 0.5 cancels O(1) log(w_m) against +log(sum w_m) near 0 (losing ~|log w| / p_bar ULPs).
+  // Conversely, whichever of (rawLogPBar, rawLogQBar) is smaller lies in [-Infinity, -ln(2)]
+  // and is free of near-zero cancellation, so deriving the larger channel via log1mexp(smallLog)
+  // preserves full 53-bit precision and 0-ULP complementary coherence [IME / ANC].
+  let logPBar: number;
+  let logQBar: number;
+  if (rawLogPBar <= rawLogQBar) {
+    logPBar = Math.min(-Math.LN2, rawLogPBar);
+    logQBar = log1mexp(logPBar);
+    if (
+      logQBar === 0 &&
+      logPBar > LN_ROUND_TO_ZERO_THRESHOLD_BINARY64 &&
+      Math.exp(logPBar) > 0
+    ) {
+      logQBar = -Number.MIN_VALUE;
+    }
+  } else {
+    logQBar = Math.min(-Math.LN2, rawLogQBar);
+    logPBar = log1mexp(logQBar);
+    if (
+      logPBar === 0 &&
+      logQBar > LN_ROUND_TO_ZERO_THRESHOLD_BINARY64 &&
+      Math.exp(logQBar) > 0
+    ) {
+      logPBar = -Number.MIN_VALUE;
+    }
+  }
+  return createDualChannelProbabilityFromPair(logPBar, logQBar);
+}
+
 /**
  * Computes the exact three-way orthogonal variance decomposition for outcome
  * category `k` across a weighted ensemble of methods [IME]:
@@ -3884,9 +3921,10 @@ export function decomposeCategoryUncertainty(
     }
   }
 
-  const logPBar = logSumExp(logWeightedProbs);
-  const logQBar = logSumExp(logWeightedComps);
-  const predictiveProbability = createDualChannelProbabilityFromPair(logPBar, logQBar);
+  const predictiveProbability = createWeightedMixtureDualChannelProbability(
+    logWeightedProbs,
+    logWeightedComps,
+  );
   const validatedParametricInterval = validateParametricIntervalField(
     parametricInterval,
     predictiveProbability,
@@ -4007,9 +4045,9 @@ export function decomposeEnsembleEntropy(
         logCompsK.push(logW + entry.logComplementProbability);
       }
     }
-    computedMixture[k] = createDualChannelProbabilityFromPair(
-      logSumExp(logProbsK),
-      logSumExp(logCompsK),
+    computedMixture[k] = createWeightedMixtureDualChannelProbability(
+      logProbsK,
+      logCompsK,
     );
   }
 
@@ -4407,13 +4445,19 @@ export function validateForecastDistributionContract(
 
   const outcomeSpace = validateOutcomeSpaceDescriptor(cand.outcomeSpace);
   const outcomeCount = outcomeSpace.outcomeLabels.length;
-  const outcomes = validateExhaustiveDistribution(cand.outcomes, outcomeCount);
 
   const footingTier = cand.footingTier as EvidentialFootingTier;
   const calibrationStatus = cand.calibrationStatus as CalibrationVerificationStatus;
   assertCalibrationHonesty(footingTier, calibrationStatus);
 
+  const isAbstaining = footingTier === 'insufficient-basis-abstain';
+
   if (cand.abstentionReason !== undefined) {
+    if (!isAbstaining) {
+      throw new RangeError(
+        `ForecastDistributionOutput with non-abstaining footingTier '${footingTier}' must not include abstentionReason ('${String(cand.abstentionReason)}')`,
+      );
+    }
     if (
       typeof cand.abstentionReason !== 'string' ||
       !ABSTENTION_REASONS.includes(cand.abstentionReason as AbstentionReason)
@@ -4422,7 +4466,7 @@ export function validateForecastDistributionContract(
         `Invalid ForecastDistributionOutput.abstentionReason: ${String(cand.abstentionReason)}`,
       );
     }
-  } else if (footingTier === 'insufficient-basis-abstain') {
+  } else if (isAbstaining) {
     throw new RangeError(
       "ForecastDistributionOutput with footingTier 'insufficient-basis-abstain' requires an abstentionReason",
     );
@@ -4464,9 +4508,9 @@ export function validateForecastDistributionContract(
   }
 
   const executedMethodIds = contrastReport.executedMethodIds;
-  if (!Array.isArray(executedMethodIds) || executedMethodIds.length === 0) {
+  if (!Array.isArray(executedMethodIds)) {
     throw new RangeError(
-      'ForecastDistributionOutput.contrastReport.executedMethodIds must be a non-empty array',
+      'ForecastDistributionOutput.contrastReport.executedMethodIds must be an array',
     );
   }
   const executedSet = new Set<string>();
@@ -4516,44 +4560,186 @@ export function validateForecastDistributionContract(
       'ForecastDistributionOutput.contrastReport.weightsByMethod must be a non-null object',
     );
   }
-  const weightKeys = Object.keys(weightsByMethod);
-  if (weightKeys.length !== executedSet.size) {
-    throw new RangeError(
-      `weightsByMethod key count (${weightKeys.length}) must match executedMethodIds count (${executedSet.size})`,
-    );
-  }
-  const orderedWeights: number[] = [];
-  for (const id of executedSet) {
-    if (!Object.prototype.hasOwnProperty.call(weightsByMethod, id)) {
-      throw new RangeError(`weightsByMethod is missing weight for executed method '${id}'`);
-    }
-    orderedWeights.push(weightsByMethod[id] as number);
-  }
-  validateAndNormalizeEnsembleWeights(
-    orderedWeights,
-    'validateForecastDistributionContract[weightsByMethod]',
-  );
 
   const effectiveIndependentMethodCount = contrastReport.effectiveIndependentMethodCount;
   if (
     typeof effectiveIndependentMethodCount !== 'number' ||
     !Number.isFinite(effectiveIndependentMethodCount) ||
-    Number.isNaN(effectiveIndependentMethodCount) ||
-    effectiveIndependentMethodCount < 1 - 1e-12 ||
-    effectiveIndependentMethodCount > executedSet.size + 1e-12
+    Number.isNaN(effectiveIndependentMethodCount)
   ) {
     throw new RangeError(
-      `contrastReport.effectiveIndependentMethodCount (${String(effectiveIndependentMethodCount)}) must lie in [1, ${executedSet.size}]`,
+      `contrastReport.effectiveIndependentMethodCount must be a finite number, received ${String(effectiveIndependentMethodCount)}`,
     );
   }
 
   const categoryDecompositions = contrastReport.categoryDecompositions as
     | readonly CategoryUncertaintyDecomposition[]
     | undefined;
+  if (!Array.isArray(categoryDecompositions)) {
+    throw new RangeError(
+      'ForecastDistributionOutput.contrastReport.categoryDecompositions must be an array',
+    );
+  }
+
+  if (isAbstaining) {
+    if (!Array.isArray(cand.outcomes) || cand.outcomes.length !== 0) {
+      throw new RangeError(
+        "ForecastDistributionOutput with footingTier 'insufficient-basis-abstain' must have an empty outcomes array [] (never fabricate a distribution on abstention)",
+      );
+    }
+    if (executedSet.size !== 0) {
+      throw new RangeError(
+        "ForecastDistributionOutput with footingTier 'insufficient-basis-abstain' must have executedMethodIds = []",
+      );
+    }
+    if (
+      contrastReport.ensembleContributingMethodIds !== undefined &&
+      (!Array.isArray(contrastReport.ensembleContributingMethodIds) ||
+        contrastReport.ensembleContributingMethodIds.length !== 0)
+    ) {
+      throw new RangeError(
+        "ForecastDistributionOutput with footingTier 'insufficient-basis-abstain' must have ensembleContributingMethodIds = []",
+      );
+    }
+    if (
+      contrastReport.referenceOnlyMethodIds !== undefined &&
+      (!Array.isArray(contrastReport.referenceOnlyMethodIds) ||
+        contrastReport.referenceOnlyMethodIds.length !== 0)
+    ) {
+      throw new RangeError(
+        "ForecastDistributionOutput with footingTier 'insufficient-basis-abstain' must have referenceOnlyMethodIds = []",
+      );
+    }
+    if (Object.keys(weightsByMethod).length !== 0) {
+      throw new RangeError(
+        "ForecastDistributionOutput with footingTier 'insufficient-basis-abstain' must have empty weightsByMethod = {}",
+      );
+    }
+    if (effectiveIndependentMethodCount !== 0) {
+      throw new RangeError(
+        `ForecastDistributionOutput with footingTier 'insufficient-basis-abstain' must have effectiveIndependentMethodCount === 0, received ${effectiveIndependentMethodCount}`,
+      );
+    }
+    if (categoryDecompositions.length !== 0) {
+      throw new RangeError(
+        "ForecastDistributionOutput with footingTier 'insufficient-basis-abstain' must have empty categoryDecompositions = []",
+      );
+    }
+    if (contrastReport.entropyDecomposition !== null) {
+      throw new RangeError(
+        "ForecastDistributionOutput with footingTier 'insufficient-basis-abstain' must have entropyDecomposition === null",
+      );
+    }
+    return value as ForecastDistributionOutput;
+  }
+
+  const outcomes = validateExhaustiveDistribution(cand.outcomes, outcomeCount);
+
+  if (executedSet.size === 0) {
+    throw new RangeError(
+      'ForecastDistributionOutput.contrastReport.executedMethodIds must be a non-empty array for non-abstaining forecasts',
+    );
+  }
+
+  let ensembleSet = executedSet;
   if (
-    !Array.isArray(categoryDecompositions) ||
-    categoryDecompositions.length !== outcomeCount
+    contrastReport.ensembleContributingMethodIds !== undefined ||
+    contrastReport.referenceOnlyMethodIds !== undefined
   ) {
+    const rawEnsemble = contrastReport.ensembleContributingMethodIds;
+    const rawRefOnly = contrastReport.referenceOnlyMethodIds ?? [];
+    if (!Array.isArray(rawEnsemble) || rawEnsemble.length === 0) {
+      throw new RangeError(
+        'contrastReport.ensembleContributingMethodIds must be a non-empty array for non-abstaining forecasts',
+      );
+    }
+    if (!Array.isArray(rawRefOnly)) {
+      throw new RangeError(
+        'contrastReport.referenceOnlyMethodIds must be an array when provided',
+      );
+    }
+    const ensSet = new Set<string>();
+    for (let i = 0; i < rawEnsemble.length; i++) {
+      const id = rawEnsemble[i];
+      if (typeof id !== 'string' || !executedSet.has(id) || ensSet.has(id)) {
+        throw new RangeError(
+          `contrastReport.ensembleContributingMethodIds[${i}] ('${String(id)}') must be a unique member of executedMethodIds`,
+        );
+      }
+      ensSet.add(id);
+    }
+    const refSet = new Set<string>();
+    for (let i = 0; i < rawRefOnly.length; i++) {
+      const id = rawRefOnly[i];
+      if (
+        typeof id !== 'string' ||
+        !executedSet.has(id) ||
+        ensSet.has(id) ||
+        refSet.has(id)
+      ) {
+        throw new RangeError(
+          `contrastReport.referenceOnlyMethodIds[${i}] ('${String(id)}') must be a unique member of executedMethodIds disjoint from ensembleContributingMethodIds`,
+        );
+      }
+      refSet.add(id);
+    }
+    if (ensSet.size + refSet.size !== executedSet.size) {
+      throw new RangeError(
+        `ensembleContributingMethodIds (${ensSet.size}) and referenceOnlyMethodIds (${refSet.size}) must partition executedMethodIds (${executedSet.size})`,
+      );
+    }
+    ensembleSet = ensSet;
+  }
+
+  const weightKeys = Object.keys(weightsByMethod);
+  if (weightKeys.length !== ensembleSet.size) {
+    throw new RangeError(
+      `weightsByMethod key count (${weightKeys.length}) must match participating ensemble method count (${ensembleSet.size})`,
+    );
+  }
+  const orderedWeights: number[] = [];
+  for (const id of ensembleSet) {
+    if (!Object.prototype.hasOwnProperty.call(weightsByMethod, id)) {
+      throw new RangeError(`weightsByMethod is missing weight for participating method '${id}'`);
+    }
+    const w = weightsByMethod[id] as number;
+    if (typeof w !== 'number' || !Number.isFinite(w) || Number.isNaN(w) || w <= 0 || w > 1) {
+      throw new RangeError(
+        `weightsByMethod['${id}'] must be a strictly positive finite weight in (0, 1], received ${String(w)}`,
+      );
+    }
+    orderedWeights.push(w);
+  }
+  validateAndNormalizeEnsembleWeights(
+    orderedWeights,
+    'validateForecastDistributionContract[weightsByMethod]',
+  );
+
+  if (footingTier === 'structural-symmetry-baseline-only') {
+    if (effectiveIndependentMethodCount !== 0) {
+      throw new RangeError(
+        `ForecastDistributionOutput with footingTier 'structural-symmetry-baseline-only' must have effectiveIndependentMethodCount === 0 (zero empirical evidence), received ${effectiveIndependentMethodCount}`,
+      );
+    }
+  } else {
+    const independenceVerified = contrastReport.statisticalIndependenceVerified === true;
+    if (!independenceVerified) {
+      if (Math.abs(effectiveIndependentMethodCount - 1) > 1e-12) {
+        throw new RangeError(
+          `contrastReport.effectiveIndependentMethodCount (${String(effectiveIndependentMethodCount)}) must equal 1 when statisticalIndependenceVerified is not true`,
+        );
+      }
+    } else if (
+      effectiveIndependentMethodCount < 1 - 1e-12 ||
+      effectiveIndependentMethodCount > ensembleSet.size + 1e-12
+    ) {
+      throw new RangeError(
+        `contrastReport.effectiveIndependentMethodCount (${String(effectiveIndependentMethodCount)}) must lie in [1, ${ensembleSet.size}]`,
+      );
+    }
+  }
+
+  if (categoryDecompositions.length !== outcomeCount) {
     throw new RangeError(
       'ForecastDistributionOutput.contrastReport.categoryDecompositions must match outcomeSpace.outcomeLabels.length',
     );
@@ -4565,14 +4751,14 @@ export function validateForecastDistributionContract(
       k,
       outcomeSpace.outcomeLabels[k]!,
       outcomes[k]!,
-      executedSet.size,
+      ensembleSet.size,
     );
   }
 
   validateEntropyDecomposition(
     contrastReport.entropyDecomposition,
     outcomes,
-    executedSet.size,
+    ensembleSet.size,
   );
 
   return value as ForecastDistributionOutput;

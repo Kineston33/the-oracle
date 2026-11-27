@@ -95,6 +95,14 @@ export {
   type UnimplementedScientificMethodId,
   type WeightedKishExecutionInput,
 } from './method-execution.ts';
+export {
+  EVIDENCE_DRIVEN_FOOTING_TIERS,
+  FORECAST_SYNTHESIS_VERSION,
+  assertCanonicalOutcomeSpaceEquality,
+  computeDependenceAwareMethodWeights,
+  synthesizeForecastDistribution,
+  type ForecastSynthesisInput,
+} from './forecast-synthesis.ts';
 
 export interface StartOracleServerOptions {
   /**

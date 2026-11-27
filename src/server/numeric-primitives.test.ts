@@ -1985,6 +1985,56 @@ describe('Stage 2A-1 — Numeric Primitives & Forecast Contracts (v4.4.3)', () =
           calibrationStatus: 'unverified-no-out-of-sample-evaluation',
         }),
       ).toThrow(RangeError);
+
+      // (j) Valid honest abstention contract vs rejected fabricated distribution on abstention
+      const validAbstention = validateForecastDistributionContract({
+        questionCategory: 'geopolitics',
+        outcomeSpace: validBinarySpace,
+        footingTier: 'insufficient-basis-abstain',
+        calibrationStatus: 'unverified-no-out-of-sample-evaluation',
+        abstentionReason: 'no-defensible-theoretical-or-empirical-basis',
+        outcomes: [],
+        contrastReport: {
+          executedMethodIds: [],
+          ensembleContributingMethodIds: [],
+          referenceOnlyMethodIds: [],
+          discardedMethods: [],
+          weightsByMethod: {},
+          effectiveIndependentMethodCount: 0,
+          entropyDecomposition: null,
+          categoryDecompositions: [],
+        },
+        epistemologicalClaims: [
+          {
+            kind: 'operational-design-heuristic',
+            tag: 'HDO',
+            statement: 'Honest abstention without fabricated probabilities',
+          },
+        ],
+        methodologicalLimitations: ['No applicable executable method'],
+      });
+      expect(validAbstention.outcomes).toEqual([]);
+      expect(validAbstention.contrastReport.entropyDecomposition).toBeNull();
+
+      // Rejects fabricated probabilities on abstention
+      expect(() =>
+        validateForecastDistributionContract({
+          ...validAbstention,
+          outcomes: [pYes, pNo],
+        }),
+      ).toThrow(RangeError);
+
+      // Rejects structural-symmetry-baseline-only claiming effectiveIndependentMethodCount > 0
+      expect(() =>
+        validateForecastDistributionContract({
+          ...validForecastContract,
+          footingTier: 'structural-symmetry-baseline-only',
+          contrastReport: {
+            ...validForecastContract.contrastReport,
+            effectiveIndependentMethodCount: 1,
+          },
+        }),
+      ).toThrow(RangeError);
     });
   });
 });

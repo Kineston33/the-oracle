@@ -32,6 +32,7 @@
 
 import { isValidIsoDateTime, parseIsoDateTimeMs } from '../data/publication.ts';
 import type { IsoDateTime, PredictionCategory } from '../data/types.ts';
+import type { MethodDependenceDiagnostics } from './method-selection.ts';
 
 /* -------------------------------------------------------------------------
    1. Epistemological Classification of Claims & Formulas
@@ -243,7 +244,8 @@ export type ParametricCredibleIntervalOmissionReason =
   | 'point-mass-structural-baseline'
   | 'unidentifiable-concentration-parameter'
   | 'degenerate-zero-exposure-or-sample'
-  | 'method-produces-point-estimate-only';
+  | 'method-produces-point-estimate-only'
+  | 'multi-method-mixture-interval-not-available';
 
 export const PARAMETRIC_INTERVAL_OMISSION_REASONS: readonly ParametricCredibleIntervalOmissionReason[] =
   Object.freeze([
@@ -251,6 +253,7 @@ export const PARAMETRIC_INTERVAL_OMISSION_REASONS: readonly ParametricCredibleIn
     'unidentifiable-concentration-parameter',
     'degenerate-zero-exposure-or-sample',
     'method-produces-point-estimate-only',
+    'multi-method-mixture-interval-not-available',
   ]);
 
 /**
@@ -396,12 +399,62 @@ export interface ScientificMethodOutput {
   readonly warnings: readonly string[];
 }
 
+export interface UnexecutedApplicableMethodReport {
+  readonly methodId: ScientificMethodId;
+  readonly disposition: 'applicable' | 'applicable-with-limitations';
+  readonly implementationStatus: string;
+  readonly reason: string;
+}
+
+export interface DependenceComponentWeightAllocation {
+  readonly componentId: string;
+  readonly correlationGroupIds: readonly string[];
+  readonly isSingletonUnlinked: boolean;
+  readonly memberMethodIds: readonly ScientificMethodId[];
+  readonly componentWeight: number;
+  readonly weightPerMethod: Readonly<Record<string, number>>;
+}
+
+export type MethodWeightingPolicyId =
+  | 'equal-component-then-equal-within-component-hdo'
+  | 'single-evidence-method-unit-weight'
+  | 'structural-baseline-standalone-unit-weight'
+  | 'custom-explicit-weights-hdo'
+  | 'abstention-no-weights';
+
+export interface MethodWeightingPolicyReport {
+  readonly policyId: MethodWeightingPolicyId;
+  readonly epistemologicalTag: 'HDO' | 'IME';
+  readonly rationale: string;
+  readonly evidenceConnectedComponentCount: number;
+  readonly componentAllocations: readonly DependenceComponentWeightAllocation[];
+}
+
+export interface EffectiveIndependenceAssessment {
+  readonly executedMethodCount: number;
+  readonly ensembleContributingMethodCount: number;
+  readonly referenceOnlyMethodCount: number;
+  readonly declaredEvidenceComponentCount: number;
+  readonly statisticalIndependenceVerified: boolean;
+  readonly effectiveIndependentMethodCount: number;
+  readonly explanation: string;
+}
+
 export interface MultiMethodContrastReport {
   readonly executedMethodIds: readonly ScientificMethodId[];
+  readonly ensembleContributingMethodIds?: readonly ScientificMethodId[];
+  readonly referenceOnlyMethodIds?: readonly ScientificMethodId[];
+  readonly referenceOnlyMethodOutputs?: readonly ScientificMethodOutput[];
+  readonly unexecutedApplicableMethods?: readonly UnexecutedApplicableMethodReport[];
+  readonly deferredMethods?: readonly MethodApplicabilityResult[];
   readonly discardedMethods: readonly MethodApplicabilityResult[];
   readonly weightsByMethod: Readonly<Record<string, number>>;
+  readonly weightingPolicy?: MethodWeightingPolicyReport;
+  readonly dependenceDiagnostics?: MethodDependenceDiagnostics;
+  readonly statisticalIndependenceVerified?: boolean;
   readonly effectiveIndependentMethodCount: number;
-  readonly entropyDecomposition: EntropyDecomposition;
+  readonly independenceSemantics?: EffectiveIndependenceAssessment;
+  readonly entropyDecomposition: EntropyDecomposition | null;
   readonly categoryDecompositions: readonly CategoryUncertaintyDecomposition[];
 }
 
