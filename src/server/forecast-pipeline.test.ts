@@ -11,12 +11,15 @@ import {
   PIPELINE_EXECUTION_STATUSES,
   PIPELINE_FORECAST_KINDS,
   STRUCTURAL_SYMMETRY_BASIS_KINDS,
+  createTrustedCombinationVerifier,
   createTrustedEvidenceVerifier,
+  createTrustedStructuralSymmetryVerifier,
   executeScientificMethod,
   runScientificForecastPipeline,
   validateStructuralSymmetryContract,
   type BinaryHistoricalObservationRecord,
   type ForecastPipelineRequest,
+  type MultiSourceCombinationVerifier,
   type MultinomialHistoricalObservationRecord,
   type PoissonEventObservationRecord,
   type StatisticalIndependenceCertification,
@@ -74,6 +77,28 @@ const TRUSTED_VERIFIER = createTrustedEvidenceVerifier({
         : `Rejected test fixture '${submission.evidenceId}': missing verified empirical attestation.`,
     };
   },
+});
+
+const TRUSTED_SYMMETRY_VERIFIER = createTrustedStructuralSymmetryVerifier({
+  verifierId: 'oracle-institutional-symmetry-verifier-v1',
+  verificationArtifactRef: 'audit://oracle/2026/verified-symmetry-registry',
+  approvedDerivationReferences: [
+    'audit://oracle/2026/symmetry/z2-exchange-derivation',
+    'audit://oracle/2026/symmetry/c3-rotor',
+  ],
+});
+
+const TRUSTED_COMBINATION_VERIFIER = createTrustedCombinationVerifier({
+  verifierId: 'oracle-institutional-combination-verifier-v1',
+  verificationArtifactRef: 'audit://oracle/2026/verified-combination-registry',
+  verifyCombination: ({ contributingEvidenceIds, justification }) => ({
+    verified:
+      justification !== undefined &&
+      contributingEvidenceIds.length >= 2 &&
+      justification.disjointPopulationsOrWindowsVerified &&
+      justification.homogeneousParameterSpaceVerified,
+    rationale: `Authenticated disjoint multi-source combination [${contributingEvidenceIds.join(', ')}] via trusted combination registry.`,
+  }),
 });
 
 function jsonResponse(body: unknown, status = 200): Response {
@@ -208,6 +233,8 @@ describe('Stage 2B-1 — End-to-End Scientific Forecast Pipeline Integration (sr
     ]);
     expect(typeof runScientificForecastPipeline).toBe('function');
     expect(typeof createTrustedEvidenceVerifier).toBe('function');
+    expect(typeof createTrustedStructuralSymmetryVerifier).toBe('function');
+    expect(typeof createTrustedCombinationVerifier).toBe('function');
   });
 
   it('1. executes the complete pipeline end-to-end with harvested documentary evidence and independently verified structured quantitative evidence', async () => {
@@ -374,7 +401,8 @@ describe('Stage 2B-1 — End-to-End Scientific Forecast Pipeline Integration (sr
       ),
     ).toBe(true);
 
-    const structuralOnly = await runScientificForecastPipeline({
+    // Formally valid symmetry contract WITHOUT a trusted symmetryVerifier fails closed to honest-abstention:
+    const unverifiedStructuralAbstained = await runScientificForecastPipeline({
       question:
         'Which symmetric coin face will show in the fair calibration draw before 2029 according to NIST?',
       questionCategory: 'science',
@@ -391,6 +419,38 @@ describe('Stage 2B-1 — End-to-End Scientific Forecast Pipeline Integration (sr
       structuralSymmetryContract: SYMMETRIC_Z2_CONTRACT,
     });
 
+    expect(unverifiedStructuralAbstained.pipelineStatus).toBe(
+      'honest-abstention',
+    );
+    expect(unverifiedStructuralAbstained.forecastKind).toBe('abstained');
+    expect(unverifiedStructuralAbstained.probabilityDistribution).toBeNull();
+    expect(unverifiedStructuralAbstained.executedMethodIds).toEqual([]);
+    expect(
+      unverifiedStructuralAbstained.evidenceAssessment
+        .structuralSymmetryVerification?.status,
+    ).toBe('rejected-no-trusted-verifier');
+
+    // With a trusted server-side symmetryVerifier, structural-uniform-baseline executes:
+    const structuralOnly = await runScientificForecastPipeline(
+      {
+        question:
+          'Which symmetric coin face will show in the fair calibration draw before 2029 according to NIST?',
+        questionCategory: 'science',
+        subdomain: 'binary-event-occurrence',
+        outcomeSpace: SYMMETRIC_COIN_OUTCOME_SPACE,
+        referenceTime: REFERENCE_TIME,
+        harvestOptions: {
+          providers: ['openalex'],
+          fetchImpl: emptyFetch,
+        },
+        assumptions: {
+          allowStructuralBaseline: true,
+        },
+        structuralSymmetryContract: SYMMETRIC_Z2_CONTRACT,
+      },
+      { symmetryVerifier: TRUSTED_SYMMETRY_VERIFIER },
+    );
+
     expect(structuralOnly.pipelineStatus).toBe('structural-baseline-forecast');
     expect(structuralOnly.forecastKind).toBe('structural-baseline-only');
     expect(structuralOnly.isEmpiricalForecast).toBe(false);
@@ -400,6 +460,9 @@ describe('Stage 2B-1 — End-to-End Scientific Forecast Pipeline Integration (sr
     expect(structuralOnly.executedMethodIds).toEqual([
       'structural-uniform-baseline',
     ]);
+    expect(
+      structuralOnly.evidenceAssessment.structuralSymmetryVerification?.status,
+    ).toBe('verified');
     expect(
       structuralOnly.independenceSemantics?.effectiveIndependentMethodCount,
     ).toBe(0);
@@ -717,7 +780,10 @@ describe('Stage 2B-1 — End-to-End Scientific Forecast Pipeline Integration (sr
           },
         ],
       },
-      { evidenceVerifier: TRUSTED_VERIFIER },
+      {
+        evidenceVerifier: TRUSTED_VERIFIER,
+        symmetryVerifier: TRUSTED_SYMMETRY_VERIFIER,
+      },
     );
 
     expect(result.pipelineStatus).toBe('successful-empirical-forecast');
@@ -2647,6 +2713,37 @@ describe('Stage 2B-1 — End-to-End Scientific Forecast Pipeline Integration (sr
       });
       expect(withoutOptIn.pipelineStatus).toBe('honest-abstention');
       expect(withoutOptIn.probabilityDistribution).toBeNull();
+      expect(
+        withoutOptIn.evidenceAssessment.structuralSymmetryVerification?.status,
+      ).toBe('rejected-baseline-not-opted-in');
+
+      // Formally valid symmetry contract WITH allowStructuralBaseline=true but WITHOUT symmetryVerifier -> fail-closed honest-abstention:
+      const withoutVerifier = await runScientificForecastPipeline({
+        question:
+          'Which rotational calibration sector will trigger before 2029 according to CERN?',
+        questionCategory: 'science',
+        outcomeSpace: threeSectorSpace,
+        referenceTime: REFERENCE_TIME,
+        harvestOptions: { skipRemoteHarvest: true },
+        assumptions: { allowStructuralBaseline: true },
+        structuralSymmetryContract: validZ3Contract,
+      });
+      expect(withoutVerifier.pipelineStatus).toBe('honest-abstention');
+      expect(withoutVerifier.probabilityDistribution).toBeNull();
+      expect(withoutVerifier.executedMethodIds).toEqual([]);
+      expect(
+        withoutVerifier.evidenceAssessment.derivedAvailableEvidence
+          .availableChannels,
+      ).toEqual([]);
+      expect(
+        withoutVerifier.evidenceAssessment.structuralSymmetryVerification
+          ?.status,
+      ).toBe('rejected-no-trusted-verifier');
+      expect(
+        withoutVerifier.missingRequirementsByMethod[
+          'structural-uniform-baseline'
+        ]?.some((m) => m.includes('symmetryVerifier')),
+      ).toBe(true);
 
       // Rejecting symmetryVerifier -> honest-abstention:
       const rejectingSymVerifier: StructuralSymmetryVerifier = () => ({
@@ -2670,6 +2767,10 @@ describe('Stage 2B-1 — End-to-End Scientific Forecast Pipeline Integration (sr
       );
       expect(rejectedByVerifier.pipelineStatus).toBe('honest-abstention');
       expect(rejectedByVerifier.probabilityDistribution).toBeNull();
+      expect(
+        rejectedByVerifier.evidenceAssessment.structuralSymmetryVerification
+          ?.status,
+      ).toBe('rejected-by-trusted-verifier');
       expect(
         rejectedByVerifier.evidenceAssessment.assessmentNotes.some((n) =>
           n.includes('magnetic bias field breaks C_3 invariance'),
@@ -2701,6 +2802,10 @@ describe('Stage 2B-1 — End-to-End Scientific Forecast Pipeline Integration (sr
       expect(verifiedBaseline.executedMethodIds).toEqual([
         'structural-uniform-baseline',
       ]);
+      expect(
+        verifiedBaseline.evidenceAssessment.structuralSymmetryVerification
+          ?.status,
+      ).toBe('verified');
       for (const out of verifiedBaseline.probabilityDistribution!) {
         expect(out.probability).toBeCloseTo(1 / 3, 14);
       }
@@ -3035,24 +3140,73 @@ describe('Stage 2B-1 — End-to-End Scientific Forecast Pipeline Integration (sr
         ),
       ).rejects.toThrow(ForecastPipelineRequestError);
 
-      // 2. Two distinct sources for beta-binomial-conjugate WITHOUT MultiSourceCombinationJustification -> throws:
-      await expect(
-        runScientificForecastPipeline(
-          {
-            question:
-              'Will global battery storage exceed 1,200 GW before 2029 according to the IEA?',
-            questionCategory: 'technology',
-            subdomain: 'binary-event-occurrence',
-            outcomeSpace: BINARY_OUTCOME_SPACE,
-            referenceTime: REFERENCE_TIME,
-            harvestOptions: { skipRemoteHarvest: true },
-            submittedEvidence: twoCohortEvidence,
-          },
-          { evidenceVerifier: TRUSTED_VERIFIER },
+      // 2. Two distinct sources for beta-binomial-conjugate WITHOUT MultiSourceCombinationJustification -> fail-closed rejection preserving both sources:
+      const missingJustRes = await runScientificForecastPipeline(
+        {
+          question:
+            'Will global battery storage exceed 1,200 GW before 2029 according to the IEA?',
+          questionCategory: 'technology',
+          subdomain: 'binary-event-occurrence',
+          outcomeSpace: BINARY_OUTCOME_SPACE,
+          referenceTime: REFERENCE_TIME,
+          harvestOptions: { skipRemoteHarvest: true },
+          submittedEvidence: twoCohortEvidence,
+        },
+        { evidenceVerifier: TRUSTED_VERIFIER },
+      );
+      expect(missingJustRes.pipelineStatus).toBe('honest-abstention');
+      expect(missingJustRes.probabilityDistribution).toBeNull();
+      expect(missingJustRes.executedMethodIds).toEqual([]);
+      expect(
+        missingJustRes.evidenceAssessment.structuredNumericalDatasets.map(
+          (r) => r.evidenceId,
         ),
-      ).rejects.toThrow(ForecastPipelineRequestError);
+      ).toEqual(['cohort-eu-2026', 'cohort-us-2026']);
+      expect(
+        missingJustRes.evidenceAssessment.rejectedMultiSourceCombinations[0]
+          ?.rejectionCode,
+      ).toBe('missing-combination-justification');
 
-      // 3. With valid MultiSourceCombinationJustification -> combines cleanly & preserves all provenance:
+      // 2b. Caller-declared valid MultiSourceCombinationJustification WITHOUT combinationVerifier -> fail-closed rejection preserving both sources:
+      const noCombVerifierRes = await runScientificForecastPipeline(
+        {
+          question:
+            'Will global battery storage exceed 1,200 GW before 2029 according to the IEA?',
+          questionCategory: 'technology',
+          subdomain: 'binary-event-occurrence',
+          outcomeSpace: BINARY_OUTCOME_SPACE,
+          referenceTime: REFERENCE_TIME,
+          harvestOptions: { skipRemoteHarvest: true },
+          submittedEvidence: twoCohortEvidence,
+          multiSourceCombinationJustifications: {
+            'beta-binomial-conjugate': {
+              basis: 'disjoint-exchangeable-cohorts',
+              contributingEvidenceIds: ['cohort-eu-2026', 'cohort-us-2026'],
+              disjointPopulationsOrWindowsVerified: true,
+              homogeneousParameterSpaceVerified: true,
+              mathematicalRationale:
+                'Caller falsely asserting disjointness without trusted server verification.',
+            },
+          },
+        },
+        { evidenceVerifier: TRUSTED_VERIFIER },
+      );
+      expect(noCombVerifierRes.pipelineStatus).toBe('honest-abstention');
+      expect(noCombVerifierRes.probabilityDistribution).toBeNull();
+      expect(
+        noCombVerifierRes.evidenceAssessment.structuredNumericalDatasets.map(
+          (r) => r.url,
+        ),
+      ).toEqual([
+        'https://ec.europa.eu/eurostat/battery-2026',
+        'https://www.eia.gov/electricity/battery-2026',
+      ]);
+      expect(
+        noCombVerifierRes.evidenceAssessment.rejectedMultiSourceCombinations[0]
+          ?.rejectionCode,
+      ).toBe('missing-trusted-combination-verifier');
+
+      // 3. With valid MultiSourceCombinationJustification AND trusted combinationVerifier -> combines cleanly & preserves all provenance:
       const combinedRes = await runScientificForecastPipeline(
         {
           question:
@@ -3074,7 +3228,10 @@ describe('Stage 2B-1 — End-to-End Scientific Forecast Pipeline Integration (sr
             },
           },
         },
-        { evidenceVerifier: TRUSTED_VERIFIER },
+        {
+          evidenceVerifier: TRUSTED_VERIFIER,
+          combinationVerifier: TRUSTED_COMBINATION_VERIFIER,
+        },
       );
 
       expect(combinedRes.pipelineStatus).toBe('successful-empirical-forecast');
@@ -3101,6 +3258,10 @@ describe('Stage 2B-1 — End-to-End Scientific Forecast Pipeline Integration (sr
         combinedRes.evidenceAssessment.multiSourceCombinations[0]
           ?.combinationBasis,
       ).toBe('disjoint-exchangeable-cohorts');
+      expect(
+        combinedRes.evidenceAssessment.multiSourceCombinations[0]
+          ?.verifiedByVerifierId,
+      ).toBe('oracle-institutional-combination-verifier-v1');
       assertDeeplyFrozen(combinedRes);
 
       // 4. Multiple continuous-state-trajectory-table submissions never silently overwrite:
@@ -3319,22 +3480,67 @@ describe('Stage 2B-1 — End-to-End Scientific Forecast Pipeline Integration (sr
         },
       };
 
-      // Without justification -> throws:
-      await expect(
-        runScientificForecastPipeline(
-          {
-            question:
-              'Will a station hazard occur before 2029 according to the IAEA?',
-            questionCategory: 'technology',
-            subdomain: 'rare-event-arrival-hazards',
-            outcomeSpace: BINARY_OUTCOME_SPACE,
-            referenceTime: REFERENCE_TIME,
-            harvestOptions: { skipRemoteHarvest: true },
-            submittedEvidence: [poissonWinEu, poissonWinJp],
-          },
-          { evidenceVerifier: TRUSTED_VERIFIER },
+      // Without justification -> fail-closed rejection preserving both historical sources:
+      const poissonNoJust = await runScientificForecastPipeline(
+        {
+          question:
+            'Will a station hazard occur before 2029 according to the IAEA?',
+          questionCategory: 'technology',
+          subdomain: 'rare-event-arrival-hazards',
+          outcomeSpace: BINARY_OUTCOME_SPACE,
+          referenceTime: REFERENCE_TIME,
+          harvestOptions: { skipRemoteHarvest: true },
+          submittedEvidence: [poissonWinEu, poissonWinJp],
+        },
+        { evidenceVerifier: TRUSTED_VERIFIER },
+      );
+      expect(poissonNoJust.pipelineStatus).toBe('honest-abstention');
+      expect(poissonNoJust.probabilityDistribution).toBeNull();
+      expect(
+        poissonNoJust.evidenceAssessment.historicalObservations.map(
+          (r) => r.evidenceId,
         ),
-      ).rejects.toThrow(ForecastPipelineRequestError);
+      ).toEqual(['poisson-win-eu', 'poisson-win-jp']);
+      expect(
+        poissonNoJust.evidenceAssessment.rejectedMultiSourceCombinations[0]
+          ?.rejectionCode,
+      ).toBe('missing-combination-justification');
+
+      // Falsely declared valid disjoint justification WITHOUT combinationVerifier -> fail-closed rejection preserving both sources:
+      const poissonNoVerifier = await runScientificForecastPipeline(
+        {
+          question:
+            'Will a station hazard occur before 2029 according to the IAEA?',
+          questionCategory: 'technology',
+          subdomain: 'rare-event-arrival-hazards',
+          outcomeSpace: BINARY_OUTCOME_SPACE,
+          referenceTime: REFERENCE_TIME,
+          harvestOptions: { skipRemoteHarvest: true },
+          submittedEvidence: [poissonWinEu, poissonWinJp],
+          multiSourceCombinationJustifications: {
+            'poisson-gamma-hazard': {
+              basis: 'disjoint-poisson-exposure-windows',
+              contributingEvidenceIds: ['poisson-win-eu', 'poisson-win-jp'],
+              disjointPopulationsOrWindowsVerified: true,
+              homogeneousParameterSpaceVerified: true,
+              mathematicalRationale:
+                'Caller claiming non-overlapping windows without trusted server verifier.',
+            },
+          },
+        },
+        { evidenceVerifier: TRUSTED_VERIFIER },
+      );
+      expect(poissonNoVerifier.pipelineStatus).toBe('honest-abstention');
+      expect(poissonNoVerifier.probabilityDistribution).toBeNull();
+      expect(
+        poissonNoVerifier.evidenceAssessment.historicalObservations.map(
+          (r) => r.evidenceId,
+        ),
+      ).toEqual(['poisson-win-eu', 'poisson-win-jp']);
+      expect(
+        poissonNoVerifier.evidenceAssessment.rejectedMultiSourceCombinations[0]
+          ?.rejectionCode,
+      ).toBe('missing-trusted-combination-verifier');
 
       // Identical exposureWindowId with conflicting durations -> throws:
       await expect(
@@ -3367,7 +3573,7 @@ describe('Stage 2B-1 — End-to-End Scientific Forecast Pipeline Integration (sr
         ),
       ).rejects.toThrow(ForecastPipelineRequestError);
 
-      // With valid 'disjoint-poisson-exposure-windows' justification -> sums exposure (5+5=10) and events (1+1=2):
+      // With valid 'disjoint-poisson-exposure-windows' justification AND trusted combinationVerifier -> sums exposure (5+5=10) and events (1+1=2):
       const combinedPoissonRes = await runScientificForecastPipeline(
         {
           question:
@@ -3389,7 +3595,10 @@ describe('Stage 2B-1 — End-to-End Scientific Forecast Pipeline Integration (sr
             },
           },
         },
-        { evidenceVerifier: TRUSTED_VERIFIER },
+        {
+          evidenceVerifier: TRUSTED_VERIFIER,
+          combinationVerifier: TRUSTED_COMBINATION_VERIFIER,
+        },
       );
       expect(
         combinedPoissonRes.evidenceAssessment.derivedAvailableEvidence
@@ -3403,6 +3612,10 @@ describe('Stage 2B-1 — End-to-End Scientific Forecast Pipeline Integration (sr
         combinedPoissonRes.evidenceAssessment.multiSourceCombinations[0]
           ?.combinationBasis,
       ).toBe('disjoint-poisson-exposure-windows');
+      expect(
+        combinedPoissonRes.evidenceAssessment.multiSourceCombinations[0]
+          ?.verifiedByVerifierId,
+      ).toBe('oracle-institutional-combination-verifier-v1');
       assertDeeplyFrozen(combinedPoissonRes);
     });
   });
@@ -3502,6 +3715,336 @@ describe('Stage 2B-1 — End-to-End Scientific Forecast Pipeline Integration (sr
           { now: () => 'not-a-valid-iso-timestamp' },
         ),
       ).rejects.toThrow(ForecastPipelineRequestError);
+    });
+  });
+
+  describe('Audit Hardening — Fail-Closed Server-Side Symmetry & Combination Verifiers', () => {
+    it('never enables structural-uniform-baseline from caller formalInvariant/derivationReference/permutations/microstateCounts without an approving trusted symmetryVerifier', async () => {
+      const selfCertifiedContract: StructuralSymmetryContract = {
+        basisKind: 'transitive-permutation-group',
+        formalInvariant: {
+          groupName: 'Z2-label-exchange',
+          invariantObservable:
+            'Caller claims Hamiltonian is invariant under 0 <-> 1 exchange.',
+          derivationReference:
+            'audit://caller-self-asserted/not-in-trusted-allowlist',
+        },
+        generatingPermutations: [[1, 0]],
+        microstateCountsPerOutcome: [1, 1],
+      };
+
+      // 1. No symmetryVerifier -> honest abstention with clear rejection diagnostic:
+      const unconfigured = await runScientificForecastPipeline({
+        question:
+          'Which symmetric coin face will show in the calibration run before 2029 according to NIST?',
+        questionCategory: 'science',
+        subdomain: 'binary-event-occurrence',
+        outcomeSpace: SYMMETRIC_COIN_OUTCOME_SPACE,
+        referenceTime: REFERENCE_TIME,
+        harvestOptions: { skipRemoteHarvest: true },
+        assumptions: { allowStructuralBaseline: true },
+        structuralSymmetryContract: selfCertifiedContract,
+      });
+
+      expect(unconfigured.pipelineStatus).toBe('honest-abstention');
+      expect(unconfigured.forecastKind).toBe('abstained');
+      expect(unconfigured.probabilityDistribution).toBeNull();
+      expect(unconfigured.executedMethodIds).toEqual([]);
+      expect(
+        unconfigured.evidenceAssessment.structuralSymmetryVerification?.status,
+      ).toBe('rejected-no-trusted-verifier');
+      expect(
+        unconfigured.evidenceAssessment.assessmentNotes.some((n) =>
+          n.includes('no trusted server-side symmetryVerifier'),
+        ),
+      ).toBe(true);
+
+      // 2. Empty trusted factory (neither allowlist nor callback) fails closed:
+      const emptySymVerifier = createTrustedStructuralSymmetryVerifier({
+        verifierId: 'empty-sym-verifier',
+      });
+      const rejectedEmpty = await runScientificForecastPipeline(
+        {
+          question:
+            'Which symmetric coin face will show in the calibration run before 2029 according to NIST?',
+          questionCategory: 'science',
+          subdomain: 'binary-event-occurrence',
+          outcomeSpace: SYMMETRIC_COIN_OUTCOME_SPACE,
+          referenceTime: REFERENCE_TIME,
+          harvestOptions: { skipRemoteHarvest: true },
+          assumptions: { allowStructuralBaseline: true },
+          structuralSymmetryContract: selfCertifiedContract,
+        },
+        { symmetryVerifier: emptySymVerifier },
+      );
+      expect(rejectedEmpty.pipelineStatus).toBe('honest-abstention');
+      expect(
+        rejectedEmpty.evidenceAssessment.structuralSymmetryVerification
+          ?.status,
+      ).toBe('rejected-by-trusted-verifier');
+
+      // 3. Trusted verifier allowlist rejects caller self-asserted derivationReference:
+      const rejectedUnallowlisted = await runScientificForecastPipeline(
+        {
+          question:
+            'Which symmetric coin face will show in the calibration run before 2029 according to NIST?',
+          questionCategory: 'science',
+          subdomain: 'binary-event-occurrence',
+          outcomeSpace: SYMMETRIC_COIN_OUTCOME_SPACE,
+          referenceTime: REFERENCE_TIME,
+          harvestOptions: { skipRemoteHarvest: true },
+          assumptions: { allowStructuralBaseline: true },
+          structuralSymmetryContract: selfCertifiedContract,
+        },
+        { symmetryVerifier: TRUSTED_SYMMETRY_VERIFIER },
+      );
+      expect(rejectedUnallowlisted.pipelineStatus).toBe('honest-abstention');
+      expect(rejectedUnallowlisted.probabilityDistribution).toBeNull();
+      expect(
+        rejectedUnallowlisted.evidenceAssessment.structuralSymmetryVerification
+          ?.verifierId,
+      ).toBe('oracle-institutional-symmetry-verifier-v1');
+
+      // 4. Trusted verifier approves allowlisted contract & event hash -> baseline executes:
+      const hashPinnedSymVerifier = createTrustedStructuralSymmetryVerifier({
+        verifierId: 'nist-symmetry-audit-v2',
+        verificationArtifactRef: 'audit://nist/2026/symmetry-cert-01',
+        approvedDerivationReferences: [
+          SYMMETRIC_Z2_CONTRACT.formalInvariant.derivationReference,
+        ],
+        approvedEventDefinitionHashes: [
+          SYMMETRIC_COIN_OUTCOME_SPACE.eventDefinitionHash,
+        ],
+      });
+      const approved = await runScientificForecastPipeline(
+        {
+          question:
+            'Which symmetric coin face will show in the calibration run before 2029 according to NIST?',
+          questionCategory: 'science',
+          subdomain: 'binary-event-occurrence',
+          outcomeSpace: SYMMETRIC_COIN_OUTCOME_SPACE,
+          referenceTime: REFERENCE_TIME,
+          harvestOptions: { skipRemoteHarvest: true },
+          assumptions: { allowStructuralBaseline: true },
+          structuralSymmetryContract: SYMMETRIC_Z2_CONTRACT,
+        },
+        { symmetryVerifier: hashPinnedSymVerifier },
+      );
+      expect(approved.pipelineStatus).toBe('structural-baseline-forecast');
+      expect(approved.executedMethodIds).toEqual([
+        'structural-uniform-baseline',
+      ]);
+      expect(
+        approved.evidenceAssessment.structuralSymmetryVerification?.status,
+      ).toBe('verified');
+      expect(
+        approved.evidenceAssessment.structuralSymmetryVerification
+          ?.verificationArtifactRef,
+      ).toBe('audit://nist/2026/symmetry-cert-01');
+      assertDeeplyFrozen(approved);
+    });
+
+    it('rejects falsely declared valid MultiSourceCombinationJustification without trusted server verification, isolates unverified combinations cleanly, and preserves all individual sources and provenances', async () => {
+      // 1. Overlapping/unverified cohorts where caller falsely certifies all boolean flags and rationale:
+      const cohortsPlusIndependentPoisson: ForecastPipelineRequest['submittedEvidence'] =
+        [
+          {
+            category: 'structured-numerical-dataset',
+            evidenceId: 'beta-cohort-overlap-a',
+            title: 'Regional Grid Storage Survey A',
+            publisher: 'Source Agency A',
+            url: 'https://agency-a.example.org/grid-2026',
+            publishedAt: '2026-03-01T00:00:00Z',
+            verifiedEmpirical: true,
+            dataset: {
+              kind: 'binary-cohort-table',
+              successes: 8,
+              failures: 2,
+              successOutcomeIndex: 0,
+              prior: { alpha: 1, beta: 1 },
+            },
+          },
+          {
+            category: 'structured-numerical-dataset',
+            evidenceId: 'beta-cohort-overlap-b',
+            title: 'Regional Grid Storage Survey B',
+            publisher: 'Source Agency B',
+            url: 'https://agency-b.example.org/grid-2026',
+            publishedAt: '2026-03-05T00:00:00Z',
+            verifiedEmpirical: true,
+            dataset: {
+              kind: 'binary-cohort-table',
+              successes: 5,
+              failures: 5,
+              successOutcomeIndex: 0,
+              prior: { alpha: 1, beta: 1 },
+            },
+          },
+          {
+            category: 'structured-numerical-dataset',
+            evidenceId: 'poisson-independent-single',
+            title: 'Independent High-Voltage Substation Telemetry',
+            publisher: 'Grid Reliability Council',
+            url: 'https://grc.example.org/substation-hazard-2026',
+            publishedAt: '2026-03-10T00:00:00Z',
+            verifiedEmpirical: true,
+            dataset: {
+              kind: 'poisson-exposure-table',
+              eventCount: 2,
+              exposureDuration: 5,
+              exposureUnit: 'years',
+              forecastExposureDuration: 2,
+              forecastExposureUnit: 'years',
+              eventOutcomeIndex: 0,
+              prior: { shape: 1, rate: 1 },
+            },
+          },
+        ];
+
+      // Server allowlist strictly permits a different cohort pair, NOT overlap-a + overlap-b:
+      const strictServerCombVerifier: MultiSourceCombinationVerifier =
+        createTrustedCombinationVerifier({
+          verifierId: 'oracle-audit-combination-gate-v2',
+          verificationArtifactRef:
+            'audit://oracle/2026/disjoint-cohort-allowlist',
+          approvedMethodCombinations: {
+            'beta-binomial-conjugate': [['approved-cohort-1', 'approved-cohort-2']],
+          },
+        });
+
+      const rejectedComboWithIsolatedPoisson =
+        await runScientificForecastPipeline(
+          {
+            question:
+              'Will regional grid capacity exceed 1,200 GW before 2029 according to the IEA?',
+            questionCategory: 'technology',
+            subdomain: 'geopolitical-or-conflict-incident-rates',
+            outcomeSpace: BINARY_OUTCOME_SPACE,
+            referenceTime: REFERENCE_TIME,
+            harvestOptions: { skipRemoteHarvest: true },
+            assumptions: {
+              verifiedAssumptions: [
+                'conditionally-independent-poisson-increments',
+                'homogeneous-or-known-exposure-intensity',
+              ],
+            },
+            submittedEvidence: cohortsPlusIndependentPoisson,
+            multiSourceCombinationJustifications: {
+              'beta-binomial-conjugate': {
+                basis: 'disjoint-exchangeable-cohorts',
+                contributingEvidenceIds: [
+                  'beta-cohort-overlap-a',
+                  'beta-cohort-overlap-b',
+                ],
+                disjointPopulationsOrWindowsVerified: true,
+                homogeneousParameterSpaceVerified: true,
+                mathematicalRationale:
+                  'False caller claim: these two surveys actually sample overlapping utilities.',
+              },
+            },
+          },
+          {
+            evidenceVerifier: TRUSTED_VERIFIER,
+            combinationVerifier: strictServerCombVerifier,
+          },
+        );
+
+      // Beta combination MUST be rejected without throwing or corrupting planMethodApplicability,
+      // while independent single-source Poisson executes cleanly AND all 3 provenances remain intact:
+      expect(rejectedComboWithIsolatedPoisson.executedMethodIds).toEqual([
+        'poisson-gamma-hazard',
+      ]);
+      expect(
+        rejectedComboWithIsolatedPoisson.evidenceAssessment
+          .rejectedMultiSourceCombinations,
+      ).toHaveLength(1);
+      expect(
+        rejectedComboWithIsolatedPoisson.evidenceAssessment
+          .rejectedMultiSourceCombinations[0],
+      ).toMatchObject({
+        methodId: 'beta-binomial-conjugate',
+        rejectionCode: 'rejected-by-trusted-combination-verifier',
+        verifiedByVerifierId: 'oracle-audit-combination-gate-v2',
+        preservedIndividualSources: true,
+        contributingEvidenceIds: [
+          'beta-cohort-overlap-a',
+          'beta-cohort-overlap-b',
+        ],
+      });
+      expect(
+        rejectedComboWithIsolatedPoisson.evidenceAssessment.structuredNumericalDatasets.map(
+          (r) => r.evidenceId,
+        ),
+      ).toEqual([
+        'beta-cohort-overlap-a',
+        'beta-cohort-overlap-b',
+        'poisson-independent-single',
+      ]);
+      expect(
+        rejectedComboWithIsolatedPoisson.evidenceAssessment.structuredNumericalDatasets.map(
+          (r) => r.url,
+        ),
+      ).toEqual([
+        'https://agency-a.example.org/grid-2026',
+        'https://agency-b.example.org/grid-2026',
+        'https://grc.example.org/substation-hazard-2026',
+      ]);
+      expect(
+        rejectedComboWithIsolatedPoisson.evidenceAssessment
+          .derivedAvailableEvidence.binaryTrialSuccesses,
+      ).toBeUndefined();
+      expect(
+        rejectedComboWithIsolatedPoisson.evidenceAssessment
+          .derivedAvailableEvidence.availableChannels,
+      ).not.toContain('binary-trial-counts');
+
+      // 2. Empty combination verifier fails closed even when caller sets every boolean to true:
+      const emptyCombVerifier = createTrustedCombinationVerifier({
+        verifierId: 'empty-combination-verifier',
+      });
+      const rejectedAllAbstained = await runScientificForecastPipeline(
+        {
+          question:
+            'Will global battery storage exceed 1,200 GW before 2029 according to the IEA?',
+          questionCategory: 'technology',
+          subdomain: 'binary-event-occurrence',
+          outcomeSpace: BINARY_OUTCOME_SPACE,
+          referenceTime: REFERENCE_TIME,
+          harvestOptions: { skipRemoteHarvest: true },
+          submittedEvidence: cohortsPlusIndependentPoisson.slice(0, 2),
+          multiSourceCombinationJustifications: {
+            'beta-binomial-conjugate': {
+              basis: 'disjoint-exchangeable-cohorts',
+              contributingEvidenceIds: [
+                'beta-cohort-overlap-a',
+                'beta-cohort-overlap-b',
+              ],
+              disjointPopulationsOrWindowsVerified: true,
+              homogeneousParameterSpaceVerified: true,
+              mathematicalRationale:
+                'Falsely asserting disjoint cohorts against unconfigured verifier.',
+            },
+          },
+        },
+        {
+          evidenceVerifier: TRUSTED_VERIFIER,
+          combinationVerifier: emptyCombVerifier,
+        },
+      );
+      expect(rejectedAllAbstained.pipelineStatus).toBe('honest-abstention');
+      expect(rejectedAllAbstained.probabilityDistribution).toBeNull();
+      expect(
+        rejectedAllAbstained.evidenceAssessment.derivedAvailableEvidence
+          .hasVerifiableEmpiricalData,
+      ).toBe(false);
+      expect(
+        rejectedAllAbstained.evidenceAssessment.derivedAvailableEvidence
+          .availableChannels,
+      ).toEqual([]);
+      expect(
+        rejectedAllAbstained.evidenceAssessment.structuredNumericalDatasets,
+      ).toHaveLength(2);
+      assertDeeplyFrozen(rejectedAllAbstained);
     });
   });
 });

@@ -854,14 +854,218 @@ export interface StructuralSymmetryVerificationDecision {
   readonly verified: boolean;
   readonly verifierId: string;
   readonly rationale: string;
+  readonly verificationArtifactRef?: string;
 }
 
 export type StructuralSymmetryVerifier = (context: {
   readonly question: string;
   readonly outcomeSpace: OutcomeSpaceDescriptor;
   readonly contract: StructuralSymmetryContract;
+  readonly validation: StructuralSymmetryValidationResult;
   readonly referenceTime: IsoDateTime;
 }) => StructuralSymmetryVerificationDecision;
+
+/**
+ * Constructs a fail-closed server-side `StructuralSymmetryVerifier`.
+ *
+ * Fail-closed guarantees:
+ *   - If neither an explicit `verifySymmetry` callback nor a non-empty
+ *     server-side allowlist (`approvedDerivationReferences` or
+ *     `approvedEventDefinitionHashes`) is configured, every symmetry contract
+ *     is rejected (`verified: false`).
+ *   - Mathematically invalid contracts (`validateStructuralSymmetryContract`
+ *     failing) are ALWAYS rejected regardless of callback decisions.
+ *   - Caller-supplied `formalInvariant`, `derivationReference`,
+ *     `generatingPermutations`, and `microstateCountsPerOutcome` are NEVER
+ *     treated as verified symmetry proof by themselves.
+ */
+export function createTrustedStructuralSymmetryVerifier(options: {
+  readonly verifierId: string;
+  readonly verificationArtifactRef?: string;
+  readonly defaultRationale?: string;
+  readonly approvedDerivationReferences?: readonly string[];
+  readonly approvedEventDefinitionHashes?: readonly string[];
+  readonly verifySymmetry?: (context: {
+    readonly question: string;
+    readonly outcomeSpace: OutcomeSpaceDescriptor;
+    readonly contract: StructuralSymmetryContract;
+    readonly validation: StructuralSymmetryValidationResult;
+    readonly referenceTime: IsoDateTime;
+  }) => Partial<StructuralSymmetryVerificationDecision> | boolean;
+}): StructuralSymmetryVerifier {
+  if (!isPlainObject(options)) {
+    throw new RangeError(
+      'createTrustedStructuralSymmetryVerifier requires a non-null options object',
+    );
+  }
+  if (
+    typeof options.verifierId !== 'string' ||
+    options.verifierId.trim().length === 0
+  ) {
+    throw new RangeError(
+      'createTrustedStructuralSymmetryVerifier requires a non-empty verifierId',
+    );
+  }
+  const verifierId = options.verifierId.trim();
+
+  if (
+    options.verifySymmetry !== undefined &&
+    typeof options.verifySymmetry !== 'function'
+  ) {
+    throw new RangeError(
+      'createTrustedStructuralSymmetryVerifier.verifySymmetry must be a function when provided',
+    );
+  }
+  if (
+    options.approvedDerivationReferences !== undefined &&
+    !Array.isArray(options.approvedDerivationReferences)
+  ) {
+    throw new RangeError(
+      'createTrustedStructuralSymmetryVerifier.approvedDerivationReferences must be an array of strings when provided',
+    );
+  }
+  if (
+    options.approvedEventDefinitionHashes !== undefined &&
+    !Array.isArray(options.approvedEventDefinitionHashes)
+  ) {
+    throw new RangeError(
+      'createTrustedStructuralSymmetryVerifier.approvedEventDefinitionHashes must be an array of strings when provided',
+    );
+  }
+
+  const refSet =
+    options.approvedDerivationReferences !== undefined
+      ? new Set(
+          options.approvedDerivationReferences
+            .filter((r): r is string => typeof r === 'string')
+            .map((r) => r.trim())
+            .filter((r) => r.length > 0),
+        )
+      : null;
+  const hashSet =
+    options.approvedEventDefinitionHashes !== undefined
+      ? new Set(
+          options.approvedEventDefinitionHashes
+            .filter((h): h is string => typeof h === 'string')
+            .map((h) => h.trim())
+            .filter((h) => h.length > 0),
+        )
+      : null;
+
+  return (context): StructuralSymmetryVerificationDecision => {
+    const validation =
+      context.validation ??
+      validateStructuralSymmetryContract(context.contract, context.outcomeSpace);
+
+    if (!validation.valid) {
+      return Object.freeze({
+        verified: false,
+        verifierId,
+        ...(options.verificationArtifactRef !== undefined
+          ? { verificationArtifactRef: options.verificationArtifactRef }
+          : {}),
+        rationale: `Fail-closed symmetry rejection by '${verifierId}': ${validation.reasons.join('; ')}`,
+      });
+    }
+
+    const derivationRef = context.contract.formalInvariant.derivationReference.trim();
+    const eventHash = context.outcomeSpace.eventDefinitionHash.trim();
+
+    if (options.verifySymmetry !== undefined) {
+      const custom = options.verifySymmetry({
+        ...context,
+        validation,
+      });
+      const allowlistPermits =
+        (refSet === null || (refSet.size > 0 && refSet.has(derivationRef))) &&
+        (hashSet === null || (hashSet.size > 0 && hashSet.has(eventHash)));
+
+      if (typeof custom === 'boolean') {
+        const verified = custom && allowlistPermits;
+        return Object.freeze({
+          verified,
+          verifierId,
+          ...(options.verificationArtifactRef !== undefined
+            ? { verificationArtifactRef: options.verificationArtifactRef }
+            : {}),
+          rationale:
+            options.defaultRationale ??
+            (verified
+              ? `Verified structural symmetry contract ('${context.contract.formalInvariant.groupName}') via trusted verifier '${verifierId}'.`
+              : `Rejected structural symmetry contract ('${context.contract.formalInvariant.groupName}') via trusted verifier '${verifierId}'.`),
+        });
+      }
+
+      if (!isPlainObject(custom)) {
+        return Object.freeze({
+          verified: false,
+          verifierId,
+          ...(options.verificationArtifactRef !== undefined
+            ? { verificationArtifactRef: options.verificationArtifactRef }
+            : {}),
+          rationale: `Fail-closed symmetry rejection by '${verifierId}': verifySymmetry returned a non-decision value.`,
+        });
+      }
+
+      const verified = custom.verified === true && allowlistPermits;
+      const effectiveVerifierId =
+        typeof custom.verifierId === 'string' &&
+        custom.verifierId.trim().length > 0
+          ? custom.verifierId.trim()
+          : verifierId;
+      const effectiveRationale =
+        typeof custom.rationale === 'string' &&
+        custom.rationale.trim().length > 0
+          ? custom.rationale.trim()
+          : options.defaultRationale ??
+            (verified
+              ? `Verified structural symmetry contract ('${context.contract.formalInvariant.groupName}') via trusted verifier '${effectiveVerifierId}'.`
+              : `Rejected structural symmetry contract ('${context.contract.formalInvariant.groupName}') via trusted verifier '${effectiveVerifierId}'.`);
+
+      return Object.freeze({
+        verified,
+        verifierId: effectiveVerifierId,
+        ...(typeof custom.verificationArtifactRef === 'string' &&
+        custom.verificationArtifactRef.trim().length > 0
+          ? { verificationArtifactRef: custom.verificationArtifactRef.trim() }
+          : options.verificationArtifactRef !== undefined
+            ? { verificationArtifactRef: options.verificationArtifactRef }
+            : {}),
+        rationale: effectiveRationale,
+      });
+    }
+
+    const hasAnyAllowlist =
+      (refSet !== null && refSet.size > 0) ||
+      (hashSet !== null && hashSet.size > 0);
+    if (!hasAnyAllowlist) {
+      return Object.freeze({
+        verified: false,
+        verifierId,
+        ...(options.verificationArtifactRef !== undefined
+          ? { verificationArtifactRef: options.verificationArtifactRef }
+          : {}),
+        rationale: `Fail-closed rejection by '${verifierId}': verifier has neither an explicit verifySymmetry callback nor a non-empty derivation/event-hash allowlist.`,
+      });
+    }
+
+    const refOk = refSet === null || refSet.has(derivationRef);
+    const hashOk = hashSet === null || hashSet.has(eventHash);
+    const verified = refOk && hashOk;
+    return Object.freeze({
+      verified,
+      verifierId,
+      ...(options.verificationArtifactRef !== undefined
+        ? { verificationArtifactRef: options.verificationArtifactRef }
+        : {}),
+      rationale:
+        options.defaultRationale ??
+        (verified
+          ? `Independently verified structural symmetry contract ('${context.contract.formalInvariant.groupName}', ref='${derivationRef}') via trusted verifier '${verifierId}'.`
+          : `Structural symmetry derivation '${derivationRef}' / event '${eventHash}' is not present in trusted verifier '${verifierId}' allowlist.`),
+    });
+  };
+}
 
 const ASYMMETRIC_BINARY_LABEL_PAIRS: ReadonlySet<string> = new Set([
   'yes|no',
@@ -1199,6 +1403,250 @@ export interface MultiSourceCombinationJustification {
   readonly mathematicalRationale: string;
 }
 
+export interface MultiSourceCombinationVerificationContext {
+  readonly methodId: ExecutableScientificMethodId;
+  readonly expectedBasis: MultiSourceCombinationBasis;
+  readonly justification?: MultiSourceCombinationJustification;
+  readonly contributingSubmissions: readonly PipelineEvidenceSubmission[];
+  readonly contributingEvidenceIds: readonly string[];
+  readonly contributingSourceUrls: readonly string[];
+  readonly outcomeSpace: OutcomeSpaceDescriptor;
+  readonly referenceTime: IsoDateTime;
+}
+
+export interface MultiSourceCombinationVerificationDecision {
+  readonly verified: boolean;
+  readonly verifierId: string;
+  readonly rationale: string;
+  readonly verificationArtifactRef?: string;
+  readonly verifiedEvidenceIds?: readonly string[];
+}
+
+export type MultiSourceCombinationVerifier = (
+  context: MultiSourceCombinationVerificationContext,
+) => MultiSourceCombinationVerificationDecision;
+
+/**
+ * Constructs a fail-closed server-side `MultiSourceCombinationVerifier`.
+ *
+ * Fail-closed guarantees:
+ *   - If neither an explicit `verifyCombination` callback nor a non-empty
+ *     `approvedMethodCombinations` mapping is configured, EVERY combination
+ *     request is rejected (`verified: false`).
+ *   - Caller-declared booleans (`disjointPopulationsOrWindowsVerified`,
+ *     `homogeneousParameterSpaceVerified`, `commonExogenousWeightScaleVerified`)
+ *     and prose `mathematicalRationale` are NEVER trusted on their own; they are
+ *     preconditions checked alongside independent server-side verification.
+ */
+export function createTrustedCombinationVerifier(options: {
+  readonly verifierId: string;
+  readonly verificationArtifactRef?: string;
+  readonly defaultRationale?: string;
+  readonly approvedMethodCombinations?: Readonly<
+    Partial<
+      Record<ExecutableScientificMethodId, readonly (readonly string[])[]>
+    >
+  >;
+  readonly verifyCombination?: (
+    context: MultiSourceCombinationVerificationContext,
+  ) => Partial<MultiSourceCombinationVerificationDecision> | boolean;
+}): MultiSourceCombinationVerifier {
+  if (!isPlainObject(options)) {
+    throw new RangeError(
+      'createTrustedCombinationVerifier requires a non-null options object',
+    );
+  }
+  if (
+    typeof options.verifierId !== 'string' ||
+    options.verifierId.trim().length === 0
+  ) {
+    throw new RangeError(
+      'createTrustedCombinationVerifier requires a non-empty verifierId',
+    );
+  }
+  const verifierId = options.verifierId.trim();
+
+  if (
+    options.verifyCombination !== undefined &&
+    typeof options.verifyCombination !== 'function'
+  ) {
+    throw new RangeError(
+      'createTrustedCombinationVerifier.verifyCombination must be a function when provided',
+    );
+  }
+
+  const approvedSetByMethod = new Map<string, Set<string>>();
+  if (options.approvedMethodCombinations !== undefined) {
+    if (!isPlainObject(options.approvedMethodCombinations)) {
+      throw new RangeError(
+        'createTrustedCombinationVerifier.approvedMethodCombinations must be an object when provided',
+      );
+    }
+    for (const [mId, groups] of Object.entries(
+      options.approvedMethodCombinations,
+    )) {
+      if (!Array.isArray(groups)) {
+        continue;
+      }
+      const keySet = new Set<string>();
+      for (const group of groups) {
+        if (!Array.isArray(group)) {
+          continue;
+        }
+        const normIds = group
+          .filter((id): id is string => typeof id === 'string')
+          .map((id) => id.trim())
+          .filter((id) => id.length > 0);
+        if (normIds.length >= 2) {
+          keySet.add(JSON.stringify([...new Set(normIds)].sort()));
+        }
+      }
+      if (keySet.size > 0) {
+        approvedSetByMethod.set(mId, keySet);
+      }
+    }
+  }
+
+  return (
+    context: MultiSourceCombinationVerificationContext,
+  ): MultiSourceCombinationVerificationDecision => {
+    const j = context.justification;
+    const expectedIds = [...new Set(context.contributingEvidenceIds)].sort();
+    const expectedKey = JSON.stringify(expectedIds);
+
+    const hasValidContractFields =
+      isPlainObject(j) &&
+      j.basis === context.expectedBasis &&
+      j.disjointPopulationsOrWindowsVerified === true &&
+      j.homogeneousParameterSpaceVerified === true &&
+      (context.methodId !== 'weighted-kish-effective-binomial' ||
+        j.commonExogenousWeightScaleVerified === true) &&
+      typeof j.mathematicalRationale === 'string' &&
+      j.mathematicalRationale.trim().length >= 10 &&
+      Array.isArray(j.contributingEvidenceIds) &&
+      j.contributingEvidenceIds.length === expectedIds.length &&
+      JSON.stringify(
+        [
+          ...new Set(
+            j.contributingEvidenceIds
+              .filter((id): id is string => typeof id === 'string')
+              .map((id) => id.trim())
+              .filter((id) => id.length > 0),
+          ),
+        ].sort(),
+      ) === expectedKey;
+
+    if (!hasValidContractFields) {
+      return Object.freeze({
+        verified: false,
+        verifierId,
+        ...(options.verificationArtifactRef !== undefined
+          ? { verificationArtifactRef: options.verificationArtifactRef }
+          : {}),
+        rationale: `Fail-closed rejection by '${verifierId}': missing or incomplete MultiSourceCombinationJustification contract for '${context.methodId}'.`,
+      });
+    }
+
+    const methodAllowlist = approvedSetByMethod.get(context.methodId);
+    const allowlistConfigured = approvedSetByMethod.size > 0;
+    const allowlistPermits =
+      !allowlistConfigured ||
+      (methodAllowlist !== undefined && methodAllowlist.has(expectedKey));
+
+    if (options.verifyCombination !== undefined) {
+      const custom = options.verifyCombination(context);
+      if (typeof custom === 'boolean') {
+        const verified = custom && allowlistPermits;
+        return Object.freeze({
+          verified,
+          verifierId,
+          ...(options.verificationArtifactRef !== undefined
+            ? { verificationArtifactRef: options.verificationArtifactRef }
+            : {}),
+          rationale:
+            options.defaultRationale ??
+            (verified
+              ? `Verified disjoint multi-source combination for '${context.methodId}' (${context.contributingEvidenceIds.join(', ')}) via trusted verifier '${verifierId}'.`
+              : `Rejected multi-source combination for '${context.methodId}' (${context.contributingEvidenceIds.join(', ')}) via trusted verifier '${verifierId}'.`),
+          ...(verified
+            ? { verifiedEvidenceIds: Object.freeze([...context.contributingEvidenceIds]) }
+            : {}),
+        });
+      }
+
+      if (!isPlainObject(custom)) {
+        return Object.freeze({
+          verified: false,
+          verifierId,
+          ...(options.verificationArtifactRef !== undefined
+            ? { verificationArtifactRef: options.verificationArtifactRef }
+            : {}),
+          rationale: `Fail-closed rejection by '${verifierId}': verifyCombination returned a non-decision value.`,
+        });
+      }
+
+      const verified = custom.verified === true && allowlistPermits;
+      const effectiveVerifierId =
+        typeof custom.verifierId === 'string' &&
+        custom.verifierId.trim().length > 0
+          ? custom.verifierId.trim()
+          : verifierId;
+      const effectiveRationale =
+        typeof custom.rationale === 'string' &&
+        custom.rationale.trim().length > 0
+          ? custom.rationale.trim()
+          : options.defaultRationale ??
+            (verified
+              ? `Verified disjoint multi-source combination for '${context.methodId}' (${context.contributingEvidenceIds.join(', ')}) via trusted verifier '${effectiveVerifierId}'.`
+              : `Rejected multi-source combination for '${context.methodId}' (${context.contributingEvidenceIds.join(', ')}) via trusted verifier '${effectiveVerifierId}'.`);
+
+      return Object.freeze({
+        verified,
+        verifierId: effectiveVerifierId,
+        ...(typeof custom.verificationArtifactRef === 'string' &&
+        custom.verificationArtifactRef.trim().length > 0
+          ? { verificationArtifactRef: custom.verificationArtifactRef.trim() }
+          : options.verificationArtifactRef !== undefined
+            ? { verificationArtifactRef: options.verificationArtifactRef }
+            : {}),
+        rationale: effectiveRationale,
+        ...(custom.verifiedEvidenceIds !== undefined
+          ? { verifiedEvidenceIds: custom.verifiedEvidenceIds }
+          : verified
+            ? { verifiedEvidenceIds: Object.freeze([...context.contributingEvidenceIds]) }
+            : {}),
+      });
+    }
+
+    if (!allowlistConfigured) {
+      return Object.freeze({
+        verified: false,
+        verifierId,
+        ...(options.verificationArtifactRef !== undefined
+          ? { verificationArtifactRef: options.verificationArtifactRef }
+          : {}),
+        rationale: `Fail-closed rejection by '${verifierId}': verifier has neither an explicit verifyCombination callback nor a non-empty approvedMethodCombinations allowlist.`,
+      });
+    }
+
+    return Object.freeze({
+      verified: allowlistPermits,
+      verifierId,
+      ...(options.verificationArtifactRef !== undefined
+        ? { verificationArtifactRef: options.verificationArtifactRef }
+        : {}),
+      rationale:
+        options.defaultRationale ??
+        (allowlistPermits
+          ? `Independently verified multi-source combination for '${context.methodId}' (${context.contributingEvidenceIds.join(', ')}) via trusted verifier '${verifierId}'.`
+          : `Source cohort set [${context.contributingEvidenceIds.join(', ')}] for '${context.methodId}' is not present in trusted verifier '${verifierId}' allowlist.`),
+      ...(allowlistPermits
+        ? { verifiedEvidenceIds: Object.freeze([...context.contributingEvidenceIds]) }
+        : {}),
+    });
+  };
+}
+
 export interface MultiSourceCombinationDiagnostic {
   readonly methodId: ExecutableScientificMethodId;
   readonly combinationMode:
@@ -1210,8 +1658,39 @@ export interface MultiSourceCombinationDiagnostic {
   readonly contributingEvidenceIds: readonly string[];
   readonly contributingSourceUrls: readonly string[];
   readonly dependencePreserved: true;
+  readonly verifiedByVerifierId: string | null;
+  readonly verificationArtifactRef: string | null;
   readonly mathematicalRationale: string;
   readonly dependenceNote: string;
+}
+
+export interface RejectedMultiSourceCombinationDiagnostic {
+  readonly methodId: ExecutableScientificMethodId;
+  readonly expectedBasis: MultiSourceCombinationBasis;
+  readonly contributingEvidenceIds: readonly string[];
+  readonly contributingSourceUrls: readonly string[];
+  readonly rejectionCode:
+    | 'missing-combination-justification'
+    | 'invalid-combination-justification'
+    | 'missing-trusted-combination-verifier'
+    | 'rejected-by-trusted-combination-verifier';
+  readonly verifiedByVerifierId: string | null;
+  readonly verificationArtifactRef: string | null;
+  readonly preservedIndividualSources: true;
+  readonly explanation: string;
+}
+
+export interface StructuralSymmetryVerificationDiagnostic {
+  readonly status:
+    | 'verified'
+    | 'rejected-no-trusted-verifier'
+    | 'rejected-by-trusted-verifier'
+    | 'rejected-legacy-premise-without-contract'
+    | 'rejected-baseline-not-opted-in';
+  readonly verifierId: string | null;
+  readonly verificationArtifactRef: string | null;
+  readonly contractBasisKind: StructuralSymmetryBasisKind | null;
+  readonly explanation: string;
 }
 
 export interface PipelineEvidenceProvenanceRecord {
@@ -1280,6 +1759,8 @@ export interface EvidenceAssessmentReport {
   readonly invalidObservationDiagnostics: readonly InvalidObservationDiagnostic[];
   readonly deduplicatedEventDiagnostics: readonly DeduplicatedEventObservationDiagnostic[];
   readonly multiSourceCombinations: readonly MultiSourceCombinationDiagnostic[];
+  readonly rejectedMultiSourceCombinations: readonly RejectedMultiSourceCombinationDiagnostic[];
+  readonly structuralSymmetryVerification: StructuralSymmetryVerificationDiagnostic | null;
   readonly derivedAvailableEvidence: AvailableEvidenceInput;
   readonly supportedMethodIds: readonly ScientificMethodId[];
   readonly missingRequirementsByMethod: Readonly<
@@ -1438,6 +1919,7 @@ export interface ForecastPipelineDependencies {
    */
   readonly evidenceVerifier?: EvidenceVerifier;
   readonly symmetryVerifier?: StructuralSymmetryVerifier;
+  readonly combinationVerifier?: MultiSourceCombinationVerifier;
   readonly registry?: ScientificMethodRegistry;
   readonly applicabilityPlanner?: (
     input: MethodApplicabilityPlanningInput,
@@ -2260,6 +2742,12 @@ interface PoissonMethodContribution {
   readonly forecastExposureUnit: string;
   readonly prior: { readonly shape: number; readonly rate: number };
   readonly credibleIntervalLevel?: number;
+  readonly preVerifiedCombination?: {
+    readonly justification: MultiSourceCombinationJustification;
+    readonly verifiedByVerifierId: string;
+    readonly verificationArtifactRef: string | null;
+    readonly verifierRationale: string;
+  };
 }
 
 interface DirichletMethodContribution {
@@ -2284,94 +2772,231 @@ interface ContinuousTrajectoryContribution {
   readonly targetMethodIds: readonly UnimplementedScientificMethodId[];
 }
 
-function validateAndAssertCombinationJustification(params: {
+type MultiSourceCombinationGateResult =
+  | {
+      readonly approved: true;
+      readonly justification: MultiSourceCombinationJustification;
+      readonly verifiedByVerifierId: string;
+      readonly verificationArtifactRef: string | null;
+      readonly verifierRationale: string;
+    }
+  | {
+      readonly approved: false;
+      readonly rejection: RejectedMultiSourceCombinationDiagnostic;
+    };
+
+function evaluateMultiSourceCombinationGate(params: {
   readonly methodId: ExecutableScientificMethodId;
   readonly expectedBasis: MultiSourceCombinationBasis;
   readonly allContributingIds: readonly string[];
+  readonly allContributingUrls: readonly string[];
+  readonly contributingSubmissions: readonly PipelineEvidenceSubmission[];
+  readonly outcomeSpace: OutcomeSpaceDescriptor;
+  readonly referenceTime: IsoDateTime;
   readonly justifications?: Readonly<
     Record<string, MultiSourceCombinationJustification>
   >;
-}): MultiSourceCombinationJustification {
-  const { methodId, expectedBasis, allContributingIds, justifications } =
-    params;
+  readonly combinationVerifier?: MultiSourceCombinationVerifier;
+}): MultiSourceCombinationGateResult {
+  const {
+    methodId,
+    expectedBasis,
+    allContributingIds,
+    allContributingUrls,
+    contributingSubmissions,
+    outcomeSpace,
+    referenceTime,
+    justifications,
+    combinationVerifier,
+  } = params;
+
+  const frozenIds = Object.freeze([...allContributingIds]);
+  const frozenUrls = Object.freeze([...allContributingUrls]);
+
+  const makeRejection = (
+    rejectionCode: RejectedMultiSourceCombinationDiagnostic['rejectionCode'],
+    explanation: string,
+    verifiedByVerifierId: string | null = null,
+    verificationArtifactRef: string | null = null,
+  ): MultiSourceCombinationGateResult => ({
+    approved: false,
+    rejection: Object.freeze({
+      methodId,
+      expectedBasis,
+      contributingEvidenceIds: frozenIds,
+      contributingSourceUrls: frozenUrls,
+      rejectionCode,
+      verifiedByVerifierId,
+      verificationArtifactRef,
+      preservedIndividualSources: true,
+      explanation,
+    }),
+  });
+
   const j = justifications?.[methodId];
   if (!isPlainObject(j)) {
-    throw new ForecastPipelineRequestError(
-      `Multiple independently verified submissions [${allContributingIds.join(', ')}] target method '${methodId}'. Silent overwriting is prohibited, and combining separate sources requires a valid MultiSourceCombinationJustification in request.multiSourceCombinationJustifications['${methodId}'] with basis='${expectedBasis}'.`,
+    return makeRejection(
+      'missing-combination-justification',
+      `Rejected multi-source combination for '${methodId}' over [${allContributingIds.join(', ')}]: silent overwriting is prohibited, and combining separate sources requires a server-verified MultiSourceCombinationJustification with basis='${expectedBasis}'. All individual sources and provenance records were preserved.`,
     );
   }
+
+  const invalidReasons: string[] = [];
   if (j.basis !== expectedBasis) {
-    throw new ForecastPipelineRequestError(
-      `multiSourceCombinationJustifications['${methodId}'].basis must be '${expectedBasis}', received '${String(j.basis)}'`,
+    invalidReasons.push(
+      `basis must be '${expectedBasis}', received '${String(j.basis)}'`,
     );
   }
   if (j.disjointPopulationsOrWindowsVerified !== true) {
-    throw new ForecastPipelineRequestError(
-      `multiSourceCombinationJustifications['${methodId}'].disjointPopulationsOrWindowsVerified must be true`,
-    );
+    invalidReasons.push('disjointPopulationsOrWindowsVerified must be true');
   }
   if (j.homogeneousParameterSpaceVerified !== true) {
-    throw new ForecastPipelineRequestError(
-      `multiSourceCombinationJustifications['${methodId}'].homogeneousParameterSpaceVerified must be true`,
-    );
+    invalidReasons.push('homogeneousParameterSpaceVerified must be true');
   }
   if (
     methodId === 'weighted-kish-effective-binomial' &&
     j.commonExogenousWeightScaleVerified !== true
   ) {
-    throw new ForecastPipelineRequestError(
-      `multiSourceCombinationJustifications['weighted-kish-effective-binomial'].commonExogenousWeightScaleVerified must be true`,
-    );
+    invalidReasons.push('commonExogenousWeightScaleVerified must be true');
   }
   if (
     typeof j.mathematicalRationale !== 'string' ||
     j.mathematicalRationale.trim().length < 10
   ) {
-    throw new ForecastPipelineRequestError(
-      `multiSourceCombinationJustifications['${methodId}'].mathematicalRationale must be a substantive explanation (at least 10 characters)`,
-    );
-  }
-  if (!Array.isArray(j.contributingEvidenceIds)) {
-    throw new ForecastPipelineRequestError(
-      `multiSourceCombinationJustifications['${methodId}'].contributingEvidenceIds must be an array matching [${allContributingIds.join(', ')}]`,
-    );
-  }
-  const declaredIds = j.contributingEvidenceIds
-    .filter((id): id is string => typeof id === 'string')
-    .map((id) => id.trim())
-    .filter((id) => id.length > 0);
-  if (
-    declaredIds.length !== j.contributingEvidenceIds.length ||
-    new Set(declaredIds).size !== declaredIds.length ||
-    declaredIds.length < 2
-  ) {
-    throw new ForecastPipelineRequestError(
-      `multiSourceCombinationJustifications['${methodId}'].contributingEvidenceIds must contain at least 2 unique non-empty evidenceIds`,
-    );
-  }
-  const declaredSet = new Set(declaredIds);
-  const expectedSet = new Set(allContributingIds);
-  const missing = allContributingIds.filter((id) => !declaredSet.has(id));
-  const extra = declaredIds.filter((id) => !expectedSet.has(id));
-  if (missing.length > 0 || extra.length > 0) {
-    throw new ForecastPipelineRequestError(
-      `multiSourceCombinationJustifications['${methodId}'].contributingEvidenceIds does not match active contributing evidenceIds [${allContributingIds.join(', ')}] (missing=[${missing.join(', ')}], unexpected=[${extra.join(', ')}])`,
+    invalidReasons.push(
+      'mathematicalRationale must be a substantive explanation (at least 10 characters)',
     );
   }
 
-  return Object.freeze({
-    basis: j.basis,
-    contributingEvidenceIds: Object.freeze(declaredIds),
-    disjointPopulationsOrWindowsVerified: true,
-    homogeneousParameterSpaceVerified: true,
-    ...(j.commonExogenousWeightScaleVerified !== undefined
-      ? {
-          commonExogenousWeightScaleVerified:
-            j.commonExogenousWeightScaleVerified,
-        }
-      : {}),
-    mathematicalRationale: j.mathematicalRationale.trim(),
+  let declaredIds: string[] = [];
+  if (!Array.isArray(j.contributingEvidenceIds)) {
+    invalidReasons.push(
+      `contributingEvidenceIds must be an array matching [${allContributingIds.join(', ')}]`,
+    );
+  } else {
+    declaredIds = j.contributingEvidenceIds
+      .filter((id): id is string => typeof id === 'string')
+      .map((id) => id.trim())
+      .filter((id) => id.length > 0);
+    if (
+      declaredIds.length !== j.contributingEvidenceIds.length ||
+      new Set(declaredIds).size !== declaredIds.length ||
+      declaredIds.length < 2
+    ) {
+      invalidReasons.push(
+        'contributingEvidenceIds must contain at least 2 unique non-empty evidenceIds',
+      );
+    } else {
+      const declaredSet = new Set(declaredIds);
+      const expectedSet = new Set(allContributingIds);
+      const missing = allContributingIds.filter((id) => !declaredSet.has(id));
+      const extra = declaredIds.filter((id) => !expectedSet.has(id));
+      if (missing.length > 0 || extra.length > 0) {
+        invalidReasons.push(
+          `contributingEvidenceIds does not match active contributing evidenceIds [${allContributingIds.join(', ')}] (missing=[${missing.join(', ')}], unexpected=[${extra.join(', ')}])`,
+        );
+      }
+    }
+  }
+
+  if (invalidReasons.length > 0) {
+    return makeRejection(
+      'invalid-combination-justification',
+      `Rejected invalid multi-source combination justification for '${methodId}' over [${allContributingIds.join(', ')}]: ${invalidReasons.join('; ')}. All individual sources and provenance records were preserved.`,
+    );
+  }
+
+  const normalizedJustification: MultiSourceCombinationJustification =
+    Object.freeze({
+      basis: j.basis as MultiSourceCombinationBasis,
+      contributingEvidenceIds: Object.freeze(declaredIds),
+      disjointPopulationsOrWindowsVerified: true,
+      homogeneousParameterSpaceVerified: true,
+      ...(j.commonExogenousWeightScaleVerified !== undefined
+        ? {
+            commonExogenousWeightScaleVerified:
+              j.commonExogenousWeightScaleVerified,
+          }
+        : {}),
+      mathematicalRationale: (j.mathematicalRationale as string).trim(),
+    });
+
+  // Fail-closed server-side verification gate: caller-declared booleans and
+  // rationale prose are NEVER trusted without an independent combinationVerifier.
+  if (combinationVerifier === undefined) {
+    return makeRejection(
+      'missing-trusted-combination-verifier',
+      `Rejected multi-source combination for '${methodId}' over [${allContributingIds.join(', ')}] (fail-closed): no trusted server-side combinationVerifier was supplied. Caller-declared disjointPopulationsOrWindowsVerified/homogeneousParameterSpaceVerified booleans and rationale text do not establish independence or shared parameters by themselves. All individual sources and provenance records were preserved.`,
+    );
+  }
+
+  const decision = combinationVerifier({
+    methodId,
+    expectedBasis,
+    justification: normalizedJustification,
+    contributingSubmissions: Object.freeze([...contributingSubmissions]),
+    contributingEvidenceIds: frozenIds,
+    contributingSourceUrls: frozenUrls,
+    outcomeSpace,
+    referenceTime,
   });
+
+  const vId =
+    isPlainObject(decision) && typeof decision.verifierId === 'string'
+      ? decision.verifierId.trim()
+      : '';
+  const vRat =
+    isPlainObject(decision) && typeof decision.rationale === 'string'
+      ? decision.rationale.trim()
+      : '';
+  const artifactRef =
+    isPlainObject(decision) &&
+    typeof decision.verificationArtifactRef === 'string' &&
+    decision.verificationArtifactRef.trim().length > 0
+      ? decision.verificationArtifactRef.trim()
+      : null;
+
+  if (vId.length === 0 || vRat.length === 0 || decision.verified !== true) {
+    return makeRejection(
+      'rejected-by-trusted-combination-verifier',
+      `Rejected multi-source combination for '${methodId}' over [${allContributingIds.join(', ')}] at trusted combinationVerifier ('${vId || 'invalid'}'): ${vRat || 'did not return verified=true with non-empty verifierId and rationale'}. All individual sources and provenance records were preserved.`,
+      vId || null,
+      artifactRef,
+    );
+  }
+
+  if (decision.verifiedEvidenceIds !== undefined) {
+    if (!Array.isArray(decision.verifiedEvidenceIds)) {
+      return makeRejection(
+        'rejected-by-trusted-combination-verifier',
+        `Rejected multi-source combination for '${methodId}' at trusted combinationVerifier ('${vId}'): verifiedEvidenceIds must be an array when supplied. All individual sources and provenance records were preserved.`,
+        vId,
+        artifactRef,
+      );
+    }
+    const verifiedSet = new Set(
+      decision.verifiedEvidenceIds
+        .filter((id): id is string => typeof id === 'string')
+        .map((id) => id.trim()),
+    );
+    const unverified = allContributingIds.filter((id) => !verifiedSet.has(id));
+    if (unverified.length > 0) {
+      return makeRejection(
+        'rejected-by-trusted-combination-verifier',
+        `Rejected multi-source combination for '${methodId}' at trusted combinationVerifier ('${vId}'): contributor(s) [${unverified.join(', ')}] were not covered in verifiedEvidenceIds. All individual sources and provenance records were preserved.`,
+        vId,
+        artifactRef,
+      );
+    }
+  }
+
+  return {
+    approved: true,
+    justification: normalizedJustification,
+    verifiedByVerifierId: vId,
+    verificationArtifactRef: artifactRef,
+    verifierRationale: vRat,
+  };
 }
 
 /* -------------------------------------------------------------------------
@@ -2393,8 +3018,9 @@ function validateAndAssertCombinationJustification(params: {
  *   3. Pipeline-wide global event deduplication across all verified
  *      `historical-observations` submissions by canonical event identity
  *      (`${schemaKind}::${eventFamily}::${eventId}`).
- *   4. Explicit non-overwriting multi-source contribution tracking and
- *      mathematical validation of all priors, units, exposures, and parameters.
+ *   4. Fail-closed server-side verification for both `StructuralSymmetryContract`
+ *      (`symmetryVerifier`) and `MultiSourceCombinationJustification`
+ *      (`combinationVerifier`).
  */
 export function assessCollectedEvidence(params: {
   readonly harvestResult: EvidenceHarvestResult;
@@ -2412,6 +3038,7 @@ export function assessCollectedEvidence(params: {
   readonly registry: ScientificMethodRegistry;
   readonly evidenceVerifier?: EvidenceVerifier;
   readonly symmetryVerifier?: StructuralSymmetryVerifier;
+  readonly combinationVerifier?: MultiSourceCombinationVerifier;
 }): {
   readonly report: EvidenceAssessmentReport;
   readonly provenanceRecords: readonly PipelineEvidenceProvenanceRecord[];
@@ -2434,6 +3061,7 @@ export function assessCollectedEvidence(params: {
     registry,
     evidenceVerifier,
     symmetryVerifier,
+    combinationVerifier,
   } = params;
 
   const effectiveExecutedAt: IsoDateTime =
@@ -2452,8 +3080,17 @@ export function assessCollectedEvidence(params: {
   const deduplicatedEventDiagnostics: DeduplicatedEventObservationDiagnostic[] =
     [];
   const multiSourceCombinations: MultiSourceCombinationDiagnostic[] = [];
+  const rejectedMultiSourceCombinations: RejectedMultiSourceCombinationDiagnostic[] =
+    [];
+  const rejectedCombinationMessageByMethod = new Map<
+    ScientificMethodId,
+    string
+  >();
+  let structuralSymmetryVerification: StructuralSymmetryVerificationDiagnostic | null =
+    null;
   const allProvenanceRecords: PipelineEvidenceProvenanceRecord[] = [];
   const assessmentNotes: string[] = [];
+  const verifiedSubmissionById = new Map<string, PipelineEvidenceSubmission>();
 
   // 1. Classify all harvested items from EvidenceHarvester as documentary-evidence:
   for (const item of harvestResult.items) {
@@ -3037,6 +3674,7 @@ export function assessCollectedEvidence(params: {
     if (qSub.lowConfidenceEvidence === true) {
       lowConfidenceEvidence = true;
     }
+    verifiedSubmissionById.set(evidenceId, qSub);
 
     /* -------------------------------------------------------------------
        Category 2: Historical Observations (`historical-observations`)
@@ -3748,11 +4386,6 @@ export function assessCollectedEvidence(params: {
           `submittedEvidence[${idx}] ('${evidenceId}')`,
         );
 
-        hasVerifiableEmpiricalData = true;
-        availableChannelSet.add('binary-trial-counts');
-        availableChannelSet.add('prior-hyperparameters');
-        supportedMethodSet.add('beta-binomial-conjugate');
-
         betaContributions.push({
           sourceKind: 'structured-numerical-dataset',
           evidenceIds: Object.freeze([evidenceId]),
@@ -3826,12 +4459,6 @@ export function assessCollectedEvidence(params: {
           ds.credibleIntervalLevel,
           `submittedEvidence[${idx}] ('${evidenceId}')`,
         );
-
-        hasVerifiableEmpiricalData = true;
-        availableChannelSet.add('weighted-binary-trials');
-        availableChannelSet.add('kish-effective-sample-size');
-        availableChannelSet.add('prior-hyperparameters');
-        supportedMethodSet.add('weighted-kish-effective-binomial');
 
         kishContributions.push({
           sourceKind: 'structured-numerical-dataset',
@@ -3913,12 +4540,6 @@ export function assessCollectedEvidence(params: {
           `submittedEvidence[${idx}] ('${evidenceId}')`,
         );
 
-        hasVerifiableEmpiricalData = true;
-        availableChannelSet.add('poisson-event-counts');
-        availableChannelSet.add('continuous-exposure-duration');
-        availableChannelSet.add('prior-hyperparameters');
-        supportedMethodSet.add('poisson-gamma-hazard');
-
         poissonContributions.push({
           sourceKind: 'structured-numerical-dataset',
           evidenceIds: Object.freeze([evidenceId]),
@@ -3989,11 +4610,6 @@ export function assessCollectedEvidence(params: {
           `submittedEvidence[${idx}] ('${evidenceId}')`,
         );
 
-        hasVerifiableEmpiricalData = true;
-        availableChannelSet.add('multinomial-category-counts');
-        availableChannelSet.add('prior-hyperparameters');
-        supportedMethodSet.add('dirichlet-multinomial-symmetry');
-
         dirichletContributions.push({
           sourceKind: 'structured-numerical-dataset',
           evidenceIds: Object.freeze([evidenceId]),
@@ -4061,30 +4677,23 @@ export function assessCollectedEvidence(params: {
           `submittedEvidence[${idx}] ('${evidenceId}')`,
         );
 
-        hasVerifiableEmpiricalData = true;
         const channels: MethodDataChannelId[] = [
           'continuous-state-trajectory',
           'drift-and-scale-estimates',
         ];
         const methods: UnimplementedScientificMethodId[] = [];
-        availableChannelSet.add('continuous-state-trajectory');
-        availableChannelSet.add('drift-and-scale-estimates');
 
         if (validatedCont.degreesOfFreedom !== undefined) {
-          availableChannelSet.add('tail-degrees-of-freedom');
           channels.push('tail-degrees-of-freedom');
           methods.push('student-t-terminal-diffusion');
-          supportedMethodSet.add('student-t-terminal-diffusion');
         }
         if (
           validatedCont.initialStateLevel !== undefined &&
           outcomeSpace.barrierLevel !== undefined &&
           outcomeSpace.barrierDirection !== undefined
         ) {
-          availableChannelSet.add('absorbing-barrier-specification');
           channels.push('absorbing-barrier-specification');
           methods.push('first-passage-barrier-diffusion');
-          supportedMethodSet.add('first-passage-barrier-diffusion');
         }
 
         continuousContributions.push({
@@ -4181,11 +4790,6 @@ export function assessCollectedEvidence(params: {
           `submittedEvidence[${idx}] ('${evidenceId}')`,
         );
 
-        hasVerifiableEmpiricalData = true;
-        availableChannelSet.add('binary-trial-counts');
-        availableChannelSet.add('prior-hyperparameters');
-        supportedMethodSet.add('beta-binomial-conjugate');
-
         betaContributions.push({
           sourceKind: 'statistical-sufficient-statistics',
           evidenceIds: Object.freeze([evidenceId]),
@@ -4262,12 +4866,6 @@ export function assessCollectedEvidence(params: {
           stats.credibleIntervalLevel,
           `submittedEvidence[${idx}] ('${evidenceId}')`,
         );
-
-        hasVerifiableEmpiricalData = true;
-        availableChannelSet.add('weighted-binary-trials');
-        availableChannelSet.add('kish-effective-sample-size');
-        availableChannelSet.add('prior-hyperparameters');
-        supportedMethodSet.add('weighted-kish-effective-binomial');
 
         kishContributions.push({
           sourceKind: 'statistical-sufficient-statistics',
@@ -4349,12 +4947,6 @@ export function assessCollectedEvidence(params: {
           `submittedEvidence[${idx}] ('${evidenceId}')`,
         );
 
-        hasVerifiableEmpiricalData = true;
-        availableChannelSet.add('poisson-event-counts');
-        availableChannelSet.add('continuous-exposure-duration');
-        availableChannelSet.add('prior-hyperparameters');
-        supportedMethodSet.add('poisson-gamma-hazard');
-
         poissonContributions.push({
           sourceKind: 'statistical-sufficient-statistics',
           evidenceIds: Object.freeze([evidenceId]),
@@ -4424,11 +5016,6 @@ export function assessCollectedEvidence(params: {
           stats.credibleIntervalLevel,
           `submittedEvidence[${idx}] ('${evidenceId}')`,
         );
-
-        hasVerifiableEmpiricalData = true;
-        availableChannelSet.add('multinomial-category-counts');
-        availableChannelSet.add('prior-hyperparameters');
-        supportedMethodSet.add('dirichlet-multinomial-symmetry');
 
         dirichletContributions.push({
           sourceKind: 'statistical-sufficient-statistics',
@@ -4500,16 +5087,12 @@ export function assessCollectedEvidence(params: {
           `submittedEvidence[${idx}] ('${evidenceId}')`,
         );
 
-        hasVerifiableEmpiricalData = true;
         const channels: MethodDataChannelId[] = [
           'continuous-state-trajectory',
           'drift-and-scale-estimates',
         ];
-        availableChannelSet.add('continuous-state-trajectory');
-        availableChannelSet.add('drift-and-scale-estimates');
 
         if (validatedCont.degreesOfFreedom !== undefined) {
-          availableChannelSet.add('tail-degrees-of-freedom');
           channels.push('tail-degrees-of-freedom');
         }
         if (
@@ -4517,10 +5100,8 @@ export function assessCollectedEvidence(params: {
           outcomeSpace.barrierLevel !== undefined &&
           outcomeSpace.barrierDirection !== undefined
         ) {
-          availableChannelSet.add('absorbing-barrier-specification');
           channels.push('absorbing-barrier-specification');
         }
-        supportedMethodSet.add(stats.targetMethodId);
 
         continuousContributions.push({
           evidenceId,
@@ -4872,10 +5453,6 @@ export function assessCollectedEvidence(params: {
         globalFailures,
         `global binary-trials pool [${activeBinarySubmissionIds.join(', ')}]`,
       );
-      hasVerifiableEmpiricalData = true;
-      availableChannelSet.add('binary-trial-counts');
-      availableChannelSet.add('prior-hyperparameters');
-      supportedMethodSet.add('beta-binomial-conjugate');
 
       const poolUrls = Object.freeze(allBinaryCitations.map((c) => c.url));
       const poolIds = Object.freeze([...activeBinarySubmissionIds]);
@@ -4918,10 +5495,6 @@ export function assessCollectedEvidence(params: {
           },
           `global weighted binary-trials pool [${activeBinarySubmissionIds.join(', ')}]`,
         );
-
-        availableChannelSet.add('weighted-binary-trials');
-        availableChannelSet.add('kish-effective-sample-size');
-        supportedMethodSet.add('weighted-kish-effective-binomial');
 
         kishContributions.push({
           sourceKind: 'historical-observations-pool',
@@ -5202,60 +5775,90 @@ export function assessCollectedEvidence(params: {
     }
 
     if (activePoissonSubmissionIds.length > 0) {
-      let poolJustifiedDisjoint = false;
+      const poolUrls = allPoissonCitations.map((c) => c.url);
+      let preVerifiedCombination:
+        | PoissonMethodContribution['preVerifiedCombination']
+        | undefined;
+      let poolAllowed = true;
+
       if (exposureDurationByWindowId.size > 1) {
-        validateAndAssertCombinationJustification({
+        const contributingSubs = activePoissonSubmissionIds
+          .map((id) => verifiedSubmissionById.get(id))
+          .filter((s): s is PipelineEvidenceSubmission => s !== undefined);
+        const gate = evaluateMultiSourceCombinationGate({
           methodId: 'poisson-gamma-hazard',
           expectedBasis: 'disjoint-poisson-exposure-windows',
           allContributingIds: activePoissonSubmissionIds,
+          allContributingUrls: poolUrls,
+          contributingSubmissions: contributingSubs,
+          outcomeSpace,
+          referenceTime,
           ...(multiSourceCombinationJustifications !== undefined
             ? { justifications: multiSourceCombinationJustifications }
             : {}),
+          ...(combinationVerifier !== undefined ? { combinationVerifier } : {}),
         });
-        poolJustifiedDisjoint = true;
+        if (!gate.approved) {
+          poolAllowed = false;
+          rejectedMultiSourceCombinations.push(gate.rejection);
+          assessmentNotes.push(gate.rejection.explanation);
+          rejectedCombinationMessageByMethod.set(
+            'poisson-gamma-hazard',
+            gate.rejection.explanation,
+          );
+        } else {
+          preVerifiedCombination = {
+            justification: gate.justification,
+            verifiedByVerifierId: gate.verifiedByVerifierId,
+            verificationArtifactRef: gate.verificationArtifactRef,
+            verifierRationale: gate.verifierRationale,
+          };
+        }
       }
 
-      const totalExposureDuration = kahanNeumaierSum([
-        ...exposureDurationByWindowId.values(),
-      ]);
-      const validatedPoolPoisson = validatePoissonExposuresUnitsAndPosterior(
-        {
-          eventCount: globalArrivalCount,
-          exposureDuration: totalExposureDuration,
-          exposureUnit: referenceSub.historicalExposureUnit,
-          forecastExposureDuration: referenceSub.forecastExposureDuration,
-          forecastExposureUnit: referenceSub.forecastExposureUnit,
-          prior: referenceSub.prior,
-        },
-        `global poisson-arrivals pool [${activePoissonSubmissionIds.join(', ')}]`,
-      );
-
-      hasVerifiableEmpiricalData = true;
-      availableChannelSet.add('poisson-event-counts');
-      availableChannelSet.add('continuous-exposure-duration');
-      availableChannelSet.add('prior-hyperparameters');
-      supportedMethodSet.add('poisson-gamma-hazard');
-
-      poissonContributions.push({
-        sourceKind: 'historical-observations-pool',
-        evidenceIds: Object.freeze([...activePoissonSubmissionIds]),
-        sourceUrls: Object.freeze(allPoissonCitations.map((c) => c.url)),
-        eventOutcomeIndex: referenceSub.eventOutcomeIndex,
-        eventCount: validatedPoolPoisson.eventCount,
-        exposureDuration: validatedPoolPoisson.exposureDuration,
-        exposureUnit: validatedPoolPoisson.exposureUnit,
-        forecastExposureDuration: validatedPoolPoisson.forecastExposureDuration,
-        forecastExposureUnit: validatedPoolPoisson.forecastExposureUnit,
-        prior: validatedPoolPoisson.prior,
-        ...(referenceSub.credibleIntervalLevel !== undefined
-          ? { credibleIntervalLevel: referenceSub.credibleIntervalLevel }
-          : {}),
-      });
-
-      if (activePoissonSubmissionIds.length > 1 && poolJustifiedDisjoint) {
-        assessmentNotes.push(
-          `Pooled ${activePoissonSubmissionIds.length} disjoint Poisson exposure windows [${[...exposureDurationByWindowId.keys()].join(', ')}] into total exposure ${totalExposureDuration} ${validatedPoolPoisson.exposureUnit} via justified multi-source combination.`,
+      if (poolAllowed) {
+        const totalExposureDuration = kahanNeumaierSum([
+          ...exposureDurationByWindowId.values(),
+        ]);
+        const validatedPoolPoisson = validatePoissonExposuresUnitsAndPosterior(
+          {
+            eventCount: globalArrivalCount,
+            exposureDuration: totalExposureDuration,
+            exposureUnit: referenceSub.historicalExposureUnit,
+            forecastExposureDuration: referenceSub.forecastExposureDuration,
+            forecastExposureUnit: referenceSub.forecastExposureUnit,
+            prior: referenceSub.prior,
+          },
+          `global poisson-arrivals pool [${activePoissonSubmissionIds.join(', ')}]`,
         );
+
+        poissonContributions.push({
+          sourceKind: 'historical-observations-pool',
+          evidenceIds: Object.freeze([...activePoissonSubmissionIds]),
+          sourceUrls: Object.freeze(poolUrls),
+          eventOutcomeIndex: referenceSub.eventOutcomeIndex,
+          eventCount: validatedPoolPoisson.eventCount,
+          exposureDuration: validatedPoolPoisson.exposureDuration,
+          exposureUnit: validatedPoolPoisson.exposureUnit,
+          forecastExposureDuration: validatedPoolPoisson.forecastExposureDuration,
+          forecastExposureUnit: validatedPoolPoisson.forecastExposureUnit,
+          prior: validatedPoolPoisson.prior,
+          ...(referenceSub.credibleIntervalLevel !== undefined
+            ? { credibleIntervalLevel: referenceSub.credibleIntervalLevel }
+            : {}),
+          ...(preVerifiedCombination !== undefined
+            ? { preVerifiedCombination }
+            : {}),
+        });
+
+        if (
+          activePoissonSubmissionIds.length > 1 &&
+          preVerifiedCombination !== undefined
+        ) {
+          assessmentNotes.push(
+            `Pooled ${activePoissonSubmissionIds.length} disjoint Poisson exposure windows [${[...exposureDurationByWindowId.keys()].join(', ')}] into total exposure ${totalExposureDuration} ${validatedPoolPoisson.exposureUnit} (verified by '${preVerifiedCombination.verifiedByVerifierId}').`,
+          );
+        }
       }
     }
   }
@@ -5500,11 +6103,6 @@ export function assessCollectedEvidence(params: {
           `global multinomial-trials pool [${activeMultinomialSubmissionIds.join(', ')}]`,
         );
 
-      hasVerifiableEmpiricalData = true;
-      availableChannelSet.add('multinomial-category-counts');
-      availableChannelSet.add('prior-hyperparameters');
-      supportedMethodSet.add('dirichlet-multinomial-symmetry');
-
       dirichletContributions.push({
         sourceKind: 'historical-observations-pool',
         evidenceIds: Object.freeze([...activeMultinomialSubmissionIds]),
@@ -5520,12 +6118,16 @@ export function assessCollectedEvidence(params: {
 
   /* -----------------------------------------------------------------------
      Phase 3: Non-Overwriting Multi-Source Resolution per Method
+     (Fail-closed server-side combination verification)
      ----------------------------------------------------------------------- */
   if (betaContributions.length > 0) {
     const firstBeta = betaContributions[0]!;
     if (betaContributions.length === 1) {
       binaryTrialSuccesses = firstBeta.successes;
       binaryTrialFailures = firstBeta.failures;
+      availableChannelSet.add('binary-trial-counts');
+      availableChannelSet.add('prior-hyperparameters');
+      supportedMethodSet.add('beta-binomial-conjugate');
 
       const betaInput: BetaBinomialExecutionInput = Object.freeze({
         methodId: 'beta-binomial-conjugate',
@@ -5556,6 +6158,8 @@ export function assessCollectedEvidence(params: {
           contributingEvidenceIds: firstBeta.evidenceIds,
           contributingSourceUrls: firstBeta.sourceUrls,
           dependencePreserved: true,
+          verifiedByVerifierId: null,
+          verificationArtifactRef: null,
           mathematicalRationale: rationale,
           dependenceNote: `Merged ${firstBeta.evidenceIds.length} binary-trials observation feeds via pipeline-wide canonical event deduplication; overlapping event reports were collapsed without double-counting.`,
         });
@@ -5577,100 +6181,127 @@ export function assessCollectedEvidence(params: {
           }
         }
       }
+      const contributingSubs = allIds
+        .map((id) => verifiedSubmissionById.get(id))
+        .filter((s): s is PipelineEvidenceSubmission => s !== undefined);
 
-      const justification = validateAndAssertCombinationJustification({
+      const gate = evaluateMultiSourceCombinationGate({
         methodId: 'beta-binomial-conjugate',
         expectedBasis: 'disjoint-exchangeable-cohorts',
         allContributingIds: allIds,
+        allContributingUrls: allUrls,
+        contributingSubmissions: contributingSubs,
+        outcomeSpace,
+        referenceTime,
         ...(multiSourceCombinationJustifications !== undefined
           ? { justifications: multiSourceCombinationJustifications }
           : {}),
+        ...(combinationVerifier !== undefined ? { combinationVerifier } : {}),
       });
 
-      const refAlpha0 =
-        firstBeta.successOutcomeIndex === 0
-          ? firstBeta.prior.alpha
-          : firstBeta.prior.beta;
-      const refBeta1 =
-        firstBeta.successOutcomeIndex === 0
-          ? firstBeta.prior.beta
-          : firstBeta.prior.alpha;
-      const refCi =
-        firstBeta.credibleIntervalLevel ?? DEFAULT_CREDIBLE_INTERVAL_LEVEL;
+      if (!gate.approved) {
+        rejectedMultiSourceCombinations.push(gate.rejection);
+        assessmentNotes.push(gate.rejection.explanation);
+        rejectedCombinationMessageByMethod.set(
+          'beta-binomial-conjugate',
+          gate.rejection.explanation,
+        );
+      } else {
+        const refAlpha0 =
+          firstBeta.successOutcomeIndex === 0
+            ? firstBeta.prior.alpha
+            : firstBeta.prior.beta;
+        const refBeta1 =
+          firstBeta.successOutcomeIndex === 0
+            ? firstBeta.prior.beta
+            : firstBeta.prior.alpha;
+        const refCi =
+          firstBeta.credibleIntervalLevel ?? DEFAULT_CREDIBLE_INTERVAL_LEVEL;
 
-      const succ0List: number[] = [];
-      const fail1List: number[] = [];
-      for (const c of betaContributions) {
-        const alpha0 =
-          c.successOutcomeIndex === 0 ? c.prior.alpha : c.prior.beta;
-        const beta1 =
-          c.successOutcomeIndex === 0 ? c.prior.beta : c.prior.alpha;
-        const ci = c.credibleIntervalLevel ?? DEFAULT_CREDIBLE_INTERVAL_LEVEL;
-        if (
-          Math.abs(alpha0 - refAlpha0) > 1e-12 ||
-          Math.abs(beta1 - refBeta1) > 1e-12
-        ) {
-          throw new ForecastPipelineRequestError(
-            `Cannot combine multiple 'beta-binomial-conjugate' submissions [${allIds.join(', ')}] with incompatible Beta priors`,
+        const succ0List: number[] = [];
+        const fail1List: number[] = [];
+        for (const c of betaContributions) {
+          const alpha0 =
+            c.successOutcomeIndex === 0 ? c.prior.alpha : c.prior.beta;
+          const beta1 =
+            c.successOutcomeIndex === 0 ? c.prior.beta : c.prior.alpha;
+          const ci =
+            c.credibleIntervalLevel ?? DEFAULT_CREDIBLE_INTERVAL_LEVEL;
+          if (
+            Math.abs(alpha0 - refAlpha0) > 1e-12 ||
+            Math.abs(beta1 - refBeta1) > 1e-12
+          ) {
+            throw new ForecastPipelineRequestError(
+              `Cannot combine multiple 'beta-binomial-conjugate' submissions [${allIds.join(', ')}] with incompatible Beta priors`,
+            );
+          }
+          if (Math.abs(ci - refCi) > 1e-12) {
+            throw new ForecastPipelineRequestError(
+              `Cannot combine multiple 'beta-binomial-conjugate' submissions [${allIds.join(', ')}] with conflicting credibleIntervalLevel (${refCi} vs ${ci})`,
+            );
+          }
+          succ0List.push(
+            c.successOutcomeIndex === 0 ? c.successes : c.failures,
+          );
+          fail1List.push(
+            c.successOutcomeIndex === 0 ? c.failures : c.successes,
           );
         }
-        if (Math.abs(ci - refCi) > 1e-12) {
-          throw new ForecastPipelineRequestError(
-            `Cannot combine multiple 'beta-binomial-conjugate' submissions [${allIds.join(', ')}] with conflicting credibleIntervalLevel (${refCi} vs ${ci})`,
-          );
-        }
-        succ0List.push(c.successOutcomeIndex === 0 ? c.successes : c.failures);
-        fail1List.push(c.successOutcomeIndex === 0 ? c.failures : c.successes);
+
+        const combinedSucc0 = kahanNeumaierSum(succ0List);
+        const combinedFail1 = kahanNeumaierSum(fail1List);
+        const canonicalPrior = Object.freeze({
+          alpha: refAlpha0,
+          beta: refBeta1,
+        });
+        validateBetaCountsAndPosterior(
+          canonicalPrior,
+          combinedSucc0,
+          combinedFail1,
+          `combined beta-binomial-conjugate submissions [${allIds.join(', ')}]`,
+        );
+
+        binaryTrialSuccesses = combinedSucc0;
+        binaryTrialFailures = combinedFail1;
+        availableChannelSet.add('binary-trial-counts');
+        availableChannelSet.add('prior-hyperparameters');
+        supportedMethodSet.add('beta-binomial-conjugate');
+
+        const betaInput: BetaBinomialExecutionInput = Object.freeze({
+          methodId: 'beta-binomial-conjugate',
+          outcomeSpace,
+          successOutcomeIndex: 0,
+          prior: canonicalPrior,
+          observed: Object.freeze({
+            successes: combinedSucc0,
+            failures: combinedFail1,
+          }),
+          ...(firstBeta.credibleIntervalLevel !== undefined
+            ? { credibleIntervalLevel: refCi }
+            : {}),
+        });
+        preparedMethodInputs.set('beta-binomial-conjugate', {
+          methodId: 'beta-binomial-conjugate',
+          executionInput: betaInput,
+          provenanceIds: Object.freeze(allIds),
+          sourceUrls: Object.freeze(allUrls),
+        });
+
+        const diag: MultiSourceCombinationDiagnostic = Object.freeze({
+          methodId: 'beta-binomial-conjugate',
+          combinationMode: 'mathematically-justified-disjoint-combination',
+          combinationBasis: gate.justification.basis,
+          contributingEvidenceIds: Object.freeze(allIds),
+          contributingSourceUrls: Object.freeze(allUrls),
+          dependencePreserved: true,
+          verifiedByVerifierId: gate.verifiedByVerifierId,
+          verificationArtifactRef: gate.verificationArtifactRef,
+          mathematicalRationale: gate.justification.mathematicalRationale,
+          dependenceNote: `Combined ${allIds.length} verified sources for 'beta-binomial-conjugate' under justified basis '${gate.justification.basis}' (total outcomes: [${combinedSucc0}, ${combinedFail1}]; verified by '${gate.verifiedByVerifierId}': ${gate.verifierRationale}). All source provenance IDs and URLs preserved.`,
+        });
+        multiSourceCombinations.push(diag);
+        assessmentNotes.push(diag.dependenceNote);
       }
-
-      const combinedSucc0 = kahanNeumaierSum(succ0List);
-      const combinedFail1 = kahanNeumaierSum(fail1List);
-      const canonicalPrior = Object.freeze({
-        alpha: refAlpha0,
-        beta: refBeta1,
-      });
-      validateBetaCountsAndPosterior(
-        canonicalPrior,
-        combinedSucc0,
-        combinedFail1,
-        `combined beta-binomial-conjugate submissions [${allIds.join(', ')}]`,
-      );
-
-      binaryTrialSuccesses = combinedSucc0;
-      binaryTrialFailures = combinedFail1;
-
-      const betaInput: BetaBinomialExecutionInput = Object.freeze({
-        methodId: 'beta-binomial-conjugate',
-        outcomeSpace,
-        successOutcomeIndex: 0,
-        prior: canonicalPrior,
-        observed: Object.freeze({
-          successes: combinedSucc0,
-          failures: combinedFail1,
-        }),
-        ...(firstBeta.credibleIntervalLevel !== undefined
-          ? { credibleIntervalLevel: refCi }
-          : {}),
-      });
-      preparedMethodInputs.set('beta-binomial-conjugate', {
-        methodId: 'beta-binomial-conjugate',
-        executionInput: betaInput,
-        provenanceIds: Object.freeze(allIds),
-        sourceUrls: Object.freeze(allUrls),
-      });
-
-      const diag: MultiSourceCombinationDiagnostic = Object.freeze({
-        methodId: 'beta-binomial-conjugate',
-        combinationMode: 'mathematically-justified-disjoint-combination',
-        combinationBasis: justification.basis,
-        contributingEvidenceIds: Object.freeze(allIds),
-        contributingSourceUrls: Object.freeze(allUrls),
-        dependencePreserved: true,
-        mathematicalRationale: justification.mathematicalRationale,
-        dependenceNote: `Combined ${allIds.length} verified sources for 'beta-binomial-conjugate' under justified basis '${justification.basis}' (total outcomes: [${combinedSucc0}, ${combinedFail1}]). All source provenance IDs and URLs preserved.`,
-      });
-      multiSourceCombinations.push(diag);
-      assessmentNotes.push(diag.dependenceNote);
     }
   }
 
@@ -5689,6 +6320,10 @@ export function assessCollectedEvidence(params: {
       );
       weightedSampleSize = validatedSingle.observationCount;
       kishEffectiveSampleSize = validatedSingle.nEff;
+      availableChannelSet.add('weighted-binary-trials');
+      availableChannelSet.add('kish-effective-sample-size');
+      availableChannelSet.add('prior-hyperparameters');
+      supportedMethodSet.add('weighted-kish-effective-binomial');
 
       const kishInput: WeightedKishExecutionInput = Object.freeze({
         methodId: 'weighted-kish-effective-binomial',
@@ -5721,6 +6356,8 @@ export function assessCollectedEvidence(params: {
           contributingEvidenceIds: firstKish.evidenceIds,
           contributingSourceUrls: firstKish.sourceUrls,
           dependencePreserved: true,
+          verifiedByVerifierId: null,
+          verificationArtifactRef: null,
           mathematicalRationale: rationale,
           dependenceNote: `Merged ${firstKish.evidenceIds.length} weighted binary-trials feeds via canonical event deduplication before computing Kish effective sample size (n=${validatedSingle.observationCount}, n_eff=${validatedSingle.nEff.toFixed(4)}).`,
         });
@@ -5742,116 +6379,140 @@ export function assessCollectedEvidence(params: {
           }
         }
       }
+      const contributingSubs = allIds
+        .map((id) => verifiedSubmissionById.get(id))
+        .filter((s): s is PipelineEvidenceSubmission => s !== undefined);
 
-      const justification = validateAndAssertCombinationJustification({
+      const gate = evaluateMultiSourceCombinationGate({
         methodId: 'weighted-kish-effective-binomial',
         expectedBasis: 'disjoint-exogenous-weighted-cohorts',
         allContributingIds: allIds,
+        allContributingUrls: allUrls,
+        contributingSubmissions: contributingSubs,
+        outcomeSpace,
+        referenceTime,
         ...(multiSourceCombinationJustifications !== undefined
           ? { justifications: multiSourceCombinationJustifications }
           : {}),
+        ...(combinationVerifier !== undefined ? { combinationVerifier } : {}),
       });
 
-      const refAlpha0 =
-        firstKish.successOutcomeIndex === 0
-          ? firstKish.prior.alpha
-          : firstKish.prior.beta;
-      const refBeta1 =
-        firstKish.successOutcomeIndex === 0
-          ? firstKish.prior.beta
-          : firstKish.prior.alpha;
-      const refCi =
-        firstKish.credibleIntervalLevel ?? DEFAULT_CREDIBLE_INTERVAL_LEVEL;
-
-      const w0List: number[] = [];
-      const w1List: number[] = [];
-      const sumSqList: number[] = [];
-      const obsCountList: number[] = [];
-      for (const c of kishContributions) {
-        const alpha0 =
-          c.successOutcomeIndex === 0 ? c.prior.alpha : c.prior.beta;
-        const beta1 =
-          c.successOutcomeIndex === 0 ? c.prior.beta : c.prior.alpha;
-        const ci = c.credibleIntervalLevel ?? DEFAULT_CREDIBLE_INTERVAL_LEVEL;
-        if (
-          Math.abs(alpha0 - refAlpha0) > 1e-12 ||
-          Math.abs(beta1 - refBeta1) > 1e-12
-        ) {
-          throw new ForecastPipelineRequestError(
-            `Cannot combine multiple 'weighted-kish-effective-binomial' submissions [${allIds.join(', ')}] with incompatible Beta priors`,
-          );
-        }
-        if (Math.abs(ci - refCi) > 1e-12) {
-          throw new ForecastPipelineRequestError(
-            `Cannot combine multiple 'weighted-kish-effective-binomial' submissions [${allIds.join(', ')}] with conflicting credibleIntervalLevel (${refCi} vs ${ci})`,
-          );
-        }
-        w0List.push(
-          c.successOutcomeIndex === 0
-            ? c.weightedSuccessMass
-            : c.weightedFailureMass,
+      if (!gate.approved) {
+        rejectedMultiSourceCombinations.push(gate.rejection);
+        assessmentNotes.push(gate.rejection.explanation);
+        rejectedCombinationMessageByMethod.set(
+          'weighted-kish-effective-binomial',
+          gate.rejection.explanation,
         );
-        w1List.push(
-          c.successOutcomeIndex === 0
-            ? c.weightedFailureMass
-            : c.weightedSuccessMass,
-        );
-        sumSqList.push(c.sumSquaredWeights);
-        obsCountList.push(c.observationCount);
-      }
+      } else {
+        const refAlpha0 =
+          firstKish.successOutcomeIndex === 0
+            ? firstKish.prior.alpha
+            : firstKish.prior.beta;
+        const refBeta1 =
+          firstKish.successOutcomeIndex === 0
+            ? firstKish.prior.beta
+            : firstKish.prior.alpha;
+        const refCi =
+          firstKish.credibleIntervalLevel ?? DEFAULT_CREDIBLE_INTERVAL_LEVEL;
 
-      const canonicalPrior = Object.freeze({
-        alpha: refAlpha0,
-        beta: refBeta1,
-      });
-      const combinedKish = validateWeightedKishPayload(
-        {
-          weightedSuccessMass: kahanNeumaierSum(w0List),
-          weightedFailureMass: kahanNeumaierSum(w1List),
-          sumSquaredWeights: kahanNeumaierSum(sumSqList),
-          observationCount: kahanNeumaierSum(obsCountList),
+        const w0List: number[] = [];
+        const w1List: number[] = [];
+        const sumSqList: number[] = [];
+        const obsCountList: number[] = [];
+        for (const c of kishContributions) {
+          const alpha0 =
+            c.successOutcomeIndex === 0 ? c.prior.alpha : c.prior.beta;
+          const beta1 =
+            c.successOutcomeIndex === 0 ? c.prior.beta : c.prior.alpha;
+          const ci =
+            c.credibleIntervalLevel ?? DEFAULT_CREDIBLE_INTERVAL_LEVEL;
+          if (
+            Math.abs(alpha0 - refAlpha0) > 1e-12 ||
+            Math.abs(beta1 - refBeta1) > 1e-12
+          ) {
+            throw new ForecastPipelineRequestError(
+              `Cannot combine multiple 'weighted-kish-effective-binomial' submissions [${allIds.join(', ')}] with incompatible Beta priors`,
+            );
+          }
+          if (Math.abs(ci - refCi) > 1e-12) {
+            throw new ForecastPipelineRequestError(
+              `Cannot combine multiple 'weighted-kish-effective-binomial' submissions [${allIds.join(', ')}] with conflicting credibleIntervalLevel (${refCi} vs ${ci})`,
+            );
+          }
+          w0List.push(
+            c.successOutcomeIndex === 0
+              ? c.weightedSuccessMass
+              : c.weightedFailureMass,
+          );
+          w1List.push(
+            c.successOutcomeIndex === 0
+              ? c.weightedFailureMass
+              : c.weightedSuccessMass,
+          );
+          sumSqList.push(c.sumSquaredWeights);
+          obsCountList.push(c.observationCount);
+        }
+
+        const canonicalPrior = Object.freeze({
+          alpha: refAlpha0,
+          beta: refBeta1,
+        });
+        const combinedKish = validateWeightedKishPayload(
+          {
+            weightedSuccessMass: kahanNeumaierSum(w0List),
+            weightedFailureMass: kahanNeumaierSum(w1List),
+            sumSquaredWeights: kahanNeumaierSum(sumSqList),
+            observationCount: kahanNeumaierSum(obsCountList),
+            prior: canonicalPrior,
+          },
+          `combined weighted-kish-effective-binomial submissions [${allIds.join(', ')}]`,
+        );
+
+        weightedSampleSize = combinedKish.observationCount;
+        kishEffectiveSampleSize = combinedKish.nEff;
+        availableChannelSet.add('weighted-binary-trials');
+        availableChannelSet.add('kish-effective-sample-size');
+        availableChannelSet.add('prior-hyperparameters');
+        supportedMethodSet.add('weighted-kish-effective-binomial');
+
+        const kishInput: WeightedKishExecutionInput = Object.freeze({
+          methodId: 'weighted-kish-effective-binomial',
+          outcomeSpace,
+          successOutcomeIndex: 0,
           prior: canonicalPrior,
-        },
-        `combined weighted-kish-effective-binomial submissions [${allIds.join(', ')}]`,
-      );
+          observed: Object.freeze({
+            weightedSuccessMass: combinedKish.weightedSuccessMass,
+            weightedFailureMass: combinedKish.weightedFailureMass,
+            sumSquaredWeights: combinedKish.sumSquaredWeights,
+            observationCount: combinedKish.observationCount,
+          }),
+          ...(firstKish.credibleIntervalLevel !== undefined
+            ? { credibleIntervalLevel: refCi }
+            : {}),
+        });
+        preparedMethodInputs.set('weighted-kish-effective-binomial', {
+          methodId: 'weighted-kish-effective-binomial',
+          executionInput: kishInput,
+          provenanceIds: Object.freeze(allIds),
+          sourceUrls: Object.freeze(allUrls),
+        });
 
-      weightedSampleSize = combinedKish.observationCount;
-      kishEffectiveSampleSize = combinedKish.nEff;
-
-      const kishInput: WeightedKishExecutionInput = Object.freeze({
-        methodId: 'weighted-kish-effective-binomial',
-        outcomeSpace,
-        successOutcomeIndex: 0,
-        prior: canonicalPrior,
-        observed: Object.freeze({
-          weightedSuccessMass: combinedKish.weightedSuccessMass,
-          weightedFailureMass: combinedKish.weightedFailureMass,
-          sumSquaredWeights: combinedKish.sumSquaredWeights,
-          observationCount: combinedKish.observationCount,
-        }),
-        ...(firstKish.credibleIntervalLevel !== undefined
-          ? { credibleIntervalLevel: refCi }
-          : {}),
-      });
-      preparedMethodInputs.set('weighted-kish-effective-binomial', {
-        methodId: 'weighted-kish-effective-binomial',
-        executionInput: kishInput,
-        provenanceIds: Object.freeze(allIds),
-        sourceUrls: Object.freeze(allUrls),
-      });
-
-      const diag: MultiSourceCombinationDiagnostic = Object.freeze({
-        methodId: 'weighted-kish-effective-binomial',
-        combinationMode: 'mathematically-justified-disjoint-combination',
-        combinationBasis: justification.basis,
-        contributingEvidenceIds: Object.freeze(allIds),
-        contributingSourceUrls: Object.freeze(allUrls),
-        dependencePreserved: true,
-        mathematicalRationale: justification.mathematicalRationale,
-        dependenceNote: `Combined ${allIds.length} weighted binomial sources under justified basis '${justification.basis}' (n=${combinedKish.observationCount}, n_eff=${combinedKish.nEff.toFixed(4)}). All source provenance IDs and URLs preserved.`,
-      });
-      multiSourceCombinations.push(diag);
-      assessmentNotes.push(diag.dependenceNote);
+        const diag: MultiSourceCombinationDiagnostic = Object.freeze({
+          methodId: 'weighted-kish-effective-binomial',
+          combinationMode: 'mathematically-justified-disjoint-combination',
+          combinationBasis: gate.justification.basis,
+          contributingEvidenceIds: Object.freeze(allIds),
+          contributingSourceUrls: Object.freeze(allUrls),
+          dependencePreserved: true,
+          verifiedByVerifierId: gate.verifiedByVerifierId,
+          verificationArtifactRef: gate.verificationArtifactRef,
+          mathematicalRationale: gate.justification.mathematicalRationale,
+          dependenceNote: `Combined ${allIds.length} weighted binomial sources under justified basis '${gate.justification.basis}' (n=${combinedKish.observationCount}, n_eff=${combinedKish.nEff.toFixed(4)}; verified by '${gate.verifiedByVerifierId}': ${gate.verifierRationale}). All source provenance IDs and URLs preserved.`,
+        });
+        multiSourceCombinations.push(diag);
+        assessmentNotes.push(diag.dependenceNote);
+      }
     }
   }
 
@@ -5860,6 +6521,10 @@ export function assessCollectedEvidence(params: {
     if (poissonContributions.length === 1) {
       poissonEventCount = firstPoisson.eventCount;
       poissonExposureDuration = firstPoisson.exposureDuration;
+      availableChannelSet.add('poisson-event-counts');
+      availableChannelSet.add('continuous-exposure-duration');
+      availableChannelSet.add('prior-hyperparameters');
+      supportedMethodSet.add('poisson-gamma-hazard');
 
       const poissonInput: PoissonGammaExecutionInput = Object.freeze({
         methodId: 'poisson-gamma-hazard',
@@ -5892,28 +6557,27 @@ export function assessCollectedEvidence(params: {
       });
 
       if (firstPoisson.evidenceIds.length > 1) {
-        const disjointJustification =
-          firstPoisson.sourceKind === 'historical-observations-pool'
-            ? multiSourceCombinationJustifications?.['poisson-gamma-hazard']
-            : undefined;
+        const preVerified = firstPoisson.preVerifiedCombination;
         const diag: MultiSourceCombinationDiagnostic = Object.freeze({
           methodId: 'poisson-gamma-hazard',
           combinationMode:
-            disjointJustification !== undefined
+            preVerified !== undefined
               ? 'mathematically-justified-disjoint-combination'
               : 'global-event-deduplication',
           combinationBasis:
-            disjointJustification !== undefined
-              ? disjointJustification.basis
+            preVerified !== undefined
+              ? preVerified.justification.basis
               : 'event-level-global-deduplication',
           contributingEvidenceIds: firstPoisson.evidenceIds,
           contributingSourceUrls: firstPoisson.sourceUrls,
           dependencePreserved: true,
+          verifiedByVerifierId: preVerified?.verifiedByVerifierId ?? null,
+          verificationArtifactRef: preVerified?.verificationArtifactRef ?? null,
           mathematicalRationale:
-            disjointJustification !== undefined
-              ? disjointJustification.mathematicalRationale
+            preVerified !== undefined
+              ? preVerified.justification.mathematicalRationale
               : `Collapsed ${firstPoisson.evidenceIds.length} Poisson arrival feeds sharing exposure window '${firstPoisson.exposureDuration} ${firstPoisson.exposureUnit}' via canonical event deduplication.`,
-          dependenceNote: `Aggregated ${firstPoisson.evidenceIds.length} Poisson arrival feeds (k=${firstPoisson.eventCount}, T=${firstPoisson.exposureDuration} ${firstPoisson.exposureUnit}) without overwriting provenance.`,
+          dependenceNote: `Aggregated ${firstPoisson.evidenceIds.length} Poisson arrival feeds (k=${firstPoisson.eventCount}, T=${firstPoisson.exposureDuration} ${firstPoisson.exposureUnit}${preVerified ? `; verified by '${preVerified.verifiedByVerifierId}'` : ''}) without overwriting provenance.`,
         });
         multiSourceCombinations.push(diag);
         assessmentNotes.push(diag.dependenceNote);
@@ -5933,112 +6597,138 @@ export function assessCollectedEvidence(params: {
           }
         }
       }
+      const contributingSubs = allIds
+        .map((id) => verifiedSubmissionById.get(id))
+        .filter((s): s is PipelineEvidenceSubmission => s !== undefined);
 
-      const justification = validateAndAssertCombinationJustification({
+      const gate = evaluateMultiSourceCombinationGate({
         methodId: 'poisson-gamma-hazard',
         expectedBasis: 'disjoint-poisson-exposure-windows',
         allContributingIds: allIds,
+        allContributingUrls: allUrls,
+        contributingSubmissions: contributingSubs,
+        outcomeSpace,
+        referenceTime,
         ...(multiSourceCombinationJustifications !== undefined
           ? { justifications: multiSourceCombinationJustifications }
           : {}),
+        ...(combinationVerifier !== undefined ? { combinationVerifier } : {}),
       });
 
-      const refCi =
-        firstPoisson.credibleIntervalLevel ?? DEFAULT_CREDIBLE_INTERVAL_LEVEL;
-      const eventCounts: number[] = [];
-      const exposureDurations: number[] = [];
-      for (const c of poissonContributions) {
-        const ci = c.credibleIntervalLevel ?? DEFAULT_CREDIBLE_INTERVAL_LEVEL;
-        if (c.eventOutcomeIndex !== firstPoisson.eventOutcomeIndex) {
-          throw new ForecastPipelineRequestError(
-            `Cannot combine multiple 'poisson-gamma-hazard' submissions [${allIds.join(', ')}] with conflicting eventOutcomeIndex`,
-          );
+      if (!gate.approved) {
+        rejectedMultiSourceCombinations.push(gate.rejection);
+        assessmentNotes.push(gate.rejection.explanation);
+        rejectedCombinationMessageByMethod.set(
+          'poisson-gamma-hazard',
+          gate.rejection.explanation,
+        );
+      } else {
+        const refCi =
+          firstPoisson.credibleIntervalLevel ??
+          DEFAULT_CREDIBLE_INTERVAL_LEVEL;
+        const eventCounts: number[] = [];
+        const exposureDurations: number[] = [];
+        for (const c of poissonContributions) {
+          const ci =
+            c.credibleIntervalLevel ?? DEFAULT_CREDIBLE_INTERVAL_LEVEL;
+          if (c.eventOutcomeIndex !== firstPoisson.eventOutcomeIndex) {
+            throw new ForecastPipelineRequestError(
+              `Cannot combine multiple 'poisson-gamma-hazard' submissions [${allIds.join(', ')}] with conflicting eventOutcomeIndex`,
+            );
+          }
+          if (
+            c.exposureUnit !== firstPoisson.exposureUnit ||
+            c.forecastExposureUnit !== firstPoisson.forecastExposureUnit ||
+            Math.abs(
+              c.forecastExposureDuration -
+                firstPoisson.forecastExposureDuration,
+            ) > 1e-12
+          ) {
+            throw new ForecastPipelineRequestError(
+              `Cannot combine multiple 'poisson-gamma-hazard' submissions [${allIds.join(', ')}] with incompatible exposure units or forecast exposure horizons`,
+            );
+          }
+          if (
+            Math.abs(c.prior.shape - firstPoisson.prior.shape) > 1e-12 ||
+            Math.abs(c.prior.rate - firstPoisson.prior.rate) > 1e-12
+          ) {
+            throw new ForecastPipelineRequestError(
+              `Cannot combine multiple 'poisson-gamma-hazard' submissions [${allIds.join(', ')}] with incompatible Gamma priors`,
+            );
+          }
+          if (Math.abs(ci - refCi) > 1e-12) {
+            throw new ForecastPipelineRequestError(
+              `Cannot combine multiple 'poisson-gamma-hazard' submissions [${allIds.join(', ')}] with conflicting credibleIntervalLevel`,
+            );
+          }
+          eventCounts.push(c.eventCount);
+          exposureDurations.push(c.exposureDuration);
         }
-        if (
-          c.exposureUnit !== firstPoisson.exposureUnit ||
-          c.forecastExposureUnit !== firstPoisson.forecastExposureUnit ||
-          Math.abs(
-            c.forecastExposureDuration - firstPoisson.forecastExposureDuration,
-          ) > 1e-12
-        ) {
-          throw new ForecastPipelineRequestError(
-            `Cannot combine multiple 'poisson-gamma-hazard' submissions [${allIds.join(', ')}] with incompatible exposure units or forecast exposure horizons`,
-          );
-        }
-        if (
-          Math.abs(c.prior.shape - firstPoisson.prior.shape) > 1e-12 ||
-          Math.abs(c.prior.rate - firstPoisson.prior.rate) > 1e-12
-        ) {
-          throw new ForecastPipelineRequestError(
-            `Cannot combine multiple 'poisson-gamma-hazard' submissions [${allIds.join(', ')}] with incompatible Gamma priors`,
-          );
-        }
-        if (Math.abs(ci - refCi) > 1e-12) {
-          throw new ForecastPipelineRequestError(
-            `Cannot combine multiple 'poisson-gamma-hazard' submissions [${allIds.join(', ')}] with conflicting credibleIntervalLevel`,
-          );
-        }
-        eventCounts.push(c.eventCount);
-        exposureDurations.push(c.exposureDuration);
-      }
 
-      const combinedPoisson = validatePoissonExposuresUnitsAndPosterior(
-        {
-          eventCount: kahanNeumaierSum(eventCounts),
-          exposureDuration: kahanNeumaierSum(exposureDurations),
-          exposureUnit: firstPoisson.exposureUnit,
-          forecastExposureDuration: firstPoisson.forecastExposureDuration,
-          forecastExposureUnit: firstPoisson.forecastExposureUnit,
-          prior: firstPoisson.prior,
-        },
-        `combined poisson-gamma-hazard submissions [${allIds.join(', ')}]`,
-      );
+        const combinedPoisson = validatePoissonExposuresUnitsAndPosterior(
+          {
+            eventCount: kahanNeumaierSum(eventCounts),
+            exposureDuration: kahanNeumaierSum(exposureDurations),
+            exposureUnit: firstPoisson.exposureUnit,
+            forecastExposureDuration: firstPoisson.forecastExposureDuration,
+            forecastExposureUnit: firstPoisson.forecastExposureUnit,
+            prior: firstPoisson.prior,
+          },
+          `combined poisson-gamma-hazard submissions [${allIds.join(', ')}]`,
+        );
 
-      poissonEventCount = combinedPoisson.eventCount;
-      poissonExposureDuration = combinedPoisson.exposureDuration;
+        poissonEventCount = combinedPoisson.eventCount;
+        poissonExposureDuration = combinedPoisson.exposureDuration;
+        availableChannelSet.add('poisson-event-counts');
+        availableChannelSet.add('continuous-exposure-duration');
+        availableChannelSet.add('prior-hyperparameters');
+        supportedMethodSet.add('poisson-gamma-hazard');
 
-      const poissonInput: PoissonGammaExecutionInput = Object.freeze({
-        methodId: 'poisson-gamma-hazard',
-        outcomeSpace,
-        eventOutcomeIndex: firstPoisson.eventOutcomeIndex,
-        prior: Object.freeze({
-          shape: firstPoisson.prior.shape,
-          rate: firstPoisson.prior.rate,
-          parameterization: 'shape-rate' as const,
-        }),
-        observed: Object.freeze({
-          eventCount: combinedPoisson.eventCount,
-          exposureDuration: combinedPoisson.exposureDuration,
+        const poissonInput: PoissonGammaExecutionInput = Object.freeze({
+          methodId: 'poisson-gamma-hazard',
+          outcomeSpace,
+          eventOutcomeIndex: firstPoisson.eventOutcomeIndex,
+          prior: Object.freeze({
+            shape: firstPoisson.prior.shape,
+            rate: firstPoisson.prior.rate,
+            parameterization: 'shape-rate' as const,
+          }),
+          observed: Object.freeze({
+            eventCount: combinedPoisson.eventCount,
+            exposureDuration: combinedPoisson.exposureDuration,
+            exposureUnit: combinedPoisson.exposureUnit,
+          }),
+          forecast: Object.freeze({
+            exposureDuration: combinedPoisson.forecastExposureDuration,
+            exposureUnit: combinedPoisson.forecastExposureUnit,
+          }),
           exposureUnit: combinedPoisson.exposureUnit,
-        }),
-        forecast: Object.freeze({
-          exposureDuration: combinedPoisson.forecastExposureDuration,
-          exposureUnit: combinedPoisson.forecastExposureUnit,
-        }),
-        exposureUnit: combinedPoisson.exposureUnit,
-        ...(firstPoisson.credibleIntervalLevel !== undefined
-          ? { credibleIntervalLevel: refCi }
-          : {}),
-      });
-      preparedMethodInputs.set('poisson-gamma-hazard', {
-        methodId: 'poisson-gamma-hazard',
-        executionInput: poissonInput,
-        provenanceIds: Object.freeze(allIds),
-        sourceUrls: Object.freeze(allUrls),
-      });
+          ...(firstPoisson.credibleIntervalLevel !== undefined
+            ? { credibleIntervalLevel: refCi }
+            : {}),
+        });
+        preparedMethodInputs.set('poisson-gamma-hazard', {
+          methodId: 'poisson-gamma-hazard',
+          executionInput: poissonInput,
+          provenanceIds: Object.freeze(allIds),
+          sourceUrls: Object.freeze(allUrls),
+        });
 
-      const diag: MultiSourceCombinationDiagnostic = Object.freeze({
-        methodId: 'poisson-gamma-hazard',
-        combinationMode: 'mathematically-justified-disjoint-combination',
-        combinationBasis: justification.basis,
-        contributingEvidenceIds: Object.freeze(allIds),
-        contributingSourceUrls: Object.freeze(allUrls),
-        dependencePreserved: true,
-        mathematicalRationale: justification.mathematicalRationale,
-        dependenceNote: `Combined ${allIds.length} verified Poisson exposure sources under justified basis '${justification.basis}' (k=${combinedPoisson.eventCount}, T=${combinedPoisson.exposureDuration} ${combinedPoisson.exposureUnit}). All source provenance IDs and URLs preserved.`,
-      });
-      multiSourceCombinations.push(diag);
-      assessmentNotes.push(diag.dependenceNote);
+        const diag: MultiSourceCombinationDiagnostic = Object.freeze({
+          methodId: 'poisson-gamma-hazard',
+          combinationMode: 'mathematically-justified-disjoint-combination',
+          combinationBasis: gate.justification.basis,
+          contributingEvidenceIds: Object.freeze(allIds),
+          contributingSourceUrls: Object.freeze(allUrls),
+          dependencePreserved: true,
+          verifiedByVerifierId: gate.verifiedByVerifierId,
+          verificationArtifactRef: gate.verificationArtifactRef,
+          mathematicalRationale: gate.justification.mathematicalRationale,
+          dependenceNote: `Combined ${allIds.length} verified Poisson exposure sources under justified basis '${gate.justification.basis}' (k=${combinedPoisson.eventCount}, T=${combinedPoisson.exposureDuration} ${combinedPoisson.exposureUnit}; verified by '${gate.verifiedByVerifierId}': ${gate.verifierRationale}). All source provenance IDs and URLs preserved.`,
+        });
+        multiSourceCombinations.push(diag);
+        assessmentNotes.push(diag.dependenceNote);
+      }
     }
   }
 
@@ -6046,6 +6736,9 @@ export function assessCollectedEvidence(params: {
     const firstDirichlet = dirichletContributions[0]!;
     if (dirichletContributions.length === 1) {
       multinomialOutcomeCounts = firstDirichlet.counts;
+      availableChannelSet.add('multinomial-category-counts');
+      availableChannelSet.add('prior-hyperparameters');
+      supportedMethodSet.add('dirichlet-multinomial-symmetry');
 
       const dirichletInput: DirichletMultinomialExecutionInput = Object.freeze({
         methodId: 'dirichlet-multinomial-symmetry',
@@ -6072,6 +6765,8 @@ export function assessCollectedEvidence(params: {
           contributingEvidenceIds: firstDirichlet.evidenceIds,
           contributingSourceUrls: firstDirichlet.sourceUrls,
           dependencePreserved: true,
+          verifiedByVerifierId: null,
+          verificationArtifactRef: null,
           mathematicalRationale: rationale,
           dependenceNote: `Merged ${firstDirichlet.evidenceIds.length} multinomial-trials observation feeds via global canonical event deduplication ([${firstDirichlet.counts.join(', ')}]).`,
         });
@@ -6093,81 +6788,108 @@ export function assessCollectedEvidence(params: {
           }
         }
       }
+      const contributingSubs = allIds
+        .map((id) => verifiedSubmissionById.get(id))
+        .filter((s): s is PipelineEvidenceSubmission => s !== undefined);
 
-      const justification = validateAndAssertCombinationJustification({
+      const gate = evaluateMultiSourceCombinationGate({
         methodId: 'dirichlet-multinomial-symmetry',
         expectedBasis: 'disjoint-exchangeable-cohorts',
         allContributingIds: allIds,
+        allContributingUrls: allUrls,
+        contributingSubmissions: contributingSubs,
+        outcomeSpace,
+        referenceTime,
         ...(multiSourceCombinationJustifications !== undefined
           ? { justifications: multiSourceCombinationJustifications }
           : {}),
+        ...(combinationVerifier !== undefined ? { combinationVerifier } : {}),
       });
 
-      const refCi =
-        firstDirichlet.credibleIntervalLevel ?? DEFAULT_CREDIBLE_INTERVAL_LEVEL;
-      for (const c of dirichletContributions) {
-        const ci = c.credibleIntervalLevel ?? DEFAULT_CREDIBLE_INTERVAL_LEVEL;
-        if (
-          c.priorAlpha.length !== firstDirichlet.priorAlpha.length ||
-          c.priorAlpha.some(
-            (a, k) => Math.abs(a - firstDirichlet.priorAlpha[k]!) > 1e-12,
-          )
-        ) {
-          throw new ForecastPipelineRequestError(
-            `Cannot combine multiple 'dirichlet-multinomial-symmetry' submissions [${allIds.join(', ')}] with incompatible Dirichlet priors`,
+      if (!gate.approved) {
+        rejectedMultiSourceCombinations.push(gate.rejection);
+        assessmentNotes.push(gate.rejection.explanation);
+        rejectedCombinationMessageByMethod.set(
+          'dirichlet-multinomial-symmetry',
+          gate.rejection.explanation,
+        );
+      } else {
+        const refCi =
+          firstDirichlet.credibleIntervalLevel ??
+          DEFAULT_CREDIBLE_INTERVAL_LEVEL;
+        for (const c of dirichletContributions) {
+          const ci =
+            c.credibleIntervalLevel ?? DEFAULT_CREDIBLE_INTERVAL_LEVEL;
+          if (
+            c.priorAlpha.length !== firstDirichlet.priorAlpha.length ||
+            c.priorAlpha.some(
+              (a, k) => Math.abs(a - firstDirichlet.priorAlpha[k]!) > 1e-12,
+            )
+          ) {
+            throw new ForecastPipelineRequestError(
+              `Cannot combine multiple 'dirichlet-multinomial-symmetry' submissions [${allIds.join(', ')}] with incompatible Dirichlet priors`,
+            );
+          }
+          if (Math.abs(ci - refCi) > 1e-12) {
+            throw new ForecastPipelineRequestError(
+              `Cannot combine multiple 'dirichlet-multinomial-symmetry' submissions [${allIds.join(', ')}] with conflicting credibleIntervalLevel`,
+            );
+          }
+        }
+
+        const combinedCounts: number[] = [];
+        for (let k = 0; k < outcomeCount; k++) {
+          combinedCounts.push(
+            kahanNeumaierSum(dirichletContributions.map((c) => c.counts[k]!)),
           );
         }
-        if (Math.abs(ci - refCi) > 1e-12) {
-          throw new ForecastPipelineRequestError(
-            `Cannot combine multiple 'dirichlet-multinomial-symmetry' submissions [${allIds.join(', ')}] with conflicting credibleIntervalLevel`,
+        const validatedCombinedDirichlet =
+          validateMultinomialDimensionCountsAndPosterior(
+            combinedCounts,
+            { alpha: firstDirichlet.priorAlpha },
+            outcomeSpace,
+            `combined dirichlet-multinomial-symmetry submissions [${allIds.join(', ')}]`,
           );
-        }
+
+        multinomialOutcomeCounts = validatedCombinedDirichlet.counts;
+        availableChannelSet.add('multinomial-category-counts');
+        availableChannelSet.add('prior-hyperparameters');
+        supportedMethodSet.add('dirichlet-multinomial-symmetry');
+
+        const dirichletInput: DirichletMultinomialExecutionInput =
+          Object.freeze({
+            methodId: 'dirichlet-multinomial-symmetry',
+            outcomeSpace,
+            prior: Object.freeze({ alpha: firstDirichlet.priorAlpha }),
+            observed: Object.freeze({
+              counts: validatedCombinedDirichlet.counts,
+            }),
+            ...(firstDirichlet.credibleIntervalLevel !== undefined
+              ? { credibleIntervalLevel: refCi }
+              : {}),
+          });
+        preparedMethodInputs.set('dirichlet-multinomial-symmetry', {
+          methodId: 'dirichlet-multinomial-symmetry',
+          executionInput: dirichletInput,
+          provenanceIds: Object.freeze(allIds),
+          sourceUrls: Object.freeze(allUrls),
+        });
+
+        const diag: MultiSourceCombinationDiagnostic = Object.freeze({
+          methodId: 'dirichlet-multinomial-symmetry',
+          combinationMode: 'mathematically-justified-disjoint-combination',
+          combinationBasis: gate.justification.basis,
+          contributingEvidenceIds: Object.freeze(allIds),
+          contributingSourceUrls: Object.freeze(allUrls),
+          dependencePreserved: true,
+          verifiedByVerifierId: gate.verifiedByVerifierId,
+          verificationArtifactRef: gate.verificationArtifactRef,
+          mathematicalRationale: gate.justification.mathematicalRationale,
+          dependenceNote: `Combined ${allIds.length} verified multinomial sources under justified basis '${gate.justification.basis}' (counts=[${validatedCombinedDirichlet.counts.join(', ')}]; verified by '${gate.verifiedByVerifierId}': ${gate.verifierRationale}). All source provenance IDs and URLs preserved.`,
+        });
+        multiSourceCombinations.push(diag);
+        assessmentNotes.push(diag.dependenceNote);
       }
-
-      const combinedCounts: number[] = [];
-      for (let k = 0; k < outcomeCount; k++) {
-        combinedCounts.push(
-          kahanNeumaierSum(dirichletContributions.map((c) => c.counts[k]!)),
-        );
-      }
-      const validatedCombinedDirichlet =
-        validateMultinomialDimensionCountsAndPosterior(
-          combinedCounts,
-          { alpha: firstDirichlet.priorAlpha },
-          outcomeSpace,
-          `combined dirichlet-multinomial-symmetry submissions [${allIds.join(', ')}]`,
-        );
-
-      multinomialOutcomeCounts = validatedCombinedDirichlet.counts;
-
-      const dirichletInput: DirichletMultinomialExecutionInput = Object.freeze({
-        methodId: 'dirichlet-multinomial-symmetry',
-        outcomeSpace,
-        prior: Object.freeze({ alpha: firstDirichlet.priorAlpha }),
-        observed: Object.freeze({ counts: validatedCombinedDirichlet.counts }),
-        ...(firstDirichlet.credibleIntervalLevel !== undefined
-          ? { credibleIntervalLevel: refCi }
-          : {}),
-      });
-      preparedMethodInputs.set('dirichlet-multinomial-symmetry', {
-        methodId: 'dirichlet-multinomial-symmetry',
-        executionInput: dirichletInput,
-        provenanceIds: Object.freeze(allIds),
-        sourceUrls: Object.freeze(allUrls),
-      });
-
-      const diag: MultiSourceCombinationDiagnostic = Object.freeze({
-        methodId: 'dirichlet-multinomial-symmetry',
-        combinationMode: 'mathematically-justified-disjoint-combination',
-        combinationBasis: justification.basis,
-        contributingEvidenceIds: Object.freeze(allIds),
-        contributingSourceUrls: Object.freeze(allUrls),
-        dependencePreserved: true,
-        mathematicalRationale: justification.mathematicalRationale,
-        dependenceNote: `Combined ${allIds.length} verified multinomial sources under justified basis '${justification.basis}' (counts=[${validatedCombinedDirichlet.counts.join(', ')}]). All source provenance IDs and URLs preserved.`,
-      });
-      multiSourceCombinations.push(diag);
-      assessmentNotes.push(diag.dependenceNote);
     }
   }
 
@@ -6180,24 +6902,58 @@ export function assessCollectedEvidence(params: {
     continuousTrajectoryObservations = c.observationCount;
     estimatedDrift = c.estimatedDrift;
     estimatedScaleOrVolatility = c.estimatedScaleOrVolatility;
+    availableChannelSet.add('continuous-state-trajectory');
+    availableChannelSet.add('drift-and-scale-estimates');
     if (c.degreesOfFreedom !== undefined) {
       degreesOfFreedom = c.degreesOfFreedom;
+      availableChannelSet.add('tail-degrees-of-freedom');
     }
     if (c.initialStateLevel !== undefined) {
       initialStateLevel = c.initialStateLevel;
+      if (
+        outcomeSpace.barrierLevel !== undefined &&
+        outcomeSpace.barrierDirection !== undefined
+      ) {
+        availableChannelSet.add('absorbing-barrier-specification');
+      }
+    }
+    for (const tm of c.targetMethodIds) {
+      supportedMethodSet.add(tm);
     }
   }
 
+  const EMPIRICAL_CHANNEL_SET: ReadonlySet<MethodDataChannelId> = new Set([
+    'binary-trial-counts',
+    'weighted-binary-trials',
+    'kish-effective-sample-size',
+    'poisson-event-counts',
+    'continuous-exposure-duration',
+    'multinomial-category-counts',
+    'continuous-state-trajectory',
+    'drift-and-scale-estimates',
+    'tail-degrees-of-freedom',
+  ]);
+  hasVerifiableEmpiricalData = [...availableChannelSet].some((ch) =>
+    EMPIRICAL_CHANNEL_SET.has(ch),
+  );
+
   /* -----------------------------------------------------------------------
-     Phase 4: Formal StructuralSymmetryContract & Optional Verifier Gate
+     Phase 4: Formal StructuralSymmetryContract & Fail-Closed Verifier Gate
      ----------------------------------------------------------------------- */
   if (
     structuralSymmetryPremise !== undefined &&
     structuralSymmetryContract === undefined
   ) {
-    assessmentNotes.push(
-      "Rejected legacy boolean+rationale structuralSymmetryPremise without a mathematically valid StructuralSymmetryContract; unverified boolean symmetry claims never unlock 'structural-uniform-baseline' or emit a 50/50 baseline.",
-    );
+    const msg =
+      "Rejected legacy boolean+rationale structuralSymmetryPremise without a mathematically valid StructuralSymmetryContract; unverified boolean symmetry claims never unlock 'structural-uniform-baseline' or emit a 50/50 baseline.";
+    assessmentNotes.push(msg);
+    structuralSymmetryVerification = Object.freeze({
+      status: 'rejected-legacy-premise-without-contract',
+      verifierId: null,
+      verificationArtifactRef: null,
+      contractBasisKind: null,
+      explanation: msg,
+    });
   }
 
   if (structuralSymmetryContract !== undefined) {
@@ -6212,15 +6968,40 @@ export function assessCollectedEvidence(params: {
       );
     }
 
-    if (allowStructuralBaseline) {
-      let verifierApproved = true;
+    if (!allowStructuralBaseline) {
+      const msg =
+        "StructuralSymmetryContract passed mathematical schema validation, but assumptions.allowStructuralBaseline is not true; 'structural-uniform-baseline' remains disabled.";
+      assessmentNotes.push(msg);
+      structuralSymmetryVerification = Object.freeze({
+        status: 'rejected-baseline-not-opted-in',
+        verifierId: null,
+        verificationArtifactRef: null,
+        contractBasisKind: structuralSymmetryContract.basisKind,
+        explanation: msg,
+      });
+    } else {
+      // FAIL-CLOSED: never self-certify structural symmetry without an explicit
+      // trusted server-side symmetryVerifier returning verified=true.
+      let verifierApproved = false;
       let verifierTag = '';
 
-      if (symmetryVerifier !== undefined) {
+      if (symmetryVerifier === undefined) {
+        const msg =
+          "Rejected StructuralSymmetryContract for 'structural-uniform-baseline' (fail-closed): no trusted server-side symmetryVerifier was configured. Caller-supplied formalInvariant, derivationReference, generatingPermutations, and microstateCountsPerOutcome do not self-verify physical partition symmetry.";
+        assessmentNotes.push(msg);
+        structuralSymmetryVerification = Object.freeze({
+          status: 'rejected-no-trusted-verifier',
+          verifierId: null,
+          verificationArtifactRef: null,
+          contractBasisKind: structuralSymmetryContract.basisKind,
+          explanation: msg,
+        });
+      } else {
         const decision = symmetryVerifier({
           question: question ?? '',
           outcomeSpace,
           contract: structuralSymmetryContract,
+          validation: symValidation,
           referenceTime,
         });
         const vId =
@@ -6231,13 +7012,35 @@ export function assessCollectedEvidence(params: {
           isPlainObject(decision) && typeof decision.rationale === 'string'
             ? decision.rationale.trim()
             : '';
+        const artifactRef =
+          isPlainObject(decision) &&
+          typeof decision.verificationArtifactRef === 'string' &&
+          decision.verificationArtifactRef.trim().length > 0
+            ? decision.verificationArtifactRef.trim()
+            : null;
+
         if (vId.length === 0 || vRat.length === 0 || decision.verified !== true) {
           verifierApproved = false;
-          assessmentNotes.push(
-            `StructuralSymmetryContract was rejected by trusted symmetryVerifier ('${vId || 'invalid'}'): ${vRat || 'did not return verified=true with non-empty verifierId and rationale'}.`,
-          );
+          const msg = `StructuralSymmetryContract was rejected by trusted symmetryVerifier ('${vId || 'invalid'}'): ${vRat || 'did not return verified=true with non-empty verifierId and rationale'}.`;
+          assessmentNotes.push(msg);
+          structuralSymmetryVerification = Object.freeze({
+            status: 'rejected-by-trusted-verifier',
+            verifierId: vId || null,
+            verificationArtifactRef: artifactRef,
+            contractBasisKind: structuralSymmetryContract.basisKind,
+            explanation: msg,
+          });
         } else {
-          verifierTag = `; verified by '${vId}': ${vRat}`;
+          verifierApproved = true;
+          verifierTag = `; verified by '${vId}'${artifactRef ? ` (ref='${artifactRef}')` : ''}: ${vRat}`;
+          const msg = `StructuralSymmetryContract ('${structuralSymmetryContract.formalInvariant.groupName}') was independently verified by trusted symmetryVerifier '${vId}'${artifactRef ? ` (ref='${artifactRef}')` : ''}: ${vRat}.`;
+          structuralSymmetryVerification = Object.freeze({
+            status: 'verified',
+            verifierId: vId,
+            verificationArtifactRef: artifactRef,
+            contractBasisKind: structuralSymmetryContract.basisKind,
+            explanation: msg,
+          });
         }
       }
 
@@ -6269,6 +7072,12 @@ export function assessCollectedEvidence(params: {
   const missingRequirementsByMethod: Record<string, readonly string[]> = {};
   for (const desc of registry.listAll()) {
     const missing: string[] = [];
+    const rejectedCombinationNote = rejectedCombinationMessageByMethod.get(
+      desc.methodId,
+    );
+    if (rejectedCombinationNote !== undefined) {
+      missing.push(rejectedCombinationNote);
+    }
     for (const reqCh of desc.requiredData.requiredInputChannels) {
       if (!availableChannelSet.has(reqCh)) {
         missing.push(
@@ -6289,7 +7098,9 @@ export function assessCollectedEvidence(params: {
       !preparedMethodInputs.has('structural-uniform-baseline')
     ) {
       missing.push(
-        "Method 'structural-uniform-baseline' requires assumptions.allowStructuralBaseline=true plus a mathematically valid StructuralSymmetryContract (transitive bijection group and equal microstate counts over non-negated exchangeable outcomes; legacy boolean+rationale structuralSymmetryPremise is rejected)",
+        structuralSymmetryVerification !== null
+          ? structuralSymmetryVerification.explanation
+          : "Method 'structural-uniform-baseline' requires assumptions.allowStructuralBaseline=true, a mathematically valid StructuralSymmetryContract, AND an explicit trusted server-side symmetryVerifier decision (verified=true)",
       );
     }
     missingRequirementsByMethod[desc.methodId] = Object.freeze(missing);
@@ -6346,6 +7157,10 @@ export function assessCollectedEvidence(params: {
     invalidObservationDiagnostics: Object.freeze(invalidObservationDiagnostics),
     deduplicatedEventDiagnostics: Object.freeze(deduplicatedEventDiagnostics),
     multiSourceCombinations: Object.freeze(multiSourceCombinations),
+    rejectedMultiSourceCombinations: Object.freeze(
+      rejectedMultiSourceCombinations,
+    ),
+    structuralSymmetryVerification,
     derivedAvailableEvidence,
     supportedMethodIds: Object.freeze([...supportedMethodSet]),
     missingRequirementsByMethod: Object.freeze(missingRequirementsByMethod),
@@ -6910,6 +7725,9 @@ export async function runScientificForecastPipeline(
       : {}),
     ...(dependencies.symmetryVerifier !== undefined
       ? { symmetryVerifier: dependencies.symmetryVerifier }
+      : {}),
+    ...(dependencies.combinationVerifier !== undefined
+      ? { combinationVerifier: dependencies.combinationVerifier }
       : {}),
   });
 
