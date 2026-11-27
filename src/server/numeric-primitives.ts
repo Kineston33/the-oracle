@@ -2107,7 +2107,7 @@ function logBetaKernelPrefix(x: number, a: number, b: number): number {
       -a * poissonDevianceUnit((x - p0) / p0) -
       b * poissonDevianceUnit((p0 - x) / q0) -
       HALF_LN_2PI +
-      0.5 * Math.log(ab / (a * b)) -
+      0.5 * Math.log((a * b) / ab) -
       stirlingError(a) -
       stirlingError(b) +
       stirlingError(ab)

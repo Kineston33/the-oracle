@@ -750,6 +750,17 @@ describe('Stage 2A-1 — Numeric Primitives & Forecast Contracts (v4.4.3)', () =
       const qDyadicHigh = inverseRegularizedIncompleteBeta(0.9375, 10.5, 10.5);
       expect(1 - qDyadicLow).toBe(qDyadicHigh);
       expect(inverseRegularizedIncompleteBeta(0.5, 10.5, 10.5)).toBe(0.5);
+
+      // Verify a >= 15 && b >= 15 binomial-deviance kernel prefix and quantile round-trip
+      for (const [a, b] of [
+        [16, 29],
+        [4001, 6001],
+      ] as const) {
+        for (const p of [0.025, 0.5, 0.975]) {
+          const x = inverseRegularizedIncompleteBeta(p, a, b);
+          expect(regularizedIncompleteBeta(x, a, b)).toBeCloseTo(p, 12);
+        }
+      }
     });
 
     it('throws NumericConvergenceError on insufficient iteration budget and rejects out-of-range inputs', () => {

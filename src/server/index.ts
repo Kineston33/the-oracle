@@ -71,6 +71,30 @@ export {
   type PostgresPublicationRegistryOptions,
   type PredictionEventsVerification,
 } from './postgres-registry.ts';
+export {
+  DEFAULT_CREDIBLE_INTERVAL_LEVEL,
+  EXECUTABLE_SCIENTIFIC_METHOD_IDS,
+  MAX_CERTIFIED_SHAPE_PARAMETER,
+  METHOD_EXECUTION_VERSION,
+  MIN_CERTIFIED_SHAPE_PARAMETER,
+  UNIMPLEMENTED_SCIENTIFIC_METHOD_IDS,
+  UnimplementedScientificMethodError,
+  executeBetaBinomialConjugate,
+  executeDirichletMultinomialSymmetry,
+  executePoissonGammaHazard,
+  executeScientificMethod,
+  executeStructuralUniformBaseline,
+  executeWeightedKishEffectiveBinomial,
+  type BetaBinomialExecutionInput,
+  type DirichletMultinomialExecutionInput,
+  type ExecutableScientificMethodId,
+  type PoissonGammaExecutionInput,
+  type ScientificMethodExecutionInput,
+  type StructuralUniformExecutionInput,
+  type UnimplementedMethodExecutionInput,
+  type UnimplementedScientificMethodId,
+  type WeightedKishExecutionInput,
+} from './method-execution.ts';
 
 export interface StartOracleServerOptions {
   /**

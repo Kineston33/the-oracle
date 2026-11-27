@@ -94,10 +94,22 @@ describe('Stage 2A-2.1 — Applicability Planner (src/server/method-selection.ts
     );
 
     // Every method evaluation contains all 6 gates in canonical order
+    const implementedIds = new Set([
+      'beta-binomial-conjugate',
+      'weighted-kish-effective-binomial',
+      'poisson-gamma-hazard',
+      'dirichlet-multinomial-symmetry',
+      'structural-uniform-baseline',
+    ]);
     for (const rec of plan.evaluatedMethods) {
       expect(rec.gates.map((g) => g.gateId)).toEqual(METHOD_GATE_IDS);
-      expect(rec.hasExecutableImplementation).toBe(false);
-      expect(rec.implementationStatus).toBe('registered-specification-only');
+      if (implementedIds.has(rec.methodId)) {
+        expect(rec.hasExecutableImplementation).toBe(true);
+        expect(rec.implementationStatus).toBe('implemented-and-verified');
+      } else {
+        expect(rec.hasExecutableImplementation).toBe(false);
+        expect(rec.implementationStatus).toBe('registered-specification-only');
+      }
     }
 
     // 4 evidence-driven methods are simultaneously strictly applicable:
