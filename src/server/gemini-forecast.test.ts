@@ -30,13 +30,19 @@ import {
   createTrustedEvidenceVerifier,
   createTrustedStructuralSymmetryVerifier,
   executeScientificMethod,
+  normalizeConditionNumber,
+  normalizeConditionUnit,
   readGeminiConfigFromEnv,
   redactProviderSecrets,
   redactSecrets,
+  resolveCanonicalWithInterpretation,
+  validateAndCanonicalizeCondition,
   validateQuestionInterpretationPayload,
   type ForecastPipelineRequest,
   type GeminiClientLike,
   type PostgresPublicationRegistry,
+  type QuestionInterpretation,
+  type QuestionInterpreterProvider,
   type StructuralSymmetryContract,
 } from './index.ts';
 
@@ -1697,6 +1703,653 @@ describe('Stage 2B-2A — Gemini Question Interpreter & Scientific Forecast Back
       expect(String(postBody.message)).toContain('gemini-3.8-flash');
       expect(String(postBody.message)).toContain('no fallback');
       expect(attemptedModels).toEqual(['gemini-3.8-flash']);
+    });
+  });
+
+  describe('4. Stage 2B-2A.1: Canonical Condition Identity Integrity', () => {
+    function buildBaseValidatedInterpretation(
+      conditionOverride: Partial<QuestionInterpretation['condition']>,
+    ): QuestionInterpretation {
+      return validateQuestionInterpretationPayload(
+        buildValidGeminiJsonPayload({
+          subject: {
+            id: 'grid-storage-deployment',
+            label: 'Grid storage deployment',
+            namespace: 'subject',
+            resolved: true,
+            ambiguityNote: null,
+          },
+          event: {
+            id: 'installed-capacity-target',
+            label: 'Installed capacity target',
+            namespace: 'event',
+            resolved: true,
+            ambiguityNote: null,
+          },
+          condition: {
+            id: 'gt-1000-gw',
+            label: 'Exceeds 1000 GW',
+            operator: 'gt',
+            thresholdValue: '1000',
+            unit: 'gw',
+            resolved: true,
+            ambiguityNote: null,
+            ...conditionOverride,
+          },
+        }),
+        {
+          question: 'Will grid storage deployment hit the target by 2030 per IEA?',
+          referenceTime: FIXED_NOW,
+          providerId: 'gemini',
+        },
+      );
+    }
+
+    it('produces distinct condition identities and identityDigests for gt-1000-gw vs gt-5000-gw', async () => {
+      // Phrasing deliberately omits explicit comparator+unit tokens so deterministic parser defers condition to AI
+      const rawQuestionA = 'What is the grid capacity target A by 2030 per IEA?';
+      const rawQuestionB = 'What is the grid capacity target B by 2030 per IEA?';
+      // Test with same raw phrasing to prove condition identity alone distinguishes digests
+      const sameRawQuestion = 'Will regional offshore wind capacity hit its 2030 milestone per IEA?';
+
+      const interp1000 = buildBaseValidatedInterpretation({
+        id: 'gt-1000-gw',
+        label: 'Exceeds 1000 GW',
+        operator: 'gt',
+        thresholdValue: '1000',
+        unit: 'gw',
+      });
+      const interp5000 = buildBaseValidatedInterpretation({
+        id: 'gt-5000-gw',
+        label: 'Exceeds 5000 GW',
+        operator: 'gt',
+        thresholdValue: '5000',
+        unit: 'gw',
+      });
+
+      const res1000 = await resolveCanonicalWithInterpretation({
+        rawQuestion: sameRawQuestion,
+        referenceTime: FIXED_NOW,
+        interpretation: interp1000,
+        providerId: 'gemini',
+        includeDemo: false,
+      });
+      const res5000 = await resolveCanonicalWithInterpretation({
+        rawQuestion: sameRawQuestion,
+        referenceTime: FIXED_NOW,
+        interpretation: interp5000,
+        providerId: 'gemini',
+        includeDemo: false,
+      });
+
+      expect(res1000.resolution.identityComplete).toBe(true);
+      expect(res5000.resolution.identityComplete).toBe(true);
+      expect(res1000.resolution.identity.condition).toEqual({
+        namespace: 'condition',
+        id: 'gt-1000-gw',
+      });
+      expect(res5000.resolution.identity.condition).toEqual({
+        namespace: 'condition',
+        id: 'gt-5000-gw',
+      });
+      expect(res1000.resolution.identityDigest).not.toBe(
+        res5000.resolution.identityDigest,
+      );
+
+      // Also verify derivation from structured fields when id is null & complete
+      const derived5000 = validateAndCanonicalizeCondition({
+        id: null,
+        label: 'Exceeds 5000 GW',
+        operator: 'gt',
+        thresholdValue: '5000',
+        unit: 'GW',
+        resolved: true,
+        ambiguityNote: null,
+      });
+      expect(derived5000.valid).toBe(true);
+      expect(derived5000.canonicalId).toBe('gt-5000-gw');
+      expect(rawQuestionA).not.toBe(rawQuestionB);
+    });
+
+    it('rejects and demotes condition IDs that contradict operator, thresholdValue, or unit (including when bypassing payload validator)', async () => {
+      const contradictoryCases: Array<{
+        desc: string;
+        cond: QuestionInterpretation['condition'];
+      }> = [
+        {
+          desc: 'threshold contradiction (id gt-5000-gw vs threshold 1000)',
+          cond: {
+            id: 'gt-5000-gw',
+            label: 'Contradictory threshold',
+            operator: 'gt',
+            thresholdValue: '1000',
+            unit: 'gw',
+            resolved: true,
+            ambiguityNote: null,
+          },
+        },
+        {
+          desc: 'operator contradiction (id lt-1000-gw vs operator gt)',
+          cond: {
+            id: 'lt-1000-gw',
+            label: 'Contradictory operator',
+            operator: 'gt',
+            thresholdValue: '1000',
+            unit: 'gw',
+            resolved: true,
+            ambiguityNote: null,
+          },
+        },
+        {
+          desc: 'strict vs inclusive operator contradiction (id gt-1000-gw vs operator gte)',
+          cond: {
+            id: 'gt-1000-gw',
+            label: 'Boundary contradiction',
+            operator: 'gte',
+            thresholdValue: '1000',
+            unit: 'gw',
+            resolved: true,
+            ambiguityNote: null,
+          },
+        },
+        {
+          desc: 'unit contradiction (id gt-1000-mw vs unit gw)',
+          cond: {
+            id: 'gt-1000-mw',
+            label: 'Contradictory unit',
+            operator: 'gt',
+            thresholdValue: '1000',
+            unit: 'gw',
+            resolved: true,
+            ambiguityNote: null,
+          },
+        },
+        {
+          desc: 'quantitative ID on binary-occurrence operator',
+          cond: {
+            id: 'gt-1000-gw',
+            label: 'Binary with threshold ID',
+            operator: 'binary-occurrence',
+            thresholdValue: null,
+            unit: null,
+            resolved: true,
+            ambiguityNote: null,
+          },
+        },
+        {
+          desc: 'binary ID on quantitative operator',
+          cond: {
+            id: 'binary-occurrence',
+            label: 'Binary ID with gt',
+            operator: 'gt',
+            thresholdValue: '1000',
+            unit: 'gw',
+            resolved: true,
+            ambiguityNote: null,
+          },
+        },
+        {
+          desc: 'quantitative fields attached to binary-occurrence operator',
+          cond: {
+            id: 'binary-occurrence',
+            label: 'Binary with thresholdValue/unit',
+            operator: 'binary-occurrence',
+            thresholdValue: '1000',
+            unit: 'gw',
+            resolved: true,
+            ambiguityNote: null,
+          },
+        },
+        {
+          desc: 'quantitative fields attached to categorical operator',
+          cond: {
+            id: 'categorical-outcome',
+            label: 'Categorical with thresholdValue/unit',
+            operator: 'categorical',
+            thresholdValue: '50',
+            unit: 'pct',
+            resolved: true,
+            ambiguityNote: null,
+          },
+        },
+        {
+          desc: 'binary-occurrence ID on categorical operator',
+          cond: {
+            id: 'binary-occurrence',
+            label: 'Categorical vs binary ID',
+            operator: 'categorical',
+            thresholdValue: null,
+            unit: null,
+            resolved: true,
+            ambiguityNote: null,
+          },
+        },
+        {
+          desc: 'unverifiable arbitrary ID under quantitative operator',
+          cond: {
+            id: 'arbitrary-unverifiable-slug',
+            label: 'Arbitrary slug',
+            operator: 'gt',
+            thresholdValue: '1000',
+            unit: 'gw',
+            resolved: true,
+            ambiguityNote: null,
+          },
+        },
+      ];
+
+      for (const testCase of contradictoryCases) {
+        // 1. Direct validator check
+        const direct = validateAndCanonicalizeCondition(testCase.cond);
+        expect(direct.valid, testCase.desc).toBe(false);
+        expect(direct.demoted, testCase.desc).toBe(true);
+        expect(direct.canonicalId, testCase.desc).toBeNull();
+        expect(direct.condition.resolved, testCase.desc).toBe(false);
+        expect(direct.diagnostic, testCase.desc).toBeTruthy();
+
+        // 2. Through raw JSON schema validator (Gemini path)
+        const payloadValidated = buildBaseValidatedInterpretation(testCase.cond);
+        expect(payloadValidated.condition.resolved, testCase.desc).toBe(false);
+        expect(payloadValidated.condition.id, testCase.desc).toBeNull();
+        expect(payloadValidated.missingComponents, testCase.desc).toContain('condition');
+
+        // 3. Bypassing payload validator directly into resolveCanonicalWithInterpretation
+        const unvalidatedInterp: QuestionInterpretation = {
+          ...buildBaseValidatedInterpretation({
+            id: 'gt-1000-gw',
+            operator: 'gt',
+            thresholdValue: '1000',
+            unit: 'gw',
+          }),
+          condition: testCase.cond,
+        };
+        const resolved = await resolveCanonicalWithInterpretation({
+          rawQuestion: 'Will offshore wind target be achieved by 2030 per IEA?',
+          referenceTime: FIXED_NOW,
+          interpretation: unvalidatedInterp,
+          providerId: 'custom-provider',
+          includeDemo: false,
+        });
+        expect(resolved.resolution.identity.condition, testCase.desc).toEqual({
+          namespace: 'condition',
+          id: 'unknown',
+          unresolved: true,
+        });
+        expect(resolved.resolution.identityComplete, testCase.desc).toBe(false);
+        expect(resolved.resolution.unresolvedComponents, testCase.desc).toContain(
+          'condition',
+        );
+        expect(resolved.resolution.autonomousDecision, testCase.desc).toBe('abstain');
+        expect(resolved.resolution.abstentionReasons.join(' '), testCase.desc).toMatch(
+          /Condition integrity violation|unresolved/i,
+        );
+      }
+
+      // 4. End-to-end HTTP POST /v1/forecasts check with a contradictory provider response
+      const badProvider: QuestionInterpreterProvider = {
+        providerId: 'mock-contradictory',
+        model: 'mock-model',
+        isConfigured: () => true,
+        getStatus: () => ({
+          providerId: 'mock-contradictory',
+          model: 'mock-model',
+          configured: true,
+          status: 'ready',
+        }),
+        interpretQuestion: async () => ({
+          providerId: 'mock-contradictory',
+          model: 'mock-model',
+          interpretedAt: FIXED_NOW,
+          latencyMs: 5,
+          interpretation: {
+            ...buildBaseValidatedInterpretation({
+              id: 'gt-1000-gw',
+              operator: 'gt',
+              thresholdValue: '1000',
+              unit: 'gw',
+            }),
+            condition: {
+              id: 'gt-5000-gw',
+              label: 'Contradictory 5000 vs 1000',
+              operator: 'gt',
+              thresholdValue: '1000',
+              unit: 'gw',
+              resolved: true,
+              ambiguityNote: null,
+            },
+          },
+        }),
+      };
+
+      const httpServer = await startTestHttpServer({
+        registry: createStubRegistry(),
+        now: () => FIXED_NOW,
+        questionInterpreter: badProvider,
+        forecastHarvestDefaults: { skipRemoteHarvest: true },
+      });
+      cleanups.push(httpServer.close);
+
+      const httpRes = await fetch(`${httpServer.baseUrl}/v1/forecasts`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          question: 'Will regional offshore wind capacity hit its 2030 milestone per IEA?',
+        }),
+      });
+      expect(httpRes.status).toBe(200);
+      const httpBody = (await httpRes.json()) as {
+        outcomeKind: string;
+        canonicalResolution: {
+          identityComplete: boolean;
+          unresolvedComponents: string[];
+          identity: { condition: { id: string; unresolved?: boolean } };
+          abstentionReasons: string[];
+        };
+        aiInterpretation: {
+          missingComponents: string[];
+          components: { condition: { id: string | null; resolved: boolean } };
+        };
+      };
+      expect(httpBody.outcomeKind).toBe('honest-abstention');
+      expect(httpBody.canonicalResolution.identityComplete).toBe(false);
+      expect(httpBody.canonicalResolution.unresolvedComponents).toContain('condition');
+      expect(httpBody.canonicalResolution.identity.condition).toEqual({
+        namespace: 'condition',
+        id: 'unknown',
+        unresolved: true,
+      });
+      expect(httpBody.aiInterpretation.components.condition.resolved).toBe(false);
+      expect(httpBody.aiInterpretation.components.condition.id).toBeNull();
+      expect(httpBody.aiInterpretation.missingComponents).toContain('condition');
+    });
+
+    it('normalizes mathematically equivalent numeric representations and canonical unit synonyms consistently', async () => {
+      // Direct numeric normalizer checks
+      expect(normalizeConditionNumber('1000')).toBe('1000');
+      expect(normalizeConditionNumber('1,000')).toBe('1000');
+      expect(normalizeConditionNumber('1000.0')).toBe('1000');
+      expect(normalizeConditionNumber('1000.00')).toBe('1000');
+      expect(normalizeConditionNumber('+1000')).toBe('1000');
+      expect(normalizeConditionNumber('01000')).toBe('1000');
+      expect(normalizeConditionNumber('1e3')).toBe('1000');
+      expect(normalizeConditionNumber('1.0e+3')).toBe('1000');
+      expect(normalizeConditionNumber('10^3')).toBe('1000');
+      expect(normalizeConditionNumber('2.50')).toBe('2.5');
+      expect(normalizeConditionNumber('02.500')).toBe('2.5');
+      expect(normalizeConditionNumber('25e-1')).toBe('2.5');
+      expect(normalizeConditionNumber('.5')).toBe('0.5');
+      expect(normalizeConditionNumber('0.50')).toBe('0.5');
+      expect(normalizeConditionNumber('-0')).toBe('0');
+      expect(normalizeConditionNumber('-0.00')).toBe('0');
+      expect(normalizeConditionNumber('-5.0')).toBe('-5');
+      expect(normalizeConditionNumber('10^27')).toBe('1e27');
+      expect(normalizeConditionNumber('1e27')).toBe('1e27');
+      // Ambiguous or non-numeric strings fail closed
+      expect(normalizeConditionNumber('1,5')).toBeNull();
+      expect(normalizeConditionNumber('1000 GW')).toBeNull();
+      expect(normalizeConditionNumber('high')).toBeNull();
+
+      // Unit synonym normalization
+      expect(normalizeConditionUnit('GW')).toBe('gw');
+      expect(normalizeConditionUnit('gigawatts')).toBe('gw');
+      expect(normalizeConditionUnit('%')).toBe('pct');
+      expect(normalizeConditionUnit('percent')).toBe('pct');
+      expect(normalizeConditionUnit('Dollars')).toBe('usd');
+      expect(normalizeConditionUnit('unknown')).toBeNull();
+      expect(normalizeConditionUnit('1000-gw')).toBeNull();
+
+      // Equivalent conditions produce identical canonical identity & digest
+      const rawQuestion = 'Will regional offshore wind capacity hit its 2030 milestone per IEA?';
+      const equivalentForms: Array<Partial<QuestionInterpretation['condition']>> = [
+        { id: 'gt-1000-gw', operator: 'gt', thresholdValue: '1000', unit: 'gw' },
+        { id: 'gt-1-000-gigawatts', operator: 'gt', thresholdValue: '1,000', unit: 'gigawatts' },
+        { id: 'gt-1000-0-gw', operator: 'gt', thresholdValue: '1000.0', unit: 'GW' },
+        { id: 'above-1000-gw', operator: 'gt', thresholdValue: '1e3', unit: 'gigawatt' },
+        { id: null, operator: 'gt', thresholdValue: '+01000.00', unit: 'GW' },
+      ];
+
+      const digests: string[] = [];
+      for (const form of equivalentForms) {
+        const res = await resolveCanonicalWithInterpretation({
+          rawQuestion,
+          referenceTime: FIXED_NOW,
+          interpretation: buildBaseValidatedInterpretation(form),
+          providerId: 'gemini',
+          includeDemo: false,
+        });
+        expect(res.resolution.identity.condition).toEqual({
+          namespace: 'condition',
+          id: 'gt-1000-gw',
+        });
+        digests.push(res.resolution.identityDigest);
+      }
+      expect(new Set(digests).size).toBe(1);
+
+      // Signed negative vs positive stay strictly distinct (lt -5 C vs lt +5 C)
+      const negRes = await resolveCanonicalWithInterpretation({
+        rawQuestion,
+        referenceTime: FIXED_NOW,
+        interpretation: buildBaseValidatedInterpretation({
+          id: 'lt-neg-5-c',
+          operator: 'lt',
+          thresholdValue: '-5.0',
+          unit: '°C',
+        }),
+        providerId: 'gemini',
+        includeDemo: false,
+      });
+      const posRes = await resolveCanonicalWithInterpretation({
+        rawQuestion,
+        referenceTime: FIXED_NOW,
+        interpretation: buildBaseValidatedInterpretation({
+          id: 'lt-5-c',
+          operator: 'lt',
+          thresholdValue: '5.0',
+          unit: 'Celsius',
+        }),
+        providerId: 'gemini',
+        includeDemo: false,
+      });
+      expect(negRes.resolution.identity.condition.id).toBe('lt-neg-5-c');
+      expect(posRes.resolution.identity.condition.id).toBe('lt-5-c');
+      expect(negRes.resolution.identityDigest).not.toBe(posRes.resolution.identityDigest);
+
+      // Guard: 'gt-1-000-gw' (thousands grouping 1000) must NOT match thresholdValue '1.0' (1)
+      const thousandVsOne = validateAndCanonicalizeCondition({
+        id: 'gt-1-000-gw',
+        label: 'Mismatch 1,000 vs 1.0',
+        operator: 'gt',
+        thresholdValue: '1.0',
+        unit: 'gw',
+        resolved: true,
+        ambiguityNote: null,
+      });
+      expect(thousandVsOne.valid).toBe(false);
+      expect(thousandVsOne.demoted).toBe(true);
+    });
+
+    it('never invents missing thresholds or units when structured values are omitted or non-numeric', async () => {
+      const missingCases: Array<QuestionInterpretation['condition']> = [
+        {
+          id: 'gt-1000-gw',
+          label: 'ID present but thresholdValue null',
+          operator: 'gt',
+          thresholdValue: null,
+          unit: 'gw',
+          resolved: true,
+          ambiguityNote: null,
+        },
+        {
+          id: null,
+          label: 'Both id and thresholdValue null',
+          operator: 'gt',
+          thresholdValue: null,
+          unit: 'gw',
+          resolved: true,
+          ambiguityNote: null,
+        },
+        {
+          id: 'gt-1000-gw',
+          label: 'Non-numeric thresholdValue',
+          operator: 'gt',
+          thresholdValue: 'high',
+          unit: 'gw',
+          resolved: true,
+          ambiguityNote: null,
+        },
+        {
+          id: 'gt-1000-gw',
+          label: 'ID claims gw but unit is null',
+          operator: 'gt',
+          thresholdValue: '1000',
+          unit: null,
+          resolved: true,
+          ambiguityNote: null,
+        },
+      ];
+
+      for (const cond of missingCases) {
+        const res = await resolveCanonicalWithInterpretation({
+          rawQuestion: 'Will offshore wind achieve its target by 2030 per IEA?',
+          referenceTime: FIXED_NOW,
+          interpretation: buildBaseValidatedInterpretation(cond),
+          providerId: 'gemini',
+          includeDemo: false,
+        });
+        expect(res.resolution.identity.condition).toEqual({
+          namespace: 'condition',
+          id: 'unknown',
+          unresolved: true,
+        });
+        expect(res.resolution.unresolvedComponents).toContain('condition');
+        expect(res.resolution.identityComplete).toBe(false);
+      }
+    });
+
+    it('preserves valid binary-occurrence and categorical conditions without forcing quantitative fields', async () => {
+      const binaryInterp = buildBaseValidatedInterpretation({
+        id: 'binary-occurrence',
+        label: 'Independent replication published in peer-reviewed journal',
+        operator: 'binary-occurrence',
+        thresholdValue: null,
+        unit: null,
+        resolved: true,
+        ambiguityNote: null,
+      });
+      const binaryRes = await resolveCanonicalWithInterpretation({
+        rawQuestion: 'Will an independent lab verify the claim by 2030 per IEA?',
+        referenceTime: FIXED_NOW,
+        interpretation: binaryInterp,
+        providerId: 'gemini',
+        includeDemo: false,
+      });
+      expect(binaryRes.resolution.identityComplete).toBe(true);
+      expect(binaryRes.resolution.identity.condition).toEqual({
+        namespace: 'condition',
+        id: 'binary-occurrence',
+      });
+
+      const milestoneBinary = buildBaseValidatedInterpretation({
+        id: 'phase-3-regulatory-approval',
+        label: 'Phase 3 trial receives approval',
+        operator: 'binary-occurrence',
+        thresholdValue: null,
+        unit: null,
+        resolved: true,
+        ambiguityNote: null,
+      });
+      const milestoneRes = await resolveCanonicalWithInterpretation({
+        rawQuestion: 'Will the candidate therapy pass Phase 3 review by 2030 per IEA?',
+        referenceTime: FIXED_NOW,
+        interpretation: milestoneBinary,
+        providerId: 'gemini',
+        includeDemo: false,
+      });
+      expect(milestoneRes.resolution.identityComplete).toBe(true);
+      expect(milestoneRes.resolution.identity.condition).toEqual({
+        namespace: 'condition',
+        id: 'phase-3-regulatory-approval',
+      });
+
+      const categoricalInterp = buildBaseValidatedInterpretation({
+        id: 'winning-party-coalition',
+        label: 'Which coalition secures parliamentary majority',
+        operator: 'categorical',
+        thresholdValue: null,
+        unit: null,
+        resolved: true,
+        ambiguityNote: null,
+      });
+      const categoricalRes = await resolveCanonicalWithInterpretation({
+        rawQuestion: 'Which coalition will hold a parliamentary majority by 2030 per IEA?',
+        referenceTime: FIXED_NOW,
+        interpretation: categoricalInterp,
+        providerId: 'gemini',
+        includeDemo: false,
+      });
+      expect(categoricalRes.resolution.identityComplete).toBe(true);
+      expect(categoricalRes.resolution.identity.condition).toEqual({
+        namespace: 'condition',
+        id: 'winning-party-coalition',
+      });
+    });
+
+    it('preserves deterministic parser precedence when deterministic parser already resolved the condition', async () => {
+      const detQuestion =
+        'Will global stationary battery storage exceed 1000 GW by 2030 according to IEA?';
+      const detBaseline = await resolveCanonicalQuestion(detQuestion, {
+        now: new Date(FIXED_NOW),
+      });
+
+      // Even if AI supplies a contradictory condition, deterministic condition precedence wins
+      const noisyAiInterp: QuestionInterpretation = {
+        ...buildBaseValidatedInterpretation({
+          id: 'gt-1000-gw',
+          operator: 'gt',
+          thresholdValue: '1000',
+          unit: 'gw',
+        }),
+        subject: {
+          id: 'battery-storage',
+          label: 'Battery storage',
+          namespace: 'subject',
+          resolved: true,
+          ambiguityNote: null,
+        },
+        event: {
+          id: 'installed-capacity-threshold',
+          label: 'Installed capacity threshold',
+          namespace: 'event',
+          resolved: true,
+          ambiguityNote: null,
+        },
+        condition: {
+          id: 'gt-9999-mw',
+          label: 'Contradictory AI condition',
+          operator: 'gt',
+          thresholdValue: '1000',
+          unit: 'gw',
+          resolved: true,
+          ambiguityNote: null,
+        },
+      };
+
+      const resolved = await resolveCanonicalWithInterpretation({
+        rawQuestion: detQuestion,
+        referenceTime: FIXED_NOW,
+        interpretation: noisyAiInterp,
+        providerId: 'gemini',
+        includeDemo: false,
+      });
+
+      expect(resolved.resolution.identity.condition).toEqual(
+        detBaseline.identity.condition,
+      );
+      expect(resolved.resolution.identity.condition.id).toBe('gt-1000-gw');
+      expect(resolved.resolution.identityDigest).toBe(detBaseline.identityDigest);
+      // Alignment telemetry reports AI condition uncertainty without corrupting deterministic condition
+      expect(resolved.deterministicVsAiComparison.outcome).toBe('uncertain');
+      expect(resolved.deterministicVsAiComparison.because).toContain('condition');
     });
   });
 });

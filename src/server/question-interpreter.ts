@@ -20,6 +20,7 @@
  *      or vendor types into canonical resolution or `runScientificForecastPipeline`.
  */
 
+import { normalizeTermValue } from '../data/canonical-identity.ts';
 import { isValidIsoDateTime, parseIsoDateTimeMs } from '../data/publication.ts';
 import type { IdentityComponent } from '../data/publication-types.ts';
 import type { IsoDateTime, PredictionCategory } from '../data/types.ts';
@@ -39,6 +40,15 @@ export const CONDITION_OPERATORS = Object.freeze([
 ] as const);
 
 export type ConditionOperator = (typeof CONDITION_OPERATORS)[number];
+
+export type QuantitativeConditionOperator = 'gt' | 'gte' | 'lt' | 'lte' | 'eq';
+
+export const QUANTITATIVE_CONDITION_OPERATORS: readonly QuantitativeConditionOperator[] =
+  Object.freeze(['gt', 'gte', 'lt', 'lte', 'eq'] as const);
+
+const QUANTITATIVE_OPERATOR_SET: ReadonlySet<string> = new Set(
+  QUANTITATIVE_CONDITION_OPERATORS,
+);
 
 const VALID_IDENTITY_COMPONENTS: ReadonlySet<string> = new Set<IdentityComponent>([
   'subject',
@@ -479,6 +489,641 @@ function scanForProhibitedContent(
   }
 }
 
+const CONDITION_SENTINEL_WORDS: ReadonlySet<string> = new Set([
+  'unknown',
+  'unresolved',
+  'none',
+  'null',
+  'n-a',
+  'na',
+  'unspecified',
+  'tbd',
+  'undefined',
+]);
+
+const NON_QUANTITATIVE_CLAIM_IDS: ReadonlySet<string> = new Set([
+  'binary-occurrence',
+  'categorical',
+  'categorical-outcome',
+  'yes-no',
+  'event-occurs',
+]);
+
+const CONDITION_UNIT_ALIASES: ReadonlyMap<string, string> = new Map([
+  ['gw', 'gw'],
+  ['gigawatt', 'gw'],
+  ['gigawatts', 'gw'],
+  ['mw', 'mw'],
+  ['megawatt', 'mw'],
+  ['megawatts', 'mw'],
+  ['tw', 'tw'],
+  ['terawatt', 'tw'],
+  ['terawatts', 'tw'],
+  ['kw', 'kw'],
+  ['kilowatt', 'kw'],
+  ['kilowatts', 'kw'],
+  ['w', 'w'],
+  ['watt', 'w'],
+  ['watts', 'w'],
+  ['%', 'pct'],
+  ['pct', 'pct'],
+  ['percent', 'pct'],
+  ['percentage', 'pct'],
+  ['pp', 'pp'],
+  ['pct-pt', 'pp'],
+  ['pct-pts', 'pp'],
+  ['percentage-point', 'pp'],
+  ['percentage-points', 'pp'],
+  ['bps', 'bps'],
+  ['basis-point', 'bps'],
+  ['basis-points', 'bps'],
+  ['ppm', 'ppm'],
+  ['parts-per-million', 'ppm'],
+  ['parts-per-millions', 'ppm'],
+  ['ppb', 'ppb'],
+  ['parts-per-billion', 'ppb'],
+  ['flop', 'flop'],
+  ['flops', 'flop'],
+  ['floating-point-operation', 'flop'],
+  ['floating-point-operations', 'flop'],
+  ['unit', 'units'],
+  ['units', 'units'],
+  ['usd', 'usd'],
+  ['us-dollar', 'usd'],
+  ['us-dollars', 'usd'],
+  ['dollar', 'usd'],
+  ['dollars', 'usd'],
+  ['$', 'usd'],
+  ['eur', 'eur'],
+  ['euro', 'eur'],
+  ['euros', 'eur'],
+  ['€', 'eur'],
+  ['gbp', 'gbp'],
+  ['pound', 'gbp'],
+  ['pounds', 'gbp'],
+  ['£', 'gbp'],
+  ['c', 'c'],
+  ['deg-c', 'c'],
+  ['degc', 'c'],
+  ['degree-c', 'c'],
+  ['degrees-c', 'c'],
+  ['degree-celsius', 'c'],
+  ['degrees-celsius', 'c'],
+  ['celsius', 'c'],
+  ['°c', 'c'],
+  ['f', 'f'],
+  ['deg-f', 'f'],
+  ['degf', 'f'],
+  ['degree-f', 'f'],
+  ['degrees-f', 'f'],
+  ['degree-fahrenheit', 'f'],
+  ['degrees-fahrenheit', 'f'],
+  ['fahrenheit', 'f'],
+  ['°f', 'f'],
+  ['k', 'k'],
+  ['kelvin', 'k'],
+  ['g', 'g'],
+  ['gram', 'g'],
+  ['grams', 'g'],
+  ['kg', 'kg'],
+  ['kilogram', 'kg'],
+  ['kilograms', 'kg'],
+  ['t', 'tonne'],
+  ['tonne', 'tonne'],
+  ['tonnes', 'tonne'],
+  ['metric-ton', 'tonne'],
+  ['metric-tons', 'tonne'],
+  ['mt', 'mt'],
+  ['megatonne', 'mt'],
+  ['megatonnes', 'mt'],
+  ['million', 'million'],
+  ['millions', 'million'],
+  ['billion', 'billion'],
+  ['billions', 'billion'],
+  ['trillion', 'trillion'],
+  ['trillions', 'trillion'],
+  ['year', 'years'],
+  ['years', 'years'],
+  ['yr', 'years'],
+  ['yrs', 'years'],
+  ['month', 'months'],
+  ['months', 'months'],
+  ['day', 'days'],
+  ['days', 'days'],
+  ['country', 'countries'],
+  ['countries', 'countries'],
+  ['nation', 'nations'],
+  ['nations', 'nations'],
+  ['state', 'states'],
+  ['states', 'states'],
+  ['seat', 'seats'],
+  ['seats', 'seats'],
+  ['mission', 'missions'],
+  ['missions', 'missions'],
+  ['case', 'cases'],
+  ['cases', 'cases'],
+]);
+
+const COMPARATOR_ID_PREFIXES: ReadonlyArray<readonly [string, QuantitativeConditionOperator]> = [
+  ['greater-than', 'gt'],
+  ['more-than', 'gt'],
+  ['less-than', 'lt'],
+  ['fewer-than', 'lt'],
+  ['at-least', 'gte'],
+  ['at-most', 'lte'],
+  ['exceeds', 'gt'],
+  ['exceed', 'gt'],
+  ['exactly', 'eq'],
+  ['equals', 'eq'],
+  ['equal', 'eq'],
+  ['above', 'gt'],
+  ['below', 'lt'],
+  ['under', 'lt'],
+  ['over', 'gt'],
+  ['gte', 'gte'],
+  ['lte', 'lte'],
+  ['min', 'gte'],
+  ['max', 'lte'],
+  ['gt', 'gt'],
+  ['lt', 'lt'],
+  ['eq', 'eq'],
+];
+
+const QUANTITATIVE_CONDITION_ID_PATTERN =
+  /^(?:greater-than|more-than|less-than|fewer-than|at-least|at-most|exceeds|exceed|exactly|equals|equal|above|below|under|over|gte|lte|min|max|gt|lt|eq)-(?:neg-)?\d/;
+
+export interface ConditionValidationOutcome {
+  readonly valid: boolean;
+  readonly demoted: boolean;
+  readonly kind: 'quantitative' | 'binary-occurrence' | 'categorical' | 'unresolved';
+  readonly canonicalId: string | null;
+  readonly normalizedOperator: ConditionOperator;
+  readonly normalizedThresholdValue: string | null;
+  readonly normalizedUnit: string | null;
+  readonly condition: InterpretedConditionTerm;
+  readonly diagnostic: string | null;
+}
+
+/**
+ * Exact base-10 string normalization for numeric thresholds.
+ * Preserves mathematical equality across representations (`"1000"`, `"1,000"`,
+ * `"1000.0"`, `"+1000"`, `"01000"`, `"1e3"`, `"10^3"` -> `"1000"`; `"-0"` -> `"0"`)
+ * and returns `null` when a string is missing, non-numeric, or ambiguous (e.g. `"1,5"`).
+ */
+export function normalizeConditionNumber(raw: string | null): string | null {
+  if (raw === null) return null;
+  const trimmed = raw.trim();
+  if (!trimmed) return null;
+
+  const compact = trimmed.replace(/\s+/g, '');
+
+  // Support exact base-10 exponential form e.g. 10^3 or 10^27
+  const powMatch = /^([+-]?)10\^([+-]?\d+)$/.exec(compact);
+  if (powMatch) {
+    const sign = powMatch[1] === '-' ? '-' : '';
+    const exp = Number.parseInt(powMatch[2]!, 10);
+    if (!Number.isSafeInteger(exp) || exp < -308 || exp > 308) {
+      return null;
+    }
+    return formatExactBase10(sign, '1', exp);
+  }
+
+  // Reject malformed commas: commas are allowed only in strict 3-digit grouping.
+  if (compact.includes(',')) {
+    if (!/^[+-]?\d{1,3}(?:,\d{3})+(?:\.\d*)?(?:[eE][+-]?\d+)?$/.test(compact)) {
+      return null;
+    }
+  }
+  if (compact.includes('_')) {
+    if (!/^[+-]?\d{1,3}(?:_\d{3})+(?:\.\d*)?(?:[eE][+-]?\d+)?$/.test(compact)) {
+      return null;
+    }
+  }
+
+  const cleaned = compact.replace(/[,_]/g, '');
+  const decMatch =
+    /^([+-]?)(?:(\d+)(?:\.(\d*))?|\.(\d+))(?:[eE]([+-]?\d+))?$/.exec(cleaned);
+  if (!decMatch) {
+    return null;
+  }
+
+  const sign = decMatch[1] === '-' ? '-' : '';
+  const intPart = decMatch[2] ?? '';
+  const fracPart = decMatch[3] ?? decMatch[4] ?? '';
+  const expRaw = decMatch[5];
+  const exp = expRaw !== undefined ? Number.parseInt(expRaw, 10) : 0;
+  if (!Number.isSafeInteger(exp) || exp < -308 || exp > 308) {
+    return null;
+  }
+
+  const combinedDigits = `${intPart}${fracPart}`.replace(/^0+/, '');
+  if (combinedDigits.length === 0) {
+    return '0';
+  }
+
+  const exponent = exp - fracPart.length;
+  return formatExactBase10(sign, combinedDigits, exponent);
+}
+
+function formatExactBase10(
+  sign: '' | '-',
+  nonzeroDigitsWithoutLeadingZeros: string,
+  base10Exponent: number,
+): string | null {
+  const trimmedRight = nonzeroDigitsWithoutLeadingZeros.replace(/0+$/, '');
+  const expAdjustment = nonzeroDigitsWithoutLeadingZeros.length - trimmedRight.length;
+  const effectiveExp = base10Exponent + expAdjustment;
+  const digits = trimmedRight;
+  if (digits.length === 0) {
+    return '0';
+  }
+
+  // Value is digits * 10^effectiveExp; number of integer digits when written in decimal is pointPos.
+  const pointPos = digits.length + effectiveExp;
+  if (pointPos < -308 || pointPos > 309) {
+    return null;
+  }
+
+  if (pointPos >= digits.length && pointPos <= 15) {
+    return `${sign}${digits}${'0'.repeat(pointPos - digits.length)}`;
+  }
+
+  if (pointPos > 0 && pointPos < digits.length && digits.length <= 15) {
+    return `${sign}${digits.slice(0, pointPos)}.${digits.slice(pointPos)}`;
+  }
+
+  if (pointPos <= 0 && -pointPos + digits.length <= 15 && -pointPos <= 6) {
+    return `${sign}0.${'0'.repeat(-pointPos)}${digits}`;
+  }
+
+  // Canonical normalized scientific representation (e.g. "1e27", "1.5e27", "1e-12")
+  const sciExp = pointPos - 1;
+  const mantissa =
+    digits.length === 1 ? digits : `${digits[0]}.${digits.slice(1)}`;
+  return `${sign}${mantissa}e${sciExp}`;
+}
+
+export function normalizeConditionUnit(raw: string | null): string | null {
+  if (raw === null) return null;
+  const trimmed = raw.trim();
+  if (!trimmed) return null;
+
+  const lower = trimmed.toLowerCase();
+  if (lower === '%' || lower === '$' || lower === '€' || lower === '£') {
+    return CONDITION_UNIT_ALIASES.get(lower) ?? null;
+  }
+  if (lower === '°c') return 'c';
+  if (lower === '°f') return 'f';
+
+  // Reject pure numbers or digit-prefixed values pretending to be units (e.g. "1000-gw")
+  if (/^[+-]?\d+(?:[.,]\d+)?$/.test(trimmed) || /^\d+[-_.]/.test(trimmed)) {
+    return null;
+  }
+
+  const slug = normalizeTermValue(trimmed);
+  if (!slug || CONDITION_SENTINEL_WORDS.has(slug) || /^\d+$/.test(slug)) {
+    return null;
+  }
+
+  return CONDITION_UNIT_ALIASES.get(slug) ?? slug;
+}
+
+function numericSlugMatchesStructuredThreshold(
+  numSlug: string,
+  normalizedNum: string,
+  rawThreshold: string | null,
+): boolean {
+  const expectedToken = normalizedNum.startsWith('-')
+    ? `neg-${normalizedNum.slice(1)}`
+    : normalizedNum;
+  if (numSlug === normalizeTermValue(expectedToken)) {
+    return true;
+  }
+
+  if (rawThreshold !== null) {
+    const trimmedRaw = rawThreshold.trim();
+    const rawToken = trimmedRaw.startsWith('-')
+      ? `neg-${trimmedRaw.slice(1)}`
+      : trimmedRaw;
+    if (numSlug === normalizeTermValue(rawToken)) {
+      return true;
+    }
+  }
+
+  // Exact thousands grouping in slug (e.g. "1-000" -> "1000")
+  if (/^\d{1,3}(?:-\d{3})+$/.test(numSlug)) {
+    const joined = numSlug.replace(/-/g, '');
+    return joined === normalizedNum;
+  }
+
+  // Unambiguous single decimal point written as '-' (e.g. "1000-0" -> "1000.0" = "1000", "2-50" -> "2.50" = "2.5")
+  const decSlugMatch = /^(neg-)?(\d+)-(\d+)$/.exec(numSlug);
+  if (decSlugMatch) {
+    const signPrefix = decSlugMatch[1] ? '-' : '';
+    const candidateDot = `${signPrefix}${decSlugMatch[2]}.${decSlugMatch[3]}`;
+    return normalizeConditionNumber(candidateDot) === normalizedNum;
+  }
+
+  return false;
+}
+
+function validateQuantitativeConditionId(
+  rawId: string,
+  op: QuantitativeConditionOperator,
+  normalizedNum: string,
+  normalizedUnit: string,
+  rawThreshold: string | null,
+  derivedId: string,
+): { readonly ok: true } | { readonly ok: false; readonly reason: string } {
+  const normId = normalizeTermValue(rawId);
+  if (!normId || CONDITION_SENTINEL_WORDS.has(normId)) {
+    return { ok: false, reason: 'condition.id is empty or an unresolved sentinel' };
+  }
+  if (NON_QUANTITATIVE_CLAIM_IDS.has(normId)) {
+    return {
+      ok: false,
+      reason: `condition.id ('${rawId}') claims non-quantitative form while operator is '${op}'`,
+    };
+  }
+  if (normId === derivedId) {
+    return { ok: true };
+  }
+
+  let matchedOp: QuantitativeConditionOperator | null = null;
+  let remainder = '';
+  for (const [prefix, mappedOp] of COMPARATOR_ID_PREFIXES) {
+    if (normId.startsWith(`${prefix}-`)) {
+      matchedOp = mappedOp;
+      remainder = normId.slice(prefix.length + 1);
+      break;
+    }
+  }
+
+  if (matchedOp === null) {
+    return {
+      ok: false,
+      reason: `condition.id ('${rawId}') does not match canonical quantitative structure '${derivedId}'`,
+    };
+  }
+
+  if (matchedOp !== op) {
+    return {
+      ok: false,
+      reason: `condition.id comparator ('${matchedOp}' in '${rawId}') contradicts structured operator '${op}'`,
+    };
+  }
+
+  const numUnitMatch =
+    /^((?:neg-)?\d+(?:-\d+)*(?:e(?:neg-)?\d+)?)-(.+)$/.exec(remainder);
+  if (!numUnitMatch) {
+    return {
+      ok: false,
+      reason: `condition.id ('${rawId}') lacks valid threshold/unit structure matching '${derivedId}'`,
+    };
+  }
+
+  const idNumSlug = numUnitMatch[1]!;
+  const idUnitSlug = numUnitMatch[2]!;
+
+  if (!numericSlugMatchesStructuredThreshold(idNumSlug, normalizedNum, rawThreshold)) {
+    return {
+      ok: false,
+      reason: `condition.id threshold ('${idNumSlug}' in '${rawId}') contradicts structured thresholdValue '${rawThreshold ?? normalizedNum}'`,
+    };
+  }
+
+  const normIdUnit = normalizeConditionUnit(idUnitSlug);
+  if (normIdUnit === null || normIdUnit !== normalizedUnit) {
+    return {
+      ok: false,
+      reason: `condition.id unit ('${idUnitSlug}' in '${rawId}') contradicts structured unit '${normalizedUnit}'`,
+    };
+  }
+
+  return { ok: true };
+}
+
+/**
+ * Deterministically validates and canonicalizes an AI-interpreted condition across
+ * `id`, `operator`, `thresholdValue`, and `unit`.
+ *
+ * Rules:
+ *   - Quantitative operators (`gt`, `gte`, `lt`, `lte`, `eq`) require a concrete
+ *     numeric `thresholdValue` and concrete non-sentinel `unit`, derive the
+ *     authoritative canonical ID `${op}-${normalizedThreshold}-${normalizedUnit}`,
+ *     and reject any contradictory `id` (never silently accepting mismatches or
+ *     inventing missing thresholds/units).
+ *   - `binary-occurrence` and `categorical` conditions reject quantitative
+ *     `thresholdValue`/`unit` fields or comparator-encoded IDs while preserving
+ *     valid non-quantitative slugs without forcing quantitative fields onto them.
+ */
+export function validateAndCanonicalizeCondition(
+  input: InterpretedConditionTerm,
+): ConditionValidationOutcome {
+  const op = VALID_CONDITION_OPERATORS.has(input.operator)
+    ? input.operator
+    : 'unresolved';
+
+  const makeDemoted = (
+    reason: string,
+    wasClaimedResolved: boolean,
+    preservedOp: ConditionOperator = op,
+  ): ConditionValidationOutcome => {
+    const finalNote = input.ambiguityNote
+      ? `${input.ambiguityNote} (${reason})`
+      : reason;
+    const demotedCond: InterpretedConditionTerm = Object.freeze({
+      id: null,
+      label: input.label,
+      operator: preservedOp,
+      thresholdValue: input.thresholdValue,
+      unit: input.unit,
+      resolved: false,
+      ambiguityNote: finalNote,
+    });
+    return Object.freeze({
+      valid: false,
+      demoted: wasClaimedResolved,
+      kind: 'unresolved',
+      canonicalId: null,
+      normalizedOperator: preservedOp,
+      normalizedThresholdValue: null,
+      normalizedUnit: null,
+      condition: demotedCond,
+      diagnostic: reason,
+    });
+  };
+
+  if (op === 'unresolved') {
+    const reason =
+      input.ambiguityNote ??
+      'Condition operator is unresolved; demoted to unresolved.';
+    return makeDemoted(reason, input.resolved === true, 'unresolved');
+  }
+
+  if (input.resolved !== true) {
+    return Object.freeze({
+      valid: false,
+      demoted: false,
+      kind: 'unresolved',
+      canonicalId: null,
+      normalizedOperator: op,
+      normalizedThresholdValue: normalizeConditionNumber(input.thresholdValue),
+      normalizedUnit: normalizeConditionUnit(input.unit),
+      condition: Object.freeze({
+        id: null,
+        label: input.label,
+        operator: op,
+        thresholdValue: input.thresholdValue,
+        unit: input.unit,
+        resolved: false,
+        ambiguityNote: input.ambiguityNote,
+      }),
+      diagnostic: input.ambiguityNote,
+    });
+  }
+
+  // Quantitative operators: gt | gte | lt | lte | eq
+  if (QUANTITATIVE_OPERATOR_SET.has(op)) {
+    const quantOp = op as QuantitativeConditionOperator;
+    const normalizedNum = normalizeConditionNumber(input.thresholdValue);
+    if (normalizedNum === null) {
+      return makeDemoted(
+        `Quantitative condition (${quantOp}) lacks a valid finite numeric thresholdValue ('${input.thresholdValue ?? 'null'}'); demoted to unresolved without guessing.`,
+        true,
+      );
+    }
+
+    const normalizedUnit = normalizeConditionUnit(input.unit);
+    if (normalizedUnit === null) {
+      return makeDemoted(
+        `Quantitative condition (${quantOp} ${normalizedNum}) lacks a valid unit ('${input.unit ?? 'null'}'); demoted to unresolved without guessing.`,
+        true,
+      );
+    }
+
+    const numToken = normalizedNum.startsWith('-')
+      ? `neg-${normalizedNum.slice(1)}`
+      : normalizedNum;
+    const derivedId = normalizeTermValue(`${quantOp}-${numToken}-${normalizedUnit}`);
+    if (!derivedId) {
+      return makeDemoted(
+        `Failed to construct canonical condition identifier from (${quantOp}, ${normalizedNum}, ${normalizedUnit}).`,
+        true,
+      );
+    }
+
+    if (input.id !== null) {
+      const check = validateQuantitativeConditionId(
+        input.id,
+        quantOp,
+        normalizedNum,
+        normalizedUnit,
+        input.thresholdValue,
+        derivedId,
+      );
+      if (!check.ok) {
+        return makeDemoted(
+          `Condition integrity violation: ${check.reason}.`,
+          true,
+        );
+      }
+    }
+
+    const validCond: InterpretedConditionTerm = Object.freeze({
+      id: derivedId,
+      label: input.label,
+      operator: quantOp,
+      thresholdValue: normalizedNum,
+      unit: normalizedUnit,
+      resolved: true,
+      ambiguityNote: input.ambiguityNote,
+    });
+    return Object.freeze({
+      valid: true,
+      demoted: false,
+      kind: 'quantitative',
+      canonicalId: derivedId,
+      normalizedOperator: quantOp,
+      normalizedThresholdValue: normalizedNum,
+      normalizedUnit,
+      condition: validCond,
+      diagnostic: null,
+    });
+  }
+
+  // Non-quantitative operators: binary-occurrence | categorical
+  if (input.thresholdValue !== null || input.unit !== null) {
+    return makeDemoted(
+      `Condition integrity violation: operator '${op}' must not carry quantitative thresholdValue ('${input.thresholdValue ?? 'null'}') or unit ('${input.unit ?? 'null'}').`,
+      true,
+    );
+  }
+
+  if (input.id === null) {
+    return makeDemoted(
+      `Condition operator '${op}' lacks a canonical condition identifier and was demoted to unresolved.`,
+      true,
+    );
+  }
+
+  const normNonQuantId = normalizeTermValue(input.id);
+  if (!normNonQuantId || CONDITION_SENTINEL_WORDS.has(normNonQuantId)) {
+    return makeDemoted(
+      `Condition identifier '${input.id}' is empty or an unresolved sentinel.`,
+      true,
+    );
+  }
+
+  if (QUANTITATIVE_CONDITION_ID_PATTERN.test(normNonQuantId)) {
+    return makeDemoted(
+      `Condition integrity violation: condition.id ('${input.id}') encodes a quantitative comparator/threshold while operator is '${op}'.`,
+      true,
+    );
+  }
+
+  if (
+    op === 'binary-occurrence' &&
+    (normNonQuantId === 'categorical' || normNonQuantId.startsWith('categorical-'))
+  ) {
+    return makeDemoted(
+      `Condition integrity violation: condition.id ('${input.id}') indicates categorical condition while operator is 'binary-occurrence'.`,
+      true,
+    );
+  }
+
+  if (op === 'categorical' && normNonQuantId === 'binary-occurrence') {
+    return makeDemoted(
+      `Condition integrity violation: condition.id ('${input.id}') indicates binary-occurrence while operator is 'categorical'.`,
+      true,
+    );
+  }
+
+  const nonQuantOp: 'binary-occurrence' | 'categorical' =
+    op === 'categorical' ? 'categorical' : 'binary-occurrence';
+
+  const validCond: InterpretedConditionTerm = Object.freeze({
+    id: normNonQuantId,
+    label: input.label,
+    operator: nonQuantOp,
+    thresholdValue: null,
+    unit: null,
+    resolved: true,
+    ambiguityNote: input.ambiguityNote,
+  });
+  return Object.freeze({
+    valid: true,
+    demoted: false,
+    kind: nonQuantOp,
+    canonicalId: normNonQuantId,
+    normalizedOperator: nonQuantOp,
+    normalizedThresholdValue: null,
+    normalizedUnit: null,
+    condition: validCond,
+    diagnostic: null,
+  });
+}
+
 function assertAllowedKeys(
   obj: Record<string, unknown>,
   requiredKeys: readonly string[],
@@ -714,6 +1359,7 @@ export function validateQuestionInterpretationPayload(
   );
 
   // Validate condition
+  let conditionOutcome: ConditionValidationOutcome | null = null;
   let condition: InterpretedConditionTerm = Object.freeze({
     id: null,
     label: null,
@@ -767,7 +1413,7 @@ export function validateQuestionInterpretationPayload(
       60,
       schemaErrors,
     );
-    let condNote = readOptionalTrimmedString(
+    const condNote = readOptionalTrimmedString(
       raw.condition.ambiguityNote,
       'interpretation.condition.ambiguityNote',
       400,
@@ -776,27 +1422,16 @@ export function validateQuestionInterpretationPayload(
     const op = VALID_CONDITION_OPERATORS.has(String(raw.condition.operator))
       ? (raw.condition.operator as ConditionOperator)
       : 'unresolved';
-    const isUnknownCond =
-      condId === null ||
-      condId.toLowerCase() === 'unknown' ||
-      condId.toLowerCase() === 'unresolved' ||
-      op === 'unresolved';
-    let condResolved = raw.condition.resolved === true && !isUnknownCond;
-    if (raw.condition.resolved === true && isUnknownCond) {
-      condResolved = false;
-      condNote =
-        condNote ??
-        'Condition lacked a concrete operator or canonical condition identifier and was demoted to unresolved.';
-    }
-    condition = Object.freeze({
-      id: condResolved ? condId : null,
+    conditionOutcome = validateAndCanonicalizeCondition({
+      id: condId,
       label: condLabel,
-      operator: condResolved ? op : op === 'unresolved' ? 'unresolved' : op,
+      operator: op,
       thresholdValue,
       unit,
-      resolved: condResolved,
+      resolved: raw.condition.resolved === true,
       ambiguityNote: condNote,
     });
+    condition = conditionOutcome.condition;
   }
 
   // Validate timeHorizon
@@ -1037,6 +1672,19 @@ export function validateQuestionInterpretationPayload(
         );
       }
     }
+  }
+  if (
+    conditionOutcome?.demoted &&
+    conditionOutcome.diagnostic &&
+    !ambiguousComponents.some((entry) => entry.component === 'condition') &&
+    ambiguousComponents.length < 7
+  ) {
+    ambiguousComponents.push(
+      Object.freeze({
+        component: 'condition',
+        reason: conditionOutcome.diagnostic.slice(0, 300),
+      }),
+    );
   }
 
   const clarifyingQuestions: string[] = [];

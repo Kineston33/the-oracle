@@ -60,6 +60,8 @@ import { redactProviderSecrets } from './gemini-provider.ts';
 import type { PostgresPublicationRegistry } from './postgres-registry.ts';
 import {
   QuestionInterpretationError,
+  validateAndCanonicalizeCondition,
+  type ConditionValidationOutcome,
   type QuestionInterpretation,
   type QuestionInterpretationProviderMetadata,
   type QuestionInterpretationResult,
@@ -211,7 +213,7 @@ function resolveComponentTerm(
   return unresolvedTerm(fallbackNamespace);
 }
 
-async function resolveCanonicalWithInterpretation(options: {
+export async function resolveCanonicalWithInterpretation(options: {
   readonly rawQuestion: string;
   readonly referenceTime: IsoDateTime;
   readonly interpretation: QuestionInterpretation;
@@ -227,6 +229,7 @@ async function resolveCanonicalWithInterpretation(options: {
   } | null;
   readonly deterministicVsAiComparison: IdentityMatch;
   readonly deterministicFallbackUsed: boolean;
+  readonly validatedCondition: ConditionValidationOutcome;
 }> {
   const refDate = new Date(parseIsoDateTimeMs(options.referenceTime)!);
   const deterministic = await resolveCanonicalQuestion(options.rawQuestion, {
@@ -236,6 +239,7 @@ async function resolveCanonicalWithInterpretation(options: {
   const interp = options.interpretation;
   const aiRuleTag = `ai-interpreter-${options.providerId}-v1`;
   const inferences: Inference[] = [];
+  const validatedCondition = validateAndCanonicalizeCondition(interp.condition);
 
   const subject = resolveComponentTerm(
     deterministic.identity.subject,
@@ -253,18 +257,47 @@ async function resolveCanonicalWithInterpretation(options: {
     'event',
     inferences,
   );
-  const condition = resolveComponentTerm(
-    deterministic.identity.condition,
-    {
-      id: interp.condition.id,
-      namespace: 'condition',
-      resolved: interp.condition.resolved,
-    },
-    'condition',
-    aiRuleTag,
-    'condition',
-    inferences,
-  );
+
+  let condition: IdentityTerm;
+  let aiConditionDiagnostic: string | null = null;
+  if (
+    !deterministic.identity.condition.unresolved &&
+    deterministic.identity.condition.id !== 'unknown'
+  ) {
+    condition = DEFAULT_ALIAS_TABLE.resolve(deterministic.identity.condition);
+    inferences.push({
+      component: 'condition',
+      value: `${condition.namespace}:${condition.id}`,
+      rule: 'deterministic-lexicon-v1',
+    });
+  } else if (validatedCondition.valid && validatedCondition.canonicalId !== null) {
+    const candidate = term('condition', validatedCondition.canonicalId);
+    if (
+      candidate.namespace.length > 0 &&
+      candidate.id.length > 0 &&
+      candidate.id !== 'unknown'
+    ) {
+      condition = DEFAULT_ALIAS_TABLE.resolve(candidate);
+      inferences.push({
+        component: 'condition',
+        value: `${condition.namespace}:${condition.id}`,
+        rule:
+          validatedCondition.kind === 'quantitative'
+            ? `${aiRuleTag}-structured-condition`
+            : aiRuleTag,
+      });
+    } else {
+      condition = unresolvedTerm('condition');
+      aiConditionDiagnostic =
+        'Canonicalized AI condition produced an empty or unknown identifier and was demoted to unresolved.';
+    }
+  } else {
+    condition = unresolvedTerm('condition');
+    if (validatedCondition.demoted && validatedCondition.diagnostic) {
+      aiConditionDiagnostic = validatedCondition.diagnostic;
+    }
+  }
+
   const geographicScope = resolveComponentTerm(
     deterministic.identity.geographicScope,
     interp.geographicScope,
@@ -422,8 +455,8 @@ async function resolveCanonicalWithInterpretation(options: {
           ? term(interp.event.namespace ?? 'event', interp.event.id)
           : unresolvedTerm('event'),
       condition:
-        interp.condition.resolved && interp.condition.id
-          ? term('condition', interp.condition.id)
+        validatedCondition.valid && validatedCondition.canonicalId !== null
+          ? term('condition', validatedCondition.canonicalId)
           : unresolvedTerm('condition'),
       geographicScope:
         interp.geographicScope.resolved && interp.geographicScope.id
@@ -501,6 +534,7 @@ async function resolveCanonicalWithInterpretation(options: {
     evidence: [],
     disclosedLimitations: [
       `Canonical identity resolved with ${options.providerId} linguistic parsing plus deterministic alias verification; no probability or evidence inferred from AI interpretation.`,
+      ...(aiConditionDiagnostic ? [aiConditionDiagnostic] : []),
       ...interp.interpretationLimitations,
     ],
     inferences,
@@ -514,6 +548,9 @@ async function resolveCanonicalWithInterpretation(options: {
 
   const existingOfficialRecord = existingMatch?.record ?? null;
   const abstentionReasons: string[] = [];
+  if (aiConditionDiagnostic) {
+    abstentionReasons.push(aiConditionDiagnostic);
+  }
   if (unresolvedComponents.length > 0) {
     abstentionReasons.push(
       `Unresolved canonical identity components (${unresolvedComponents.join(', ')}): THE ORACLE refuses to guess missing entities, thresholds, horizons, or deciding authorities.`,
@@ -567,6 +604,7 @@ async function resolveCanonicalWithInterpretation(options: {
     horizonWindow,
     deterministicVsAiComparison,
     deterministicFallbackUsed: deterministic.identityComplete,
+    validatedCondition,
   };
 }
 
@@ -811,6 +849,7 @@ export async function executeForecastApiRequest(
     resolution,
     horizonWindow,
     deterministicVsAiComparison,
+    validatedCondition,
   } = await resolveCanonicalWithInterpretation({
     rawQuestion: trimmedQuestion,
     referenceTime,
@@ -819,6 +858,24 @@ export async function executeForecastApiRequest(
     registry: deps.registry,
     includeDemo,
   });
+
+  const effectiveMissingComponents: readonly IdentityComponent[] =
+    !validatedCondition.condition.resolved &&
+    !interp.missingComponents.includes('condition')
+      ? [...interp.missingComponents, 'condition']
+      : interp.missingComponents;
+  const effectiveAmbiguousComponents =
+    validatedCondition.demoted &&
+    validatedCondition.diagnostic &&
+    !interp.ambiguousComponents.some((item) => item.component === 'condition')
+      ? [
+          ...interp.ambiguousComponents,
+          {
+            component: 'condition' as const,
+            reason: validatedCondition.diagnostic,
+          },
+        ]
+      : interp.ambiguousComponents;
 
   const aiInterpretationSummary = {
     invoked: true,
@@ -834,14 +891,14 @@ export async function executeForecastApiRequest(
     components: {
       subject: interp.subject,
       event: interp.event,
-      condition: interp.condition,
+      condition: validatedCondition.condition,
       geographicScope: interp.geographicScope,
       timeHorizon: interp.timeHorizon,
       resolutionDate: interp.resolutionDate,
       decidingAuthority: interp.decidingAuthority,
     },
-    missingComponents: interp.missingComponents,
-    ambiguousComponents: interp.ambiguousComponents,
+    missingComponents: effectiveMissingComponents,
+    ambiguousComponents: effectiveAmbiguousComponents,
     clarifyingQuestions: interp.clarifyingQuestions,
     normalizedSearchQuery: interp.normalizedSearchQuery,
     limitations: interp.interpretationLimitations,
