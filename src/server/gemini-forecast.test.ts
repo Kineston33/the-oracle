@@ -2351,5 +2351,159 @@ describe('Stage 2B-2A — Gemini Question Interpreter & Scientific Forecast Back
       expect(resolved.deterministicVsAiComparison.outcome).toBe('uncertain');
       expect(resolved.deterministicVsAiComparison.because).toContain('condition');
     });
+
+    it('keeps existing official identity deduplication unchanged without false-positive collisions', async () => {
+      // 1. Existing official/archive deterministic identity for ORC-2025-0001 retains exact deterministic condition
+      const orc1 = predictionRecords.find((r) => r.id === 'ORC-2025-0001')!;
+      expect(orc1).toBeDefined();
+      const orc1Baseline = await resolveCanonicalQuestion(orc1.canonicalQuestion, {
+        now: new Date(FIXED_NOW),
+      });
+      // Deterministic baseline retains gt-1200-gw condition even if AI interpretation has conflicting condition fields
+      const orc1WithAi = await resolveCanonicalWithInterpretation({
+        rawQuestion: orc1.canonicalQuestion,
+        referenceTime: FIXED_NOW,
+        interpretation: buildBaseValidatedInterpretation({
+          id: 'gt-9999-mw',
+          label: 'Conflicting AI condition',
+          operator: 'gt',
+          thresholdValue: '1200',
+          unit: 'gw',
+        }),
+        providerId: 'gemini',
+        includeDemo: true,
+      });
+      expect(orc1WithAi.resolution.identity.condition).toEqual(
+        orc1Baseline.identity.condition,
+      );
+      expect(orc1WithAi.resolution.identity.condition.id).toBe('gt-1200-gw');
+
+      // 2. When AI leaves non-deterministic components unresolved, full identity & identityDigest stay bit-for-bit identical
+      const passThroughAi = validateQuestionInterpretationPayload(
+        buildValidGeminiJsonPayload({
+          subject: {
+            id: null,
+            label: null,
+            namespace: 'subject',
+            resolved: false,
+            ambiguityNote: 'Unspecified.',
+          },
+          event: {
+            id: null,
+            label: null,
+            namespace: 'event',
+            resolved: false,
+            ambiguityNote: 'Unspecified.',
+          },
+          decidingAuthority: {
+            id: null,
+            label: null,
+            namespace: 'authority',
+            resolved: false,
+            ambiguityNote: 'Unspecified.',
+          },
+          condition: {
+            id: 'gt-1200-gw',
+            label: 'Exceeds 1,200 GW',
+            operator: 'gt',
+            thresholdValue: '1,200',
+            unit: 'gw',
+            resolved: true,
+            ambiguityNote: null,
+          },
+        }),
+        {
+          question: orc1.canonicalQuestion,
+          referenceTime: FIXED_NOW,
+          providerId: 'gemini',
+        },
+      );
+      const orc1Unchanged = await resolveCanonicalWithInterpretation({
+        rawQuestion: orc1.canonicalQuestion,
+        referenceTime: FIXED_NOW,
+        interpretation: passThroughAi,
+        providerId: 'gemini',
+        includeDemo: true,
+      });
+      expect(orc1Unchanged.resolution.identity).toEqual(orc1Baseline.identity);
+      expect(orc1Unchanged.resolution.identityDigest).toBe(
+        orc1Baseline.identityDigest,
+      );
+
+      // 3. Official registry deduplication matches gt-1000-gw across equivalent formats, never gt-5000-gw
+      const sameRawQuestion =
+        'Will regional offshore wind capacity hit its 2030 milestone per IEA?';
+      const baseOfficialRes = await resolveCanonicalWithInterpretation({
+        rawQuestion: sameRawQuestion,
+        referenceTime: FIXED_NOW,
+        interpretation: buildBaseValidatedInterpretation({
+          id: 'gt-1000-gw',
+          operator: 'gt',
+          thresholdValue: '1000',
+          unit: 'gw',
+        }),
+        providerId: 'gemini',
+        includeDemo: false,
+      });
+      const mockOfficialRecord: PredictionRecord = {
+        ...orc1,
+        id: 'ORC-2026-0099',
+        canonicalQuestion:
+          'Will regional offshore wind capacity exceed 1000 GW by 2030 per IEA?',
+        demo: false,
+      };
+      const registry = createStubRegistry({
+        officialRecords: [mockOfficialRecord],
+        byIdentity: new Map([
+          [baseOfficialRes.resolution.identityDigest, mockOfficialRecord],
+        ]),
+      });
+
+      const equivalentMatch = await resolveCanonicalWithInterpretation({
+        rawQuestion: sameRawQuestion,
+        referenceTime: FIXED_NOW,
+        interpretation: buildBaseValidatedInterpretation({
+          id: 'gt-1-000-gigawatts',
+          operator: 'gt',
+          thresholdValue: '1e3',
+          unit: 'gigawatts',
+        }),
+        providerId: 'gemini',
+        registry,
+        includeDemo: false,
+      });
+      expect(equivalentMatch.resolution.identityDigest).toBe(
+        baseOfficialRes.resolution.identityDigest,
+      );
+      expect(equivalentMatch.resolution.autonomousDecision).toBe(
+        'deduplicated-official',
+      );
+      expect(equivalentMatch.resolution.existingOfficialRecord?.id).toBe(
+        'ORC-2026-0099',
+      );
+
+      const distinctThreshold = await resolveCanonicalWithInterpretation({
+        rawQuestion: sameRawQuestion,
+        referenceTime: FIXED_NOW,
+        interpretation: buildBaseValidatedInterpretation({
+          id: 'gt-5000-gw',
+          operator: 'gt',
+          thresholdValue: '5000',
+          unit: 'gw',
+        }),
+        providerId: 'gemini',
+        registry,
+        includeDemo: false,
+      });
+      expect(distinctThreshold.resolution.identityDigest).not.toBe(
+        baseOfficialRes.resolution.identityDigest,
+      );
+      expect(distinctThreshold.resolution.identityComplete).toBe(true);
+      expect(distinctThreshold.resolution.autonomousDecision).not.toBe(
+        'deduplicated-official',
+      );
+      expect(distinctThreshold.resolution.autonomousDecision).toBe('abstain');
+      expect(distinctThreshold.resolution.existingOfficialRecord).toBeNull();
+    });
   });
 });
