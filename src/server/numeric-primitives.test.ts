@@ -751,6 +751,14 @@ describe('Stage 2A-1 — Numeric Primitives & Forecast Contracts (v4.4.3)', () =
       expect(1 - qDyadicLow).toBe(qDyadicHigh);
       expect(inverseRegularizedIncompleteBeta(0.5, 10.5, 10.5)).toBe(0.5);
 
+      // Independent exact symmetry references I_0.5(a, a) = 0.5 exercising the a >= 15 && b >= 15
+      // binomial-deviance kernel prefix in logBetaKernelPrefix without relying on inverse-CDF round-trip:
+      for (const a of [16, 4001] as const) {
+        const midpointCdf = regularizedIncompleteBeta(0.5, a, a);
+        const relErr = Math.abs(midpointCdf - 0.5) / 0.5;
+        expect(relErr).toBeLessThanOrEqual(1e-14);
+      }
+
       // Verify a >= 15 && b >= 15 binomial-deviance kernel prefix and quantile round-trip
       for (const [a, b] of [
         [16, 29],

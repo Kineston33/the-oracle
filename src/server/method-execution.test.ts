@@ -749,6 +749,119 @@ describe('Stage 2A-2.2 — Foundational Executable Scientific Method Adapters (s
       ).toBe(true);
     });
 
+    it('computes finite positive conditional event-probability variance without 2 * x overflow at extreme forecast exposure (H = 1e308)', () => {
+      const priorShape = 0.05;
+      const priorRate = 1;
+      const observedEventCount = 0;
+      const observedExposure = 1e-300;
+      const forecastExposure = 1e308;
+
+      const out = executePoissonGammaHazard({
+        methodId: 'poisson-gamma-hazard',
+        outcomeSpace: BINARY_OUTCOME_SPACE,
+        eventOutcomeIndex: 0,
+        prior: { shape: priorShape, rate: priorRate },
+        observed: {
+          eventCount: observedEventCount,
+          exposureDuration: observedExposure,
+          exposureUnit: 'years',
+        },
+        forecast: {
+          exposureDuration: forecastExposure,
+          exposureUnit: 'years',
+        },
+        exposureUnit: 'years',
+      });
+
+      const posteriorShape = priorShape + observedEventCount;
+      const posteriorRate = priorRate + observedExposure;
+      expect(posteriorRate).toBe(1);
+
+      const exposureRatio = forecastExposure / posteriorRate;
+      expect(Number.isFinite(exposureRatio)).toBe(true);
+      expect(exposureRatio).toBe(1e308);
+
+      // Independent stable reference without 2 * x overflow:
+      // ln(1 + 2x) = ln(x) + ln(2) + ln(1 + 0.5 / x)
+      // x^2 / (1 + 2x) = x / (2 + 1 / x)
+      const refLogL2H =
+        -posteriorShape *
+        (Math.log(exposureRatio) + Math.LN2 + Math.log1p(0.5 / exposureRatio));
+      const refRatioDiffArg = exposureRatio / (2 + 1 / exposureRatio);
+      const refLogOnePlusRatioDiff =
+        Math.log(refRatioDiffArg) + Math.log1p(1 / refRatioDiffArg);
+      const expectedVariance =
+        Math.exp(refLogL2H) *
+        -Math.expm1(-posteriorShape * refLogOnePlusRatioDiff);
+
+      expect(expectedVariance).toBeCloseTo(3.8454617884310206e-16, 30);
+
+      for (const outcome of out.outcomes) {
+        expect(Number.isFinite(outcome.probability)).toBe(true);
+        expect(Number.isFinite(outcome.complementProbability)).toBe(true);
+        expect(Number.isFinite(outcome.logProbability)).toBe(true);
+        expect(Number.isFinite(outcome.logComplementProbability)).toBe(true);
+        expect(Number.isNaN(outcome.probability)).toBe(false);
+      }
+
+      for (const variance of out.parametricVariances) {
+        expect(Number.isFinite(variance)).toBe(true);
+        expect(Number.isNaN(variance)).toBe(false);
+        expect(variance).toBeGreaterThan(0);
+        const relErr =
+          Math.abs(variance - expectedVariance) / expectedVariance;
+        expect(relErr).toBeLessThan(1e-13);
+      }
+    });
+
+    it('preserves exact x^2 / (1 + 2x) variance identity immediately above the 1e8 exposureRatio threshold without x / 2 truncation error', () => {
+      const priorShape = 0.05;
+      const priorRate = 0.5;
+      const observedEventCount = 0;
+      const observedExposure = 0.5;
+      const forecastExposure = 1.000001e8;
+
+      const out = executePoissonGammaHazard({
+        methodId: 'poisson-gamma-hazard',
+        outcomeSpace: BINARY_OUTCOME_SPACE,
+        eventOutcomeIndex: 0,
+        prior: { shape: priorShape, rate: priorRate },
+        observed: {
+          eventCount: observedEventCount,
+          exposureDuration: observedExposure,
+          exposureUnit: 'days',
+        },
+        forecast: {
+          exposureDuration: forecastExposure,
+          exposureUnit: 'days',
+        },
+        exposureUnit: 'days',
+      });
+
+      const a = priorShape + observedEventCount;
+      const posteriorRate = priorRate + observedExposure;
+      const x = forecastExposure / posteriorRate;
+      expect(x).toBeGreaterThan(1e8);
+
+      const logL2H = -a * Math.log1p(2 * x);
+      const ratioDiffArg = (x * x) / (1 + 2 * x);
+      const expectedVariance =
+        Math.exp(logL2H) * -Math.expm1(-a * Math.log1p(ratioDiffArg));
+
+      // Verify that the naive x / 2 approximation violates the 1e-13 relative error bound:
+      const truncatedApproxVariance =
+        Math.exp(logL2H) * -Math.expm1(-a * Math.log1p(0.5 * x));
+      expect(
+        Math.abs(truncatedApproxVariance - expectedVariance) / expectedVariance,
+      ).toBeGreaterThan(1e-10);
+
+      for (const variance of out.parametricVariances) {
+        const relErr =
+          Math.abs(variance - expectedVariance) / expectedVariance;
+        expect(relErr).toBeLessThan(1e-13);
+      }
+    });
+
     it('rejects mismatched or missing exposure units, shape-scale parameterization, non-positive exposures, and invalid event counts', () => {
       const base: PoissonGammaExecutionInput = {
         methodId: 'poisson-gamma-hazard',

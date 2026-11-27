@@ -1098,16 +1098,24 @@ export function executePoissonGammaHazard(
   //   Var(P(event | lambda) | D) = L(2H) - L(H)^2
   // Using algebraic identity (1 + x)^2 / (1 + 2x) = 1 + x^2 / (1 + 2x):
   //   2*ln(L(H)) - ln(L(2H)) = -posteriorShape * ln(1 + x^2 / (1 + 2x)) <= 0
-  //   L(2H) - L(H)^2 = exp(ln(L(2H))) * (-expm1(-posteriorShape * log1p(x^2 / (1 + 2x))))
-  const twoX = 2 * exposureRatio;
+  //   L(2H) - L(H)^2 = exp(ln(L(2H))) * (-expm1(-posteriorShape * ln(1 + x^2 / (1 + 2x))))
+  // For x > 1e8, avoid 2 * x overflow and x / 2 truncation by evaluating:
+  //   ln(1 + 2x) = ln(x) + ln(2) + ln(1 + 0.5 / x)
+  //   x^2 / (1 + 2x) = x / (2 + 1 / x)
   const logOnePlusTwoX =
-    twoX <= 1e8 ? Math.log1p(twoX) : Math.log(twoX) + Math.log1p(1 / twoX);
+    exposureRatio <= 1e8
+      ? Math.log1p(2 * exposureRatio)
+      : Math.log(exposureRatio) + Math.LN2 + Math.log1p(0.5 / exposureRatio);
   const logL2H = -posteriorShape * logOnePlusTwoX;
   const ratioDiffArg =
     exposureRatio <= 1e8
-      ? (exposureRatio * exposureRatio) / (1 + twoX)
-      : 0.5 * exposureRatio;
-  const logRatioDiff = -posteriorShape * Math.log1p(ratioDiffArg);
+      ? (exposureRatio * exposureRatio) / (1 + 2 * exposureRatio)
+      : exposureRatio / (2 + 1 / exposureRatio);
+  const logOnePlusRatioDiff =
+    ratioDiffArg <= 1e8
+      ? Math.log1p(ratioDiffArg)
+      : Math.log(ratioDiffArg) + Math.log1p(1 / ratioDiffArg);
+  const logRatioDiff = -posteriorShape * logOnePlusRatioDiff;
   const rawConditionalVariance =
     Math.exp(logL2H) * -Math.expm1(logRatioDiff);
   const maxBernoulliVariance =
