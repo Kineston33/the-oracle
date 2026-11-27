@@ -1349,6 +1349,331 @@ describe('Stage 2A-1 — Numeric Primitives & Forecast Contracts (v4.4.3)', () =
       expect(autoDecomp.closureResidualNats).toBeLessThanOrEqual(1e-15);
     });
 
+    it('normalizes weighted Jensen-Shannon disagreement by Shannon weight entropy H(w) = -sum_m w_m ln(w_m) across equal, unequal, identical, maximally separated, single-method, and zero-weight ensembles', () => {
+      const binaryEntropy = (p: number): number =>
+        p <= 0 || p >= 1 ? 0 : -p * Math.log(p) - (1 - p) * Math.log(1 - p);
+
+      const dA = [
+        createDualChannelProbability(0.8),
+        createDualChannelProbability(0.2),
+      ];
+      const dB = [
+        createDualChannelProbability(0.1),
+        createDualChannelProbability(0.9),
+      ];
+
+      // 1. Two equally weighted methods (w = [0.5, 0.5], H(w) = ln(2)):
+      const pBarEqual = 0.5 * 0.8 + 0.5 * 0.1; // 0.45
+      const expectedTotalEqual = binaryEntropy(pBarEqual);
+      const expectedWithinEqual = 0.5 * binaryEntropy(0.8) + 0.5 * binaryEntropy(0.1);
+      const expectedJsdEqual = expectedTotalEqual - expectedWithinEqual;
+      const expectedHwEqual = Math.LN2;
+      const equalDecomp = decomposeEnsembleEntropy([dA, dB], [0.5, 0.5]);
+      expect(equalDecomp.jensenShannonDivergenceNats).toBeCloseTo(expectedJsdEqual, 15);
+      expect(equalDecomp.normalizedDisagreementIndex).toBeCloseTo(
+        expectedJsdEqual / expectedHwEqual,
+        15,
+      );
+
+      // 2. Two methods weighted 0.9 / 0.1 (H(w) = -0.9 ln(0.9) - 0.1 ln(0.1) != ln(2)):
+      const pBar9010 = 0.9 * 0.8 + 0.1 * 0.1; // 0.73
+      const expectedTotal9010 = binaryEntropy(pBar9010);
+      const expectedWithin9010 = 0.9 * binaryEntropy(0.8) + 0.1 * binaryEntropy(0.1);
+      const expectedJsd9010 = expectedTotal9010 - expectedWithin9010;
+      const expectedHw9010 = -0.9 * Math.log(0.9) - 0.1 * Math.log(0.1);
+      const decomp9010 = decomposeEnsembleEntropy([dA, dB], [0.9, 0.1]);
+      expect(decomp9010.jensenShannonDivergenceNats).toBeCloseTo(expectedJsd9010, 15);
+      expect(decomp9010.normalizedDisagreementIndex).toBeCloseTo(
+        expectedJsd9010 / expectedHw9010,
+        15,
+      );
+      // Explicitly verify it differs from the incorrect JSD_w / ln(2) formula:
+      expect(
+        Math.abs(
+          decomp9010.normalizedDisagreementIndex - expectedJsd9010 / Math.LN2,
+        ),
+      ).toBeGreaterThan(0.1);
+
+      // 3. Three methods with unequal weights (w = [0.6, 0.3, 0.1] on K = 3 outcomes):
+      const t1 = [
+        createDualChannelProbability(0.7),
+        createDualChannelProbability(0.2),
+        createDualChannelProbability(0.1),
+      ];
+      const t2 = [
+        createDualChannelProbability(0.1),
+        createDualChannelProbability(0.7),
+        createDualChannelProbability(0.2),
+      ];
+      const t3 = [
+        createDualChannelProbability(0.2),
+        createDualChannelProbability(0.1),
+        createDualChannelProbability(0.7),
+      ];
+      const w3 = [0.6, 0.3, 0.1];
+      const pMix3 = [
+        0.6 * 0.7 + 0.3 * 0.1 + 0.1 * 0.2,
+        0.6 * 0.2 + 0.3 * 0.7 + 0.1 * 0.1,
+        0.6 * 0.1 + 0.3 * 0.2 + 0.1 * 0.7,
+      ];
+      const catEntropy = (ps: readonly number[]): number =>
+        ps.reduce((acc, p) => (p > 0 ? acc - p * Math.log(p) : acc), 0);
+      const expectedTotal3 = catEntropy(pMix3);
+      const expectedWithin3 =
+        0.6 * catEntropy([0.7, 0.2, 0.1]) +
+        0.3 * catEntropy([0.1, 0.7, 0.2]) +
+        0.1 * catEntropy([0.2, 0.1, 0.7]);
+      const expectedJsd3 = expectedTotal3 - expectedWithin3;
+      const expectedHw3 =
+        -0.6 * Math.log(0.6) - 0.3 * Math.log(0.3) - 0.1 * Math.log(0.1);
+      const decomp3 = decomposeEnsembleEntropy([t1, t2, t3], w3);
+      expect(decomp3.jensenShannonDivergenceNats).toBeCloseTo(expectedJsd3, 15);
+      expect(decomp3.normalizedDisagreementIndex).toBeCloseTo(
+        expectedJsd3 / expectedHw3,
+        15,
+      );
+      expect(
+        decomp3.normalizedDisagreementIndex - expectedJsd3 / Math.log(3),
+      ).toBeCloseTo(
+        expectedJsd3 * (1 / expectedHw3 - 1 / Math.log(3)),
+        15,
+      );
+
+      // 4. Identical distributions across equal and unequal weights -> JSD_w = 0 and index = 0:
+      const identicalEqual = decomposeEnsembleEntropy([dA, dA], [0.5, 0.5]);
+      expect(identicalEqual.jensenShannonDivergenceNats).toBe(0);
+      expect(identicalEqual.normalizedDisagreementIndex).toBe(0);
+
+      const identicalUnequal = decomposeEnsembleEntropy(
+        [t1, t1, t1],
+        [0.6, 0.3, 0.1],
+      );
+      expect(identicalUnequal.jensenShannonDivergenceNats).toBe(0);
+      expect(identicalUnequal.normalizedDisagreementIndex).toBe(0);
+
+      // 5. Maximally separated distributions -> JSD_w reaches H(w) and index = 1:
+      const certYes = [
+        createDualChannelProbability(1),
+        createDualChannelProbability(0),
+      ];
+      const certNo = [
+        createDualChannelProbability(0),
+        createDualChannelProbability(1),
+      ];
+      const maxSepEqual = decomposeEnsembleEntropy(
+        [certYes, certNo],
+        [0.5, 0.5],
+      );
+      expect(maxSepEqual.withinMethodExpectedEntropyNats).toBe(0);
+      expect(maxSepEqual.jensenShannonDivergenceNats).toBeCloseTo(Math.LN2, 15);
+      expect(maxSepEqual.normalizedDisagreementIndex).toBeCloseTo(1, 15);
+
+      const maxSep9010 = decomposeEnsembleEntropy(
+        [certYes, certNo],
+        [0.9, 0.1],
+      );
+      expect(maxSep9010.withinMethodExpectedEntropyNats).toBe(0);
+      // Raw JSD is preserved as H(w) = 0.3250829733914482 independently of its normalized index = 1:
+      expect(maxSep9010.jensenShannonDivergenceNats).toBeCloseTo(
+        expectedHw9010,
+        15,
+      );
+      expect(maxSep9010.normalizedDisagreementIndex).toBeCloseTo(1, 15);
+
+      const corner1 = [
+        createDualChannelProbability(1),
+        createDualChannelProbability(0),
+        createDualChannelProbability(0),
+      ];
+      const corner2 = [
+        createDualChannelProbability(0),
+        createDualChannelProbability(1),
+        createDualChannelProbability(0),
+      ];
+      const corner3 = [
+        createDualChannelProbability(0),
+        createDualChannelProbability(0),
+        createDualChannelProbability(1),
+      ];
+      const maxSep3 = decomposeEnsembleEntropy(
+        [corner1, corner2, corner3],
+        [0.6, 0.3, 0.1],
+      );
+      expect(maxSep3.withinMethodExpectedEntropyNats).toBe(0);
+      expect(maxSep3.jensenShannonDivergenceNats).toBeCloseTo(expectedHw3, 15);
+      expect(maxSep3.normalizedDisagreementIndex).toBeCloseTo(1, 15);
+
+      // 6. Single-method behavior and zero-weight method handling:
+      const singleMethod = decomposeEnsembleEntropy([dA], [1]);
+      expect(singleMethod.jensenShannonDivergenceNats).toBe(0);
+      expect(singleMethod.normalizedDisagreementIndex).toBe(0);
+
+      const withZeroWeightSingle = decomposeEnsembleEntropy([dA, dB], [1, 0]);
+      expect(withZeroWeightSingle.jensenShannonDivergenceNats).toBe(0);
+      expect(withZeroWeightSingle.normalizedDisagreementIndex).toBe(0);
+
+      const withZeroWeightThird = decomposeEnsembleEntropy(
+        [dA, dB, dA],
+        [0.9, 0.1, 0],
+      );
+      expect(withZeroWeightThird.jensenShannonDivergenceNats).toBeCloseTo(
+        decomp9010.jensenShannonDivergenceNats,
+        15,
+      );
+      expect(withZeroWeightThird.normalizedDisagreementIndex).toBeCloseTo(
+        decomp9010.normalizedDisagreementIndex,
+        15,
+      );
+
+      // 7. Extremely imbalanced weights [1 - 1e-16, 1e-16] (analytically derived reference):
+      // Analytical Shannon entropy H([1 - eps, eps]) = eps * (1 - ln(eps)) - eps^2 / 2 - ...
+      // For eps = 1e-16: 1e-16 * (1 + 16 * ln(10)) = 3.7841361487904734e-15 nats.
+      const analyticHw1e16 = 3.7841361487904734e-15;
+      const maxSep1e16 = decomposeEnsembleEntropy(
+        [certYes, certNo],
+        [1 - 1e-16, 1e-16],
+      );
+      expect(maxSep1e16.jensenShannonDivergenceNats).toBeCloseTo(
+        analyticHw1e16,
+        28,
+      );
+      expect(maxSep1e16.normalizedDisagreementIndex).toBeCloseTo(1, 15);
+
+      const identical1e16 = decomposeEnsembleEntropy(
+        [dA, dA],
+        [1 - 1e-16, 1e-16],
+      );
+      expect(identical1e16.jensenShannonDivergenceNats).toBe(0);
+      expect(identical1e16.normalizedDisagreementIndex).toBe(0);
+
+      // Interior distributions [0.8, 0.2] vs [0.1, 0.9] with weights [1 - 1e-16, 1e-16]:
+      // Analytical asymptotic expansion: JSD_w = eps * KL([0.1, 0.9] || [0.8, 0.2]) + O(eps^2)
+      // KL([0.1, 0.9] || [0.8, 0.2]) = 0.1 * ln(1/8) + 0.9 * ln(9/2) = 1.1457255029306628 nats.
+      const analyticInteriorJsd1e16 = 1.1457255029306628e-16;
+      const interior1e16 = decomposeEnsembleEntropy(
+        [dA, dB],
+        [1 - 1e-16, 1e-16],
+      );
+      expect(interior1e16.jensenShannonDivergenceNats).toBeCloseTo(
+        analyticInteriorJsd1e16,
+        30,
+      );
+      expect(interior1e16.normalizedDisagreementIndex).toBeCloseTo(
+        analyticInteriorJsd1e16 / analyticHw1e16,
+        14,
+      );
+
+      // 8. Positive weight entropy below 1e-15 ([1 - 1e-17, 1e-17] and [1 - 1e-20, 1e-20]):
+      // Analytical H(w) for eps = 1e-17: 1e-17 * (1 + 17 * ln(10)) = 4.014394658089878e-16 nats (< 1e-15).
+      // Analytical H(w) for eps = 1e-20: 1e-20 * (1 + 20 * ln(10)) = 4.705170185988092e-19 nats (< 1e-15).
+      const analyticHw1e17 = 4.014394658089878e-16;
+      const maxSep1e17 = decomposeEnsembleEntropy(
+        [certYes, certNo],
+        [1 - 1e-17, 1e-17],
+      );
+      expect(maxSep1e17.jensenShannonDivergenceNats).toBeLessThan(1e-15);
+      expect(maxSep1e17.jensenShannonDivergenceNats).toBeCloseTo(
+        analyticHw1e17,
+        29,
+      );
+      // Never replaces a meaningful positive ratio JSD_w / H(w) = 1 with 0 when H(w) <= 1e-15:
+      expect(maxSep1e17.normalizedDisagreementIndex).toBeCloseTo(1, 15);
+
+      const analyticHw1e20 = 4.705170185988092e-19;
+      const maxSep1e20 = decomposeEnsembleEntropy(
+        [certYes, certNo],
+        [1 - 1e-20, 1e-20],
+      );
+      expect(maxSep1e20.jensenShannonDivergenceNats).toBeCloseTo(
+        analyticHw1e20,
+        32,
+      );
+      expect(maxSep1e20.normalizedDisagreementIndex).toBeCloseTo(1, 15);
+
+      const identical1e17 = decomposeEnsembleEntropy(
+        [dA, dA],
+        [1 - 1e-17, 1e-17],
+      );
+      expect(identical1e17.jensenShannonDivergenceNats).toBe(0);
+      expect(identical1e17.normalizedDisagreementIndex).toBe(0);
+
+      // validateEntropyDecomposition accepts valid tiny-entropy decomposition (JSD_w <= 1e-15 with index = 1)
+      // and rejects a deliberately invalid JSD exceeding H(w) even when both are << 1e-12:
+      const mix1e17 = [
+        createDualChannelProbabilityFromLog(Math.log1p(-1e-17)),
+        createDualChannelProbability(1e-17),
+      ];
+      expect(
+        validateEntropyDecomposition(
+          maxSep1e17,
+          mix1e17,
+          2,
+          2,
+          [1 - 1e-17, 1e-17],
+        ),
+      ).toEqual(maxSep1e17);
+
+      // Falsified JSD = 2 * H(w) (~8.03e-16 << 1e-12) is rejected because tolerance scales with H(w):
+      expect(() =>
+        validateEntropyDecomposition(
+          {
+            totalPredictiveEntropyNats: maxSep1e17.totalPredictiveEntropyNats,
+            withinMethodExpectedEntropyNats: 0,
+            jensenShannonDivergenceNats: 2 * analyticHw1e17,
+            normalizedDisagreementIndex: 1,
+            closureResidualNats: Math.abs(
+              maxSep1e17.totalPredictiveEntropyNats - 2 * analyticHw1e17,
+            ),
+          },
+          mix1e17,
+          2,
+          2,
+          [1 - 1e-17, 1e-17],
+        ),
+      ).toThrow(/exceeds theoretical upper bound H\(w\)|violates H\(p_bar\) = H_within \+ JSD_w/);
+
+      // Even if totalPredictiveEntropyNats and withinMethodExpectedEntropyNats are crafted to satisfy
+      // H(p_bar) = H_within + JSD_w, JSD_w > H(w) is still rejected by computeNormalizedWeightedJsdIndex:
+      expect(() =>
+        validateEntropyDecomposition(
+          {
+            totalPredictiveEntropyNats: dA[0]!.probability > 0 ? 0.5004024235381879 : 0,
+            withinMethodExpectedEntropyNats:
+              0.5004024235381879 - 2 * analyticHw1e17,
+            jensenShannonDivergenceNats: 2 * analyticHw1e17,
+            normalizedDisagreementIndex: 1,
+            closureResidualNats: 0,
+          },
+          dA,
+          2,
+          2,
+          [1 - 1e-17, 1e-17],
+        ),
+      ).toThrow(/exceeds theoretical upper bound H\(w\)/);
+
+      // validateEntropyDecomposition verifies JSD_w / H(w) and rejects the old JSD_w / ln(M) under unequal weights:
+      const ensemble9010 = [
+        createDualChannelProbability(0.73),
+        createDualChannelProbability(0.27),
+      ];
+      expect(
+        validateEntropyDecomposition(decomp9010, ensemble9010, 2, 2, [0.9, 0.1]),
+      ).toEqual(decomp9010);
+      expect(() =>
+        validateEntropyDecomposition(
+          {
+            ...decomp9010,
+            normalizedDisagreementIndex:
+              decomp9010.jensenShannonDivergenceNats / Math.LN2,
+          },
+          ensemble9010,
+          2,
+          2,
+          [0.9, 0.1],
+        ),
+      ).toThrow(RangeError);
+    });
+
     it('normalizes weights once up front in decomposeCategoryUncertainty and rejects negative, non-unit-sum, or invalid inputs', () => {
       const m1 = createDualChannelProbability(0.2);
       const m2 = createDualChannelProbability(0.8);
@@ -1983,6 +2308,56 @@ describe('Stage 2A-1 — Numeric Primitives & Forecast Contracts (v4.4.3)', () =
           ...validForecastContract,
           footingTier: 'empirically-calibrated-high-evidence',
           calibrationStatus: 'unverified-no-out-of-sample-evaluation',
+        }),
+      ).toThrow(RangeError);
+
+      // (j) Valid honest abstention contract vs rejected fabricated distribution on abstention
+      const validAbstention = validateForecastDistributionContract({
+        questionCategory: 'geopolitics',
+        outcomeSpace: validBinarySpace,
+        footingTier: 'insufficient-basis-abstain',
+        calibrationStatus: 'unverified-no-out-of-sample-evaluation',
+        abstentionReason: 'no-defensible-theoretical-or-empirical-basis',
+        outcomes: [],
+        contrastReport: {
+          executedMethodIds: [],
+          ensembleContributingMethodIds: [],
+          referenceOnlyMethodIds: [],
+          discardedMethods: [],
+          weightsByMethod: {},
+          effectiveIndependentMethodCount: 0,
+          entropyDecomposition: null,
+          categoryDecompositions: [],
+        },
+        epistemologicalClaims: [
+          {
+            kind: 'operational-design-heuristic',
+            tag: 'HDO',
+            statement: 'Honest abstention without fabricated probabilities',
+          },
+        ],
+        methodologicalLimitations: ['No applicable executable method'],
+      });
+      expect(validAbstention.outcomes).toEqual([]);
+      expect(validAbstention.contrastReport.entropyDecomposition).toBeNull();
+
+      // Rejects fabricated probabilities on abstention
+      expect(() =>
+        validateForecastDistributionContract({
+          ...validAbstention,
+          outcomes: [pYes, pNo],
+        }),
+      ).toThrow(RangeError);
+
+      // Rejects structural-symmetry-baseline-only claiming effectiveIndependentMethodCount > 0
+      expect(() =>
+        validateForecastDistributionContract({
+          ...validForecastContract,
+          footingTier: 'structural-symmetry-baseline-only',
+          contrastReport: {
+            ...validForecastContract.contrastReport,
+            effectiveIndependentMethodCount: 1,
+          },
         }),
       ).toThrow(RangeError);
     });

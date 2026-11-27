@@ -95,6 +95,23 @@ export {
   type UnimplementedScientificMethodId,
   type WeightedKishExecutionInput,
 } from './method-execution.ts';
+export {
+  EVIDENCE_DRIVEN_FOOTING_TIERS,
+  FORECAST_SYNTHESIS_VERSION,
+  INDEPENDENCE_CERTIFICATION_TIERS,
+  INDEPENDENCE_CERTIFICATION_VERIFICATION_STATUSES,
+  assertCanonicalOutcomeSpaceEquality,
+  computeDependenceAwareMethodWeights,
+  synthesizeForecastDistribution,
+  validateStatisticalIndependenceCertification,
+  type CertifiedIndependenceRelationship,
+  type CertifiedIndependentMethodGroup,
+  type ForecastSynthesisInput,
+  type IndependenceCertificationTier,
+  type IndependenceCertificationValidationContext,
+  type IndependenceCertificationVerificationStatus,
+  type StatisticalIndependenceCertification,
+} from './forecast-synthesis.ts';
 
 export interface StartOracleServerOptions {
   /**

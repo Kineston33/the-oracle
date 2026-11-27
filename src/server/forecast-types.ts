@@ -32,6 +32,7 @@
 
 import { isValidIsoDateTime, parseIsoDateTimeMs } from '../data/publication.ts';
 import type { IsoDateTime, PredictionCategory } from '../data/types.ts';
+import type { MethodDependenceDiagnostics } from './method-selection.ts';
 
 /* -------------------------------------------------------------------------
    1. Epistemological Classification of Claims & Formulas
@@ -243,7 +244,8 @@ export type ParametricCredibleIntervalOmissionReason =
   | 'point-mass-structural-baseline'
   | 'unidentifiable-concentration-parameter'
   | 'degenerate-zero-exposure-or-sample'
-  | 'method-produces-point-estimate-only';
+  | 'method-produces-point-estimate-only'
+  | 'multi-method-mixture-interval-not-available';
 
 export const PARAMETRIC_INTERVAL_OMISSION_REASONS: readonly ParametricCredibleIntervalOmissionReason[] =
   Object.freeze([
@@ -251,6 +253,7 @@ export const PARAMETRIC_INTERVAL_OMISSION_REASONS: readonly ParametricCredibleIn
     'unidentifiable-concentration-parameter',
     'degenerate-zero-exposure-or-sample',
     'method-produces-point-estimate-only',
+    'multi-method-mixture-interval-not-available',
   ]);
 
 /**
@@ -396,12 +399,135 @@ export interface ScientificMethodOutput {
   readonly warnings: readonly string[];
 }
 
+export interface UnexecutedApplicableMethodReport {
+  readonly methodId: ScientificMethodId;
+  readonly disposition: 'applicable' | 'applicable-with-limitations';
+  readonly implementationStatus: string;
+  readonly reason: string;
+}
+
+export interface DependenceComponentWeightAllocation {
+  readonly componentId: string;
+  readonly correlationGroupIds: readonly string[];
+  readonly isSingletonUnlinked: boolean;
+  readonly memberMethodIds: readonly ScientificMethodId[];
+  readonly componentWeight: number;
+  readonly weightPerMethod: Readonly<Record<string, number>>;
+}
+
+export type MethodWeightingPolicyId =
+  | 'equal-component-then-equal-within-component-hdo'
+  | 'single-evidence-method-unit-weight'
+  | 'structural-baseline-standalone-unit-weight'
+  | 'custom-explicit-weights-hdo'
+  | 'abstention-no-weights';
+
+export interface MethodWeightingPolicyReport {
+  readonly policyId: MethodWeightingPolicyId;
+  readonly epistemologicalTag: 'HDO' | 'IME';
+  readonly rationale: string;
+  readonly evidenceConnectedComponentCount: number;
+  readonly componentAllocations: readonly DependenceComponentWeightAllocation[];
+}
+
+export type IndependenceCertificationTier = 'declared' | 'verified';
+
+export const INDEPENDENCE_CERTIFICATION_TIERS: readonly IndependenceCertificationTier[] =
+  Object.freeze(['declared', 'verified']);
+
+export type IndependenceCertificationVerificationStatus =
+  | 'declared-unverified-assertion'
+  | 'empirically-verified-orthogonal-residuals'
+  | 'structurally-verified-disjoint-information-sets';
+
+export const INDEPENDENCE_CERTIFICATION_VERIFICATION_STATUSES: readonly IndependenceCertificationVerificationStatus[] =
+  Object.freeze([
+    'declared-unverified-assertion',
+    'empirically-verified-orthogonal-residuals',
+    'structurally-verified-disjoint-information-sets',
+  ]);
+
+export interface CertifiedIndependentMethodGroup {
+  readonly groupId: string;
+  readonly methodIds: readonly ScientificMethodId[];
+  readonly evidenceDatasetOrChannelRef: string;
+}
+
+export interface CertifiedIndependenceRelationship {
+  readonly groupIdA: string;
+  readonly groupIdB: string;
+  readonly evidenceBasis: string;
+  readonly maxAbsResidualDependenceMetric?: number;
+}
+
+export interface StatisticalIndependenceCertification {
+  readonly certificationId: string;
+  readonly evidenceReference: string;
+  readonly participatingMethodIds: readonly ScientificMethodId[];
+  readonly certifiedIndependentGroups: readonly CertifiedIndependentMethodGroup[];
+  readonly certifiedRelationships: readonly CertifiedIndependenceRelationship[];
+  readonly methodologicalJustification: string;
+  /**
+   * Effective, authoritative verification status of this certification record.
+   * Whenever no trusted verification authority authenticates the certification
+   * at runtime (including throughout Stage 2A-2.3), the authoritative
+   * `verificationStatus` is forced to `'declared-unverified-assertion'` so
+   * downstream consumers never mistake a declared assertion for a verified result.
+   */
+  readonly verificationStatus: IndependenceCertificationVerificationStatus;
+  /**
+   * Untrusted caller-supplied verification status claim preserved for audit
+   * provenance only. This field records what the caller asserted (for example,
+   * `'empirically-verified-orthogonal-residuals'` or
+   * `'structurally-verified-disjoint-information-sets'`), and MUST NOT be
+   * interpreted as an authenticated or runtime-verified independence result.
+   */
+  readonly claimedVerificationStatus?: IndependenceCertificationVerificationStatus;
+  /**
+   * Explicit distinction between a caller-supplied structured assertion
+   * (`'declared'`) and a certification authenticated by a trusted runtime
+   * verification mechanism (`'verified'`). In Stage 2A-2.3 no trusted
+   * verification mechanism exists, so valid certifications are always preserved
+   * with `tier: 'declared'`.
+   */
+  readonly tier?: IndependenceCertificationTier;
+}
+
+export interface IndependenceCertificationValidationContext {
+  readonly expectedParticipatingMethodIds?: readonly ScientificMethodId[];
+  readonly correlatedMethodSets?: readonly (readonly ScientificMethodId[])[];
+  readonly maxIndependentComponents?: number;
+}
+
+export interface EffectiveIndependenceAssessment {
+  readonly executedMethodCount: number;
+  readonly ensembleContributingMethodCount: number;
+  readonly referenceOnlyMethodCount: number;
+  readonly declaredEvidenceComponentCount: number;
+  readonly certificationTier?: 'none' | IndependenceCertificationTier;
+  readonly declaredIndependentGroupCount?: number;
+  readonly statisticalIndependenceVerified: boolean;
+  readonly effectiveIndependentMethodCount: number;
+  readonly independenceCertification?: StatisticalIndependenceCertification;
+  readonly explanation: string;
+}
+
 export interface MultiMethodContrastReport {
   readonly executedMethodIds: readonly ScientificMethodId[];
+  readonly ensembleContributingMethodIds?: readonly ScientificMethodId[];
+  readonly referenceOnlyMethodIds?: readonly ScientificMethodId[];
+  readonly referenceOnlyMethodOutputs?: readonly ScientificMethodOutput[];
+  readonly unexecutedApplicableMethods?: readonly UnexecutedApplicableMethodReport[];
+  readonly deferredMethods?: readonly MethodApplicabilityResult[];
   readonly discardedMethods: readonly MethodApplicabilityResult[];
   readonly weightsByMethod: Readonly<Record<string, number>>;
+  readonly weightingPolicy?: MethodWeightingPolicyReport;
+  readonly dependenceDiagnostics?: MethodDependenceDiagnostics;
+  readonly statisticalIndependenceVerified?: boolean;
+  readonly independenceCertification?: StatisticalIndependenceCertification;
   readonly effectiveIndependentMethodCount: number;
-  readonly entropyDecomposition: EntropyDecomposition;
+  readonly independenceSemantics?: EffectiveIndependenceAssessment;
+  readonly entropyDecomposition: EntropyDecomposition | null;
   readonly categoryDecompositions: readonly CategoryUncertaintyDecomposition[];
 }
 
@@ -700,3 +826,372 @@ export function validateParametricIntervalField(
     `ParametricIntervalField.kind must be 'available' or 'omitted', received ${String(value.kind)}`,
   );
 }
+
+function assertTrimmedNonEmptyString(value: unknown, fieldName: string): string {
+  if (
+    typeof value !== 'string' ||
+    value.length === 0 ||
+    value !== value.trim()
+  ) {
+    throw new RangeError(
+      `${fieldName} must be a non-empty string without leading or trailing whitespace, received ${String(value)}`,
+    );
+  }
+  return value;
+}
+
+/**
+ * Validates at runtime an auditable `StatisticalIndependenceCertification`
+ * record, enforcing that:
+ *   1. `certificationId`, `evidenceReference`, and `methodologicalJustification`
+ *      are non-empty trimmed strings.
+ *   2. `verificationStatus` is one of `INDEPENDENCE_CERTIFICATION_VERIFICATION_STATUSES`.
+ *   3. `participatingMethodIds` is a duplicate-free list of `>= 2` evidence-driven
+ *      methods (never including `'structural-uniform-baseline'`) that matches
+ *      `context.expectedParticipatingMethodIds` exactly when supplied.
+ *   4. `certifiedIndependentGroups` is a disjoint partition of `participatingMethodIds`
+ *      into `G >= 2` groups (bounded by `context.maxIndependentComponents` when supplied),
+ *      where no two methods sharing a declared correlated group in
+ *      `context.correlatedMethodSets` are placed into different groups.
+ *   5. `certifiedRelationships` explicitly covers every distinct unordered pair
+ *      of `certifiedIndependentGroups` (`G * (G - 1) / 2` pairs) with a valid
+ *      `evidenceBasis` and optional `maxAbsResidualDependenceMetric` in `[0, 1]`.
+ */
+export function validateStatisticalIndependenceCertification(
+  value: unknown,
+  context?: IndependenceCertificationValidationContext,
+): StatisticalIndependenceCertification {
+  if (!isPlainObject(value)) {
+    throw new RangeError(
+      'StatisticalIndependenceCertification must be a non-null plain object',
+    );
+  }
+
+  if (value.tier !== undefined) {
+    if (
+      typeof value.tier !== 'string' ||
+      !INDEPENDENCE_CERTIFICATION_TIERS.includes(
+        value.tier as IndependenceCertificationTier,
+      )
+    ) {
+      throw new RangeError(
+        `independenceCertification.tier must be one of [${INDEPENDENCE_CERTIFICATION_TIERS.join(', ')}], received '${String(value.tier)}'`,
+      );
+    }
+    if (value.tier === 'verified') {
+      throw new RangeError(
+        "independenceCertification.tier cannot be 'verified' in Stage 2A-2.3: no trusted certification-verification mechanism exists to authenticate external evidence; certifications must be 'declared'",
+      );
+    }
+  }
+
+  const certificationId = assertTrimmedNonEmptyString(
+    value.certificationId,
+    'independenceCertification.certificationId',
+  );
+  const evidenceReference = assertTrimmedNonEmptyString(
+    value.evidenceReference,
+    'independenceCertification.evidenceReference',
+  );
+  const methodologicalJustification = assertTrimmedNonEmptyString(
+    value.methodologicalJustification,
+    'independenceCertification.methodologicalJustification',
+  );
+
+  const verificationStatus = value.verificationStatus;
+  if (
+    typeof verificationStatus !== 'string' ||
+    !INDEPENDENCE_CERTIFICATION_VERIFICATION_STATUSES.includes(
+      verificationStatus as IndependenceCertificationVerificationStatus,
+    )
+  ) {
+    throw new RangeError(
+      `independenceCertification.verificationStatus must be one of [${INDEPENDENCE_CERTIFICATION_VERIFICATION_STATUSES.join(', ')}], received '${String(verificationStatus)}'`,
+    );
+  }
+
+  let claimedVerificationStatus: IndependenceCertificationVerificationStatus =
+    verificationStatus as IndependenceCertificationVerificationStatus;
+  if (value.claimedVerificationStatus !== undefined) {
+    if (
+      typeof value.claimedVerificationStatus !== 'string' ||
+      !INDEPENDENCE_CERTIFICATION_VERIFICATION_STATUSES.includes(
+        value.claimedVerificationStatus as IndependenceCertificationVerificationStatus,
+      )
+    ) {
+      throw new RangeError(
+        `independenceCertification.claimedVerificationStatus must be one of [${INDEPENDENCE_CERTIFICATION_VERIFICATION_STATUSES.join(', ')}], received '${String(value.claimedVerificationStatus)}'`,
+      );
+    }
+    if (
+      verificationStatus !== 'declared-unverified-assertion' &&
+      verificationStatus !== value.claimedVerificationStatus
+    ) {
+      throw new RangeError(
+        `independenceCertification.claimedVerificationStatus ('${value.claimedVerificationStatus}') conflicts with caller-supplied verificationStatus ('${verificationStatus}')`,
+      );
+    }
+    claimedVerificationStatus =
+      value.claimedVerificationStatus as IndependenceCertificationVerificationStatus;
+  }
+
+  if (
+    !Array.isArray(value.participatingMethodIds) ||
+    value.participatingMethodIds.length < 2
+  ) {
+    throw new RangeError(
+      'independenceCertification.participatingMethodIds must be an array of at least 2 method IDs',
+    );
+  }
+
+  const participatingMethodIds: ScientificMethodId[] = [];
+  const participatingSet = new Set<ScientificMethodId>();
+  for (let i = 0; i < value.participatingMethodIds.length; i++) {
+    const id = assertTrimmedNonEmptyString(
+      value.participatingMethodIds[i],
+      `independenceCertification.participatingMethodIds[${i}]`,
+    ) as ScientificMethodId;
+    if (id === 'structural-uniform-baseline') {
+      throw new RangeError(
+        "independenceCertification.participatingMethodIds cannot include 'structural-uniform-baseline' (non-evidential reference method)",
+      );
+    }
+    if (participatingSet.has(id)) {
+      throw new RangeError(
+        `independenceCertification.participatingMethodIds contains duplicate methodId '${id}'`,
+      );
+    }
+    participatingSet.add(id);
+    participatingMethodIds.push(id);
+  }
+
+  if (context?.expectedParticipatingMethodIds !== undefined) {
+    const expectedSet = new Set<ScientificMethodId>(
+      context.expectedParticipatingMethodIds,
+    );
+    if (expectedSet.size < 2) {
+      throw new RangeError(
+        `Statistical independence cannot be certified when fewer than 2 evidence-driven methods participate (participating count = ${expectedSet.size})`,
+      );
+    }
+    if (participatingSet.size !== expectedSet.size) {
+      throw new RangeError(
+        `independenceCertification.participatingMethodIds ([${participatingMethodIds.join(', ')}]) must match participating evidence-driven methods ([${context.expectedParticipatingMethodIds.join(', ')}])`,
+      );
+    }
+    for (const id of participatingSet) {
+      if (!expectedSet.has(id)) {
+        throw new RangeError(
+          `independenceCertification.participatingMethodIds includes method '${id}' which is not in participating evidence-driven methods ([${context.expectedParticipatingMethodIds.join(', ')}])`,
+        );
+      }
+    }
+  }
+
+  if (
+    !Array.isArray(value.certifiedIndependentGroups) ||
+    value.certifiedIndependentGroups.length < 2
+  ) {
+    throw new RangeError(
+      'independenceCertification.certifiedIndependentGroups must be an array of at least 2 independent method groups',
+    );
+  }
+
+  if (
+    context?.maxIndependentComponents !== undefined &&
+    value.certifiedIndependentGroups.length > context.maxIndependentComponents
+  ) {
+    throw new RangeError(
+      `independenceCertification.certifiedIndependentGroups length (${value.certifiedIndependentGroups.length}) exceeds declared evidence connected components (${context.maxIndependentComponents})`,
+    );
+  }
+
+  const groupIdSet = new Set<string>();
+  const methodToGroupId = new Map<ScientificMethodId, string>();
+  const validatedGroups: CertifiedIndependentMethodGroup[] = [];
+
+  for (let i = 0; i < value.certifiedIndependentGroups.length; i++) {
+    const rawGroup = value.certifiedIndependentGroups[i];
+    if (!isPlainObject(rawGroup)) {
+      throw new RangeError(
+        `independenceCertification.certifiedIndependentGroups[${i}] must be a non-null plain object`,
+      );
+    }
+    const groupId = assertTrimmedNonEmptyString(
+      rawGroup.groupId,
+      `independenceCertification.certifiedIndependentGroups[${i}].groupId`,
+    );
+    if (groupIdSet.has(groupId)) {
+      throw new RangeError(
+        `independenceCertification.certifiedIndependentGroups contains duplicate groupId '${groupId}'`,
+      );
+    }
+    groupIdSet.add(groupId);
+
+    const evidenceDatasetOrChannelRef = assertTrimmedNonEmptyString(
+      rawGroup.evidenceDatasetOrChannelRef,
+      `independenceCertification.certifiedIndependentGroups[${i}].evidenceDatasetOrChannelRef`,
+    );
+
+    if (!Array.isArray(rawGroup.methodIds) || rawGroup.methodIds.length === 0) {
+      throw new RangeError(
+        `independenceCertification.certifiedIndependentGroups[${i}].methodIds must be a non-empty array`,
+      );
+    }
+    const groupMethods: ScientificMethodId[] = [];
+    for (let m = 0; m < rawGroup.methodIds.length; m++) {
+      const mId = assertTrimmedNonEmptyString(
+        rawGroup.methodIds[m],
+        `independenceCertification.certifiedIndependentGroups[${i}].methodIds[${m}]`,
+      ) as ScientificMethodId;
+      if (!participatingSet.has(mId)) {
+        throw new RangeError(
+          `independenceCertification.certifiedIndependentGroups[${i}] references method '${mId}' which is not in participatingMethodIds`,
+        );
+      }
+      if (methodToGroupId.has(mId)) {
+        throw new RangeError(
+          `Method '${mId}' is assigned to multiple certifiedIndependentGroups ('${methodToGroupId.get(mId)}' and '${groupId}')`,
+        );
+      }
+      methodToGroupId.set(mId, groupId);
+      groupMethods.push(mId);
+    }
+
+    validatedGroups.push(
+      Object.freeze({
+        groupId,
+        methodIds: Object.freeze(groupMethods),
+        evidenceDatasetOrChannelRef,
+      }),
+    );
+  }
+
+  if (methodToGroupId.size !== participatingSet.size) {
+    const missing = participatingMethodIds.filter(
+      (id) => !methodToGroupId.has(id),
+    );
+    throw new RangeError(
+      `independenceCertification.certifiedIndependentGroups must cover all participatingMethodIds; missing [${missing.join(', ')}]`,
+    );
+  }
+
+  if (context?.correlatedMethodSets !== undefined) {
+    for (const corrSet of context.correlatedMethodSets) {
+      const activeInSet = corrSet.filter((id) => methodToGroupId.has(id));
+      if (activeInSet.length >= 2) {
+        const firstMethod = activeInSet[0]!;
+        const firstGroupId = methodToGroupId.get(firstMethod)!;
+        for (let i = 1; i < activeInSet.length; i++) {
+          const otherMethod = activeInSet[i]!;
+          const otherGroupId = methodToGroupId.get(otherMethod)!;
+          if (otherGroupId !== firstGroupId) {
+            throw new RangeError(
+              `independenceCertification cannot place correlated/equivalent methods '${firstMethod}' (group '${firstGroupId}') and '${otherMethod}' (group '${otherGroupId}') into distinct independent groups`,
+            );
+          }
+        }
+      }
+    }
+  }
+
+  if (!Array.isArray(value.certifiedRelationships)) {
+    throw new RangeError(
+      'independenceCertification.certifiedRelationships must be an array',
+    );
+  }
+
+  const groupCount = validatedGroups.length;
+  const requiredPairCount = (groupCount * (groupCount - 1)) / 2;
+  if (value.certifiedRelationships.length !== requiredPairCount) {
+    throw new RangeError(
+      `independenceCertification.certifiedRelationships must contain exactly ${requiredPairCount} pairwise relationship(s) for ${groupCount} certified groups, received ${value.certifiedRelationships.length}`,
+    );
+  }
+
+  const seenPairKeys = new Set<string>();
+  const validatedRelationships: CertifiedIndependenceRelationship[] = [];
+
+  for (let r = 0; r < value.certifiedRelationships.length; r++) {
+    const rawRel = value.certifiedRelationships[r];
+    if (!isPlainObject(rawRel)) {
+      throw new RangeError(
+        `independenceCertification.certifiedRelationships[${r}] must be a non-null plain object`,
+      );
+    }
+    const groupIdA = assertTrimmedNonEmptyString(
+      rawRel.groupIdA,
+      `independenceCertification.certifiedRelationships[${r}].groupIdA`,
+    );
+    const groupIdB = assertTrimmedNonEmptyString(
+      rawRel.groupIdB,
+      `independenceCertification.certifiedRelationships[${r}].groupIdB`,
+    );
+    if (groupIdA === groupIdB) {
+      throw new RangeError(
+        `independenceCertification.certifiedRelationships[${r}] cannot relate group '${groupIdA}' to itself`,
+      );
+    }
+    if (!groupIdSet.has(groupIdA) || !groupIdSet.has(groupIdB)) {
+      throw new RangeError(
+        `independenceCertification.certifiedRelationships[${r}] references unknown groupId(s) ('${groupIdA}', '${groupIdB}')`,
+      );
+    }
+    const evidenceBasis = assertTrimmedNonEmptyString(
+      rawRel.evidenceBasis,
+      `independenceCertification.certifiedRelationships[${r}].evidenceBasis`,
+    );
+
+    let maxAbsResidualDependenceMetric: number | undefined;
+    if (rawRel.maxAbsResidualDependenceMetric !== undefined) {
+      const m = rawRel.maxAbsResidualDependenceMetric;
+      if (
+        typeof m !== 'number' ||
+        !Number.isFinite(m) ||
+        Number.isNaN(m) ||
+        m < 0 ||
+        m > 1
+      ) {
+        throw new RangeError(
+          `independenceCertification.certifiedRelationships[${r}].maxAbsResidualDependenceMetric must be a finite number in [0, 1], received ${String(m)}`,
+        );
+      }
+      maxAbsResidualDependenceMetric = m;
+    }
+
+    const pairKey =
+      groupIdA < groupIdB
+        ? `${groupIdA}\u0000${groupIdB}`
+        : `${groupIdB}\u0000${groupIdA}`;
+    if (seenPairKeys.has(pairKey)) {
+      throw new RangeError(
+        `independenceCertification.certifiedRelationships contains duplicate relationship for group pair ('${groupIdA}', '${groupIdB}')`,
+      );
+    }
+    seenPairKeys.add(pairKey);
+
+    validatedRelationships.push(
+      Object.freeze({
+        groupIdA,
+        groupIdB,
+        evidenceBasis,
+        ...(maxAbsResidualDependenceMetric !== undefined
+          ? { maxAbsResidualDependenceMetric }
+          : {}),
+      }),
+    );
+  }
+
+  return Object.freeze({
+    certificationId,
+    evidenceReference,
+    participatingMethodIds: Object.freeze(participatingMethodIds),
+    certifiedIndependentGroups: Object.freeze(validatedGroups),
+    certifiedRelationships: Object.freeze(validatedRelationships),
+    methodologicalJustification,
+    verificationStatus: 'declared-unverified-assertion' as const,
+    claimedVerificationStatus,
+    tier: 'declared' as const,
+  });
+}
+
