@@ -1133,7 +1133,7 @@ describe('Stage 2A-2.3 — Dependence-Aware Multi-Method Aggregation & Forecast 
         }),
       ).toThrow(/must be a finite positive number in \(0, 1\]/);
 
-      // Rejects unsupported boolean or numeric independence assertions without an auditable certification:
+      // Rejects unsupported boolean or numeric verified-independence assertions in Stage 2A-2.3:
       expect(() =>
         synthesizeForecastDistribution({
           plan,
@@ -1141,7 +1141,7 @@ describe('Stage 2A-2.3 — Dependence-Aware Multi-Method Aggregation & Forecast 
           footingTier: 'methodologically-sound-moderate-evidence',
           verifiedIndependentMethodCount: 2,
         }),
-      ).toThrow(/verifiedIndependentMethodCount cannot be supplied without a valid auditable independenceCertification record/);
+      ).toThrow(/verifiedIndependentMethodCount cannot be supplied in Stage 2A-2\.3/);
 
       expect(() =>
         synthesizeForecastDistribution({
@@ -1150,7 +1150,7 @@ describe('Stage 2A-2.3 — Dependence-Aware Multi-Method Aggregation & Forecast 
           footingTier: 'methodologically-sound-moderate-evidence',
           statisticalIndependenceVerified: true,
         }),
-      ).toThrow(/statisticalIndependenceVerified cannot be true without a valid auditable independenceCertification record/);
+      ).toThrow(/statisticalIndependenceVerified cannot be true in Stage 2A-2\.3/);
 
       expect(() =>
         synthesizeForecastDistribution({
@@ -1160,7 +1160,7 @@ describe('Stage 2A-2.3 — Dependence-Aware Multi-Method Aggregation & Forecast 
           statisticalIndependenceVerified: true,
           verifiedIndependentMethodCount: 2,
         }),
-      ).toThrow(/statisticalIndependenceVerified cannot be true without a valid auditable independenceCertification record/);
+      ).toThrow(/statisticalIndependenceVerified cannot be true in Stage 2A-2\.3/);
 
       // Rejects null / non-object input:
       expect(() => synthesizeForecastDistribution(null)).toThrow(RangeError);
@@ -1219,13 +1219,14 @@ describe('Stage 2A-2.3 — Dependence-Aware Multi-Method Aggregation & Forecast 
       ]);
     });
 
-    it('accepts a valid auditable StatisticalIndependenceCertification and rejects malformed, incomplete, mismatched, or unsupported certification records', () => {
+    it('preserves a valid StatisticalIndependenceCertification as declared without promoting unauthenticated claims to verified independence, and rejects malformed or unsupported certification records', () => {
       const plan = planMethodApplicability(
         createAllBinaryApplicablePlanningInput(false),
       );
       const allFour = executeAllFourBinaryEvidenceMethods();
 
       const validCertification: StatisticalIndependenceCertification = {
+        tier: 'declared',
         certificationId: 'CERT-IND-2026-GEOPOL-001',
         evidenceReference:
           'audit://oracle/2026/disjoint-cohort-and-continuous-hazard-telemetry-v1',
@@ -1258,56 +1259,163 @@ describe('Stage 2A-2.3 — Dependence-Aware Multi-Method Aggregation & Forecast 
             groupIdA: 'discrete-binomial-multinomial-cohort',
             groupIdB: 'continuous-poisson-hazard-telemetry',
             evidenceBasis:
-              'Disjoint data collection pipelines and verified out-of-sample residual orthogonality (|rho_res| <= 0.03).',
+              'Disjoint data collection pipelines and out-of-sample residual orthogonality assertion (|rho_res| <= 0.03).',
             maxAbsResidualDependenceMetric: 0.03,
           },
         ],
         methodologicalJustification:
-          'The discrete historical treaty cohort and the continuous incident-rate telemetry stream are collected from disjoint institutional sensors with verified orthogonal prediction residuals.',
+          'The discrete historical treaty cohort and the continuous incident-rate telemetry stream are collected from disjoint institutional sensors with orthogonal prediction residual assertions.',
         verificationStatus: 'empirically-verified-orthogonal-residuals',
       };
 
-      // 1. Valid auditable certification succeeds and sets effectiveIndependentMethodCount = 2:
-      const certifiedResult = synthesizeForecastDistribution({
+      // 1. Valid declared certification is preserved in diagnostics with certificationTier = 'declared'
+      // and declaredIndependentGroupCount = 2, while keeping statisticalIndependenceVerified = false
+      // and effectiveIndependentMethodCount = 1 (because no trusted authentication mechanism exists in Stage 2A-2.3):
+      const declaredResult = synthesizeForecastDistribution({
         plan,
         methodOutputs: allFour,
         footingTier: 'methodologically-sound-moderate-evidence',
         independenceCertification: validCertification,
-        statisticalIndependenceVerified: true,
-        verifiedIndependentMethodCount: 2,
       });
       expect(
-        certifiedResult.contrastReport.statisticalIndependenceVerified,
-      ).toBe(true);
+        declaredResult.contrastReport.statisticalIndependenceVerified,
+      ).toBe(false);
       expect(
-        certifiedResult.contrastReport.effectiveIndependentMethodCount,
-      ).toBe(2);
+        declaredResult.contrastReport.effectiveIndependentMethodCount,
+      ).toBe(1);
       expect(
-        certifiedResult.contrastReport.independenceCertification,
+        declaredResult.contrastReport.independenceCertification,
       ).toEqual(validCertification);
       expect(
-        certifiedResult.contrastReport.independenceSemantics
+        declaredResult.contrastReport.independenceSemantics?.certificationTier,
+      ).toBe('declared');
+      expect(
+        declaredResult.contrastReport.independenceSemantics
+          ?.declaredIndependentGroupCount,
+      ).toBe(2);
+      expect(
+        declaredResult.contrastReport.independenceSemantics
+          ?.statisticalIndependenceVerified,
+      ).toBe(false);
+      expect(
+        declaredResult.contrastReport.independenceSemantics
+          ?.effectiveIndependentMethodCount,
+      ).toBe(1);
+      expect(
+        declaredResult.contrastReport.independenceSemantics
           ?.independenceCertification,
       ).toEqual(validCertification);
       expect(
-        validateForecastDistributionContract(certifiedResult),
-      ).toBe(certifiedResult);
-      assertDeeplyFrozen(certifiedResult);
+        validateForecastDistributionContract(declaredResult),
+      ).toBe(declaredResult);
+      assertDeeplyFrozen(declaredResult);
 
-      // 2. Rejects validateForecastDistributionContract when statisticalIndependenceVerified === true without certification:
+      // A self-declared verificationStatus string (whether 'empirically-verified-orthogonal-residuals',
+      // 'structurally-verified-disjoint-information-sets', or 'declared-unverified-assertion')
+      // cannot promote an unauthenticated certification into a verified independence claim:
+      const declaredWithExplicitUnverifiedStatus =
+        synthesizeForecastDistribution({
+          plan,
+          methodOutputs: allFour,
+          footingTier: 'methodologically-sound-moderate-evidence',
+          independenceCertification: {
+            ...validCertification,
+            verificationStatus: 'declared-unverified-assertion',
+          },
+        });
+      expect(
+        declaredWithExplicitUnverifiedStatus.contrastReport
+          .statisticalIndependenceVerified,
+      ).toBe(false);
+      expect(
+        declaredWithExplicitUnverifiedStatus.contrastReport
+          .effectiveIndependentMethodCount,
+      ).toBe(1);
+      expect(
+        declaredWithExplicitUnverifiedStatus.contrastReport
+          .independenceSemantics?.certificationTier,
+      ).toBe('declared');
+
+      // 2. Rejects unsupported attempts to promote a declared certification to 'verified'
+      // via tier: 'verified', statisticalIndependenceVerified: true, or verifiedIndependentMethodCount:
+      expect(() =>
+        synthesizeForecastDistribution({
+          plan,
+          methodOutputs: allFour,
+          footingTier: 'methodologically-sound-moderate-evidence',
+          independenceCertification: {
+            ...validCertification,
+            tier: 'verified',
+          },
+        }),
+      ).toThrow(/independenceCertification\.tier cannot be 'verified' in Stage 2A-2\.3/);
+
+      expect(() =>
+        synthesizeForecastDistribution({
+          plan,
+          methodOutputs: allFour,
+          footingTier: 'methodologically-sound-moderate-evidence',
+          independenceCertification: validCertification,
+          statisticalIndependenceVerified: true,
+        }),
+      ).toThrow(/statisticalIndependenceVerified cannot be true in Stage 2A-2\.3/);
+
+      expect(() =>
+        synthesizeForecastDistribution({
+          plan,
+          methodOutputs: allFour,
+          footingTier: 'methodologically-sound-moderate-evidence',
+          independenceCertification: validCertification,
+          verifiedIndependentMethodCount: 2,
+        }),
+      ).toThrow(/verifiedIndependentMethodCount cannot be supplied in Stage 2A-2\.3/);
+
+      // 2b. validateForecastDistributionContract also rejects forged verified independence claims on contracts:
       expect(() =>
         validateForecastDistributionContract({
-          ...certifiedResult,
+          ...declaredResult,
           contrastReport: {
-            ...certifiedResult.contrastReport,
-            independenceCertification: undefined,
+            ...declaredResult.contrastReport,
+            statisticalIndependenceVerified: true,
+          },
+        }),
+      ).toThrow(/statisticalIndependenceVerified cannot be true in Stage 2A-2\.3/);
+
+      expect(() =>
+        validateForecastDistributionContract({
+          ...declaredResult,
+          contrastReport: {
+            ...declaredResult.contrastReport,
+            effectiveIndependentMethodCount: 2,
+          },
+        }),
+      ).toThrow(/contrastReport\.effectiveIndependentMethodCount \(2\) must equal 1 for evidence-driven forecasts/);
+
+      expect(() =>
+        validateForecastDistributionContract({
+          ...declaredResult,
+          contrastReport: {
+            ...declaredResult.contrastReport,
             independenceSemantics: {
-              ...certifiedResult.contrastReport.independenceSemantics!,
-              independenceCertification: undefined,
+              ...declaredResult.contrastReport.independenceSemantics!,
+              certificationTier: 'verified',
             },
           },
         }),
-      ).toThrow(/independenceCertification is required when statisticalIndependenceVerified === true/);
+      ).toThrow(/contrastReport\.independenceSemantics\.certificationTier must be 'declared'/);
+
+      expect(() =>
+        validateForecastDistributionContract({
+          ...declaredResult,
+          contrastReport: {
+            ...declaredResult.contrastReport,
+            independenceSemantics: {
+              ...declaredResult.contrastReport.independenceSemantics!,
+              declaredIndependentGroupCount: 3,
+            },
+          },
+        }),
+      ).toThrow(/declaredIndependentGroupCount \(3\) does not match certifiedIndependentGroups\.length \(2\)/);
 
       // 3. Rejects empty or whitespace-padded certificationId, evidenceReference, or methodologicalJustification:
       expect(() =>
@@ -1346,7 +1454,7 @@ describe('Stage 2A-2.3 — Dependence-Aware Multi-Method Aggregation & Forecast 
         }),
       ).toThrow(/independenceCertification\.methodologicalJustification/);
 
-      // 4. Rejects unsupported or unverified verificationStatus:
+      // 4. Rejects unsupported verificationStatus:
       expect(() =>
         synthesizeForecastDistribution({
           plan,
@@ -1536,27 +1644,6 @@ describe('Stage 2A-2.3 — Dependence-Aware Multi-Method Aggregation & Forecast 
           },
         }),
       ).toThrow(/maxAbsResidualDependenceMetric must be a finite number in \[0, 1\]/);
-
-      // 9. Rejects mismatch between verifiedIndependentMethodCount and certifiedIndependentGroups.length, or contradictory statisticalIndependenceVerified: false:
-      expect(() =>
-        synthesizeForecastDistribution({
-          plan,
-          methodOutputs: allFour,
-          footingTier: 'methodologically-sound-moderate-evidence',
-          independenceCertification: validCertification,
-          verifiedIndependentMethodCount: 3,
-        }),
-      ).toThrow(/verifiedIndependentMethodCount \(3\) must match independenceCertification\.certifiedIndependentGroups\.length \(2\)/);
-
-      expect(() =>
-        synthesizeForecastDistribution({
-          plan,
-          methodOutputs: allFour,
-          footingTier: 'methodologically-sound-moderate-evidence',
-          independenceCertification: validCertification,
-          statisticalIndependenceVerified: false,
-        }),
-      ).toThrow(/statisticalIndependenceVerified cannot be false when independenceCertification is supplied/);
     });
   });
 });

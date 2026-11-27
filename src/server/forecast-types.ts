@@ -430,12 +430,19 @@ export interface MethodWeightingPolicyReport {
   readonly componentAllocations: readonly DependenceComponentWeightAllocation[];
 }
 
+export type IndependenceCertificationTier = 'declared' | 'verified';
+
+export const INDEPENDENCE_CERTIFICATION_TIERS: readonly IndependenceCertificationTier[] =
+  Object.freeze(['declared', 'verified']);
+
 export type IndependenceCertificationVerificationStatus =
+  | 'declared-unverified-assertion'
   | 'empirically-verified-orthogonal-residuals'
   | 'structurally-verified-disjoint-information-sets';
 
 export const INDEPENDENCE_CERTIFICATION_VERIFICATION_STATUSES: readonly IndependenceCertificationVerificationStatus[] =
   Object.freeze([
+    'declared-unverified-assertion',
     'empirically-verified-orthogonal-residuals',
     'structurally-verified-disjoint-information-sets',
   ]);
@@ -461,6 +468,14 @@ export interface StatisticalIndependenceCertification {
   readonly certifiedRelationships: readonly CertifiedIndependenceRelationship[];
   readonly methodologicalJustification: string;
   readonly verificationStatus: IndependenceCertificationVerificationStatus;
+  /**
+   * Explicit distinction between a caller-supplied structured assertion
+   * (`'declared'`) and a certification authenticated by a trusted runtime
+   * verification mechanism (`'verified'`). In Stage 2A-2.3 no trusted
+   * verification mechanism exists, so valid certifications are always preserved
+   * with `tier: 'declared'`.
+   */
+  readonly tier?: IndependenceCertificationTier;
 }
 
 export interface IndependenceCertificationValidationContext {
@@ -474,6 +489,8 @@ export interface EffectiveIndependenceAssessment {
   readonly ensembleContributingMethodCount: number;
   readonly referenceOnlyMethodCount: number;
   readonly declaredEvidenceComponentCount: number;
+  readonly certificationTier?: 'none' | IndependenceCertificationTier;
+  readonly declaredIndependentGroupCount?: number;
   readonly statisticalIndependenceVerified: boolean;
   readonly effectiveIndependentMethodCount: number;
   readonly independenceCertification?: StatisticalIndependenceCertification;
@@ -835,6 +852,24 @@ export function validateStatisticalIndependenceCertification(
     );
   }
 
+  if (value.tier !== undefined) {
+    if (
+      typeof value.tier !== 'string' ||
+      !INDEPENDENCE_CERTIFICATION_TIERS.includes(
+        value.tier as IndependenceCertificationTier,
+      )
+    ) {
+      throw new RangeError(
+        `independenceCertification.tier must be one of [${INDEPENDENCE_CERTIFICATION_TIERS.join(', ')}], received '${String(value.tier)}'`,
+      );
+    }
+    if (value.tier === 'verified') {
+      throw new RangeError(
+        "independenceCertification.tier cannot be 'verified' in Stage 2A-2.3: no trusted certification-verification mechanism exists to authenticate external evidence; certifications must be 'declared'",
+      );
+    }
+  }
+
   const certificationId = assertTrimmedNonEmptyString(
     value.certificationId,
     'independenceCertification.certificationId',
@@ -1116,6 +1151,7 @@ export function validateStatisticalIndependenceCertification(
     methodologicalJustification,
     verificationStatus:
       verificationStatus as IndependenceCertificationVerificationStatus,
+    tier: 'declared' as const,
   });
 }
 

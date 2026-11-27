@@ -3987,24 +3987,76 @@ function shannonEntropyFromDistribution(outcomes: readonly DualChannelProbabilit
   return terms.length === 0 ? 0 : Math.max(0, kahanNeumaierSum(terms));
 }
 
+function uMinusLog1p(u: number): number {
+  if (Math.abs(u) <= 1e-4) {
+    return u * u * (0.5 - u * (1 / 3 - u * (0.25 - u * (0.2 - u / 6))));
+  }
+  return u - Math.log1p(u);
+}
+
 function shannonEntropyFromWeights(normalizedWeights: readonly number[]): {
   readonly weightEntropyNats: number;
   readonly positiveWeightCount: number;
+  readonly dominantWeightIndex: number;
+  readonly restWeightSum: number;
 } {
-  const terms: number[] = [];
   let positiveWeightCount = 0;
+  let dominantWeightIndex = -1;
+  let maxW = -1;
   for (let m = 0; m < normalizedWeights.length; m++) {
     const w = normalizedWeights[m]!;
     if (w > 0) {
       positiveWeightCount += 1;
+      if (w > maxW) {
+        maxW = w;
+        dominantWeightIndex = m;
+      }
+    }
+  }
+
+  if (positiveWeightCount <= 1) {
+    return {
+      weightEntropyNats: 0,
+      positiveWeightCount,
+      dominantWeightIndex,
+      restWeightSum: 0,
+    };
+  }
+
+  const restWeights: number[] = [];
+  for (let m = 0; m < normalizedWeights.length; m++) {
+    if (m !== dominantWeightIndex && normalizedWeights[m]! > 0) {
+      restWeights.push(normalizedWeights[m]!);
+    }
+  }
+  const restWeightSum = restWeights.length === 0 ? 0 : kahanNeumaierSum(restWeights);
+
+  const terms: number[] = [];
+  for (let m = 0; m < normalizedWeights.length; m++) {
+    const w = normalizedWeights[m]!;
+    if (w <= 0) {
+      continue;
+    }
+    if (m === dominantWeightIndex && restWeightSum > 0 && restWeightSum <= 0.5) {
+      // Preserve full 53-bit precision when the dominant weight w_max = 1 - s_rest
+      // is near 1 (including when 1 - s_rest rounds to 1.0 in binary64 for s_rest < 2^-53):
+      const wMax = 1 - restWeightSum;
+      const logWMax = Math.log1p(-restWeightSum);
+      terms.push(-wMax * logWMax);
+    } else {
       const logW = Math.log(w);
       if (logW < 0) {
         terms.push(-w * logW);
       }
     }
   }
+
   const rawEntropy = terms.length === 0 ? 0 : kahanNeumaierSum(terms);
-  if (!Number.isFinite(rawEntropy) || Number.isNaN(rawEntropy) || rawEntropy < -1e-15) {
+  if (
+    !Number.isFinite(rawEntropy) ||
+    Number.isNaN(rawEntropy) ||
+    rawEntropy < -1e-15
+  ) {
     throw new RangeError(
       `Invalid Shannon weight entropy H(w) = ${String(rawEntropy)}`,
     );
@@ -4012,10 +4064,11 @@ function shannonEntropyFromWeights(normalizedWeights: readonly number[]): {
   return {
     weightEntropyNats: rawEntropy <= 0 ? 0 : rawEntropy,
     positiveWeightCount,
+    dominantWeightIndex,
+    restWeightSum,
   };
 }
 
-const WEIGHT_ENTROPY_NEGLIGIBLE_THRESHOLD_NATS = 1e-15;
 const JSD_BOUND_TOLERANCE_NATS = 1e-12;
 
 function computeNormalizedWeightedJsdIndex(
@@ -4043,8 +4096,8 @@ function computeNormalizedWeightedJsdIndex(
     );
   }
 
-  // Single participating method (or at most one positive weight -> H(w) = 0)
-  if (positiveWeightCount <= 1) {
+  // Single participating method (or at most one positive weight -> H(w) = 0):
+  if (positiveWeightCount <= 1 || weightEntropyNats === 0) {
     if (jensenShannonDivergenceNats > JSD_BOUND_TOLERANCE_NATS) {
       throw new RangeError(
         `${callerName}: jensenShannonDivergenceNats (${jensenShannonDivergenceNats}) must be 0 when positiveWeightCount (${positiveWeightCount}) <= 1`,
@@ -4053,26 +4106,17 @@ function computeNormalizedWeightedJsdIndex(
     return 0;
   }
 
-  // Numerically negligible weight entropy H(w) <= 1e-15
-  if (weightEntropyNats <= WEIGHT_ENTROPY_NEGLIGIBLE_THRESHOLD_NATS) {
-    if (
-      jensenShannonDivergenceNats >
-      weightEntropyNats + JSD_BOUND_TOLERANCE_NATS
-    ) {
-      throw new RangeError(
-        `${callerName}: jensenShannonDivergenceNats (${jensenShannonDivergenceNats}) exceeds negligible weight entropy H(w) (${weightEntropyNats}) beyond numerical tolerance`,
-      );
-    }
-    return 0;
-  }
-
-  // General weighted ensemble with H(w) > 1e-15: theoretical upper bound is H(w)
-  const maxAllowedJsd =
-    weightEntropyNats +
-    Math.max(JSD_BOUND_TOLERANCE_NATS, 1e-12 * weightEntropyNats);
-  if (jensenShannonDivergenceNats > maxAllowedJsd) {
+  // General weighted ensemble with positiveWeightCount >= 2 and H(w) > 0:
+  // Theoretical upper bound is H(w). The upper-bound tolerance scales with H(w)
+  // and IEEE 754 binary64 ULP spacing so a JSD materially exceeding H(w) is
+  // rejected even when both JSD_w and H(w) are below 1e-15.
+  const scaledBoundTolerance = Math.max(
+    1e-12 * weightEntropyNats,
+    64 * ulpBinary64(weightEntropyNats),
+  );
+  if (jensenShannonDivergenceNats > weightEntropyNats + scaledBoundTolerance) {
     throw new RangeError(
-      `${callerName}: jensenShannonDivergenceNats (${jensenShannonDivergenceNats}) exceeds theoretical upper bound H(w) (${weightEntropyNats})`,
+      `${callerName}: jensenShannonDivergenceNats (${jensenShannonDivergenceNats}) exceeds theoretical upper bound H(w) (${weightEntropyNats}) beyond numerical tolerance (${scaledBoundTolerance})`,
     );
   }
 
@@ -4147,6 +4191,13 @@ export function decomposeEnsembleEntropy(
     );
   }
 
+  const {
+    weightEntropyNats,
+    positiveWeightCount,
+    dominantWeightIndex,
+    restWeightSum,
+  } = shannonEntropyFromWeights(normalizedWeights);
+
   // Compute the exact log-space mixture distribution from the individual distributions and normalized weights
   const computedMixture: DualChannelProbability[] = new Array<DualChannelProbability>(
     outcomeCount,
@@ -4169,7 +4220,13 @@ export function decomposeEnsembleEntropy(
         ) {
           allIdenticalForK = false;
         }
-        const logW = Math.log(w);
+        const logW =
+          positiveWeightCount >= 2 &&
+          m === dominantWeightIndex &&
+          restWeightSum > 0 &&
+          restWeightSum <= 0.5
+            ? Math.log1p(-restWeightSum)
+            : Math.log(w);
         logProbsK.push(logW + entry.logProbability);
         logCompsK.push(logW + entry.logComplementProbability);
       }
@@ -4215,17 +4272,57 @@ export function decomposeEnsembleEntropy(
 
   for (let m = 0; m < validatedMethods.length; m++) {
     const dist = validatedMethods[m]!;
-    const w = normalizedWeights[m]!;
-    if (w <= 0) {
+    const rawW = normalizedWeights[m]!;
+    if (rawW <= 0) {
       continue;
     }
+    const w =
+      positiveWeightCount >= 2 &&
+      m === dominantWeightIndex &&
+      restWeightSum > 0 &&
+      restWeightSum <= 0.5
+        ? 1 - restWeightSum
+        : rawW;
     withinTerms.push(w * shannonEntropyFromDistribution(dist));
 
-    // KL(p_m || p_bar) = sum_k p_{m,k} * (ln p_{m,k} - ln p_bar_k)
+    // When one weight dominates (restWeightSum < 1e-6), evaluating
+    // pm * (ln pm - ln pBar) directly for the dominant method suffers O(1)
+    // ULP cancellation because pBar ≈ pm. Using the non-negative Bregman
+    // divergence b_{m,k} = (pBar_k - p_{m,k}) + p_{m,k}*(ln p_{m,k} - ln pBar_k)
+    // = p_{m,k}*(u_{m,k} - log1p(u_{m,k})) where u_{m,k} = (pBar_k - p_{m,k}) / p_{m,k}
+    // eliminates first-order cancellation while summing to KL(p_m || pBar) [IME / ANC].
+    const useBregmanForDominant =
+      positiveWeightCount >= 2 &&
+      m === dominantWeightIndex &&
+      restWeightSum > 0 &&
+      restWeightSum < 1e-6;
+
     for (let k = 0; k < outcomeCount; k++) {
       const pm = dist[k]!;
       const pBar = computedMixture[k]!;
-      if (pm.probability > 0 && Number.isFinite(pm.logProbability)) {
+      if (useBregmanForDominant) {
+        let delta = 0;
+        for (let j = 0; j < validatedMethods.length; j++) {
+          if (j === m || normalizedWeights[j]! <= 0) {
+            continue;
+          }
+          delta += normalizedWeights[j]! * (validatedMethods[j]![k]!.probability - pm.probability);
+        }
+        if (pm.probability === 0) {
+          if (delta > 0) {
+            jsdTerms.push(w * delta);
+          }
+        } else {
+          const u = delta / pm.probability;
+          if (Math.abs(u) <= 0.5) {
+            jsdTerms.push(w * pm.probability * uMinusLog1p(u));
+          } else if (Number.isFinite(pm.logProbability)) {
+            jsdTerms.push(
+              w * (delta + pm.probability * (pm.logProbability - pBar.logProbability)),
+            );
+          }
+        }
+      } else if (pm.probability > 0 && Number.isFinite(pm.logProbability)) {
         jsdTerms.push(w * pm.probability * (pm.logProbability - pBar.logProbability));
       }
     }
@@ -4247,8 +4344,6 @@ export function decomposeEnsembleEntropy(
   }
   const jensenShannonDivergenceNats = rawJsd <= 0 ? 0 : rawJsd;
 
-  const { weightEntropyNats, positiveWeightCount } =
-    shannonEntropyFromWeights(normalizedWeights);
   const normalizedDisagreementIndex = computeNormalizedWeightedJsdIndex(
     jensenShannonDivergenceNats,
     weightEntropyNats,
@@ -4524,7 +4619,7 @@ export function validateEntropyDecomposition(
   }
 
   // 3. Check JSD_w and normalizedDisagreementIndex against weights H(w) or executedMethodCount
-  if (jensenShannonDivergenceNats <= 1e-15 && normalizedDisagreementIndex > 1e-12) {
+  if (jensenShannonDivergenceNats === 0 && normalizedDisagreementIndex > 1e-12) {
     throw new RangeError(
       `EntropyDecomposition.normalizedDisagreementIndex (${normalizedDisagreementIndex}) must be 0 when jensenShannonDivergenceNats is 0`,
     );
@@ -4923,25 +5018,18 @@ export function validateForecastDistributionContract(
       );
     }
   } else {
-    const independenceVerified = contrastReport.statisticalIndependenceVerified === true;
-    if (!independenceVerified) {
-      if (rawCert !== undefined) {
-        throw new RangeError(
-          'contrastReport.independenceCertification must not be present when statisticalIndependenceVerified is not true',
-        );
-      }
-      if (Math.abs(effectiveIndependentMethodCount - 1) > 1e-12) {
-        throw new RangeError(
-          `contrastReport.effectiveIndependentMethodCount (${String(effectiveIndependentMethodCount)}) must equal 1 when statisticalIndependenceVerified is not true`,
-        );
-      }
-    } else {
-      if (rawCert === undefined) {
-        throw new RangeError(
-          'contrastReport.independenceCertification is required when statisticalIndependenceVerified === true',
-        );
-      }
+    if (contrastReport.statisticalIndependenceVerified === true) {
+      throw new RangeError(
+        "contrastReport.statisticalIndependenceVerified cannot be true in Stage 2A-2.3: no trusted verification mechanism exists to authenticate external independence references; certifications must remain 'declared' with statisticalIndependenceVerified = false",
+      );
+    }
+    if (Math.abs(effectiveIndependentMethodCount - 1) > 1e-12) {
+      throw new RangeError(
+        `contrastReport.effectiveIndependentMethodCount (${String(effectiveIndependentMethodCount)}) must equal 1 for evidence-driven forecasts when no trusted verification authority has verified cross-method independence`,
+      );
+    }
 
+    if (rawCert !== undefined) {
       const correlatedMethodSets: Array<readonly ScientificMethodId[]> = [];
       const depDiag = contrastReport.dependenceDiagnostics as
         | {
@@ -4990,12 +5078,33 @@ export function validateForecastDistributionContract(
           : {}),
       });
 
-      const certifiedGroupCount = validatedCert.certifiedIndependentGroups.length;
-      if (Math.abs(effectiveIndependentMethodCount - certifiedGroupCount) > 1e-12) {
-        throw new RangeError(
-          `contrastReport.effectiveIndependentMethodCount (${String(effectiveIndependentMethodCount)}) does not match certifiedIndependentGroups.length (${certifiedGroupCount})`,
-        );
+      if (rawSemantics !== undefined) {
+        if (
+          rawSemantics.certificationTier !== undefined &&
+          rawSemantics.certificationTier !== 'declared'
+        ) {
+          throw new RangeError(
+            `contrastReport.independenceSemantics.certificationTier must be 'declared' when a declared independenceCertification is present, received '${String(rawSemantics.certificationTier)}'`,
+          );
+        }
+        if (
+          rawSemantics.declaredIndependentGroupCount !== undefined &&
+          rawSemantics.declaredIndependentGroupCount !==
+            validatedCert.certifiedIndependentGroups.length
+        ) {
+          throw new RangeError(
+            `contrastReport.independenceSemantics.declaredIndependentGroupCount (${String(rawSemantics.declaredIndependentGroupCount)}) does not match certifiedIndependentGroups.length (${validatedCert.certifiedIndependentGroups.length})`,
+          );
+        }
       }
+    } else if (
+      rawSemantics !== undefined &&
+      rawSemantics.certificationTier !== undefined &&
+      rawSemantics.certificationTier !== 'none'
+    ) {
+      throw new RangeError(
+        `contrastReport.independenceSemantics.certificationTier must be 'none' when no independenceCertification is present, received '${String(rawSemantics.certificationTier)}'`,
+      );
     }
   }
 

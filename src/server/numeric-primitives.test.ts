@@ -1503,7 +1503,7 @@ describe('Stage 2A-1 — Numeric Primitives & Forecast Contracts (v4.4.3)', () =
       expect(maxSep3.jensenShannonDivergenceNats).toBeCloseTo(expectedHw3, 15);
       expect(maxSep3.normalizedDisagreementIndex).toBeCloseTo(1, 15);
 
-      // 6. Single-method behavior, zero-weight method handling, and negligible weight entropy:
+      // 6. Single-method behavior and zero-weight method handling:
       const singleMethod = decomposeEnsembleEntropy([dA], [1]);
       expect(singleMethod.jensenShannonDivergenceNats).toBe(0);
       expect(singleMethod.normalizedDisagreementIndex).toBe(0);
@@ -1524,6 +1524,132 @@ describe('Stage 2A-1 — Numeric Primitives & Forecast Contracts (v4.4.3)', () =
         decomp9010.normalizedDisagreementIndex,
         15,
       );
+
+      // 7. Extremely imbalanced weights [1 - 1e-16, 1e-16] (analytically derived reference):
+      // Analytical Shannon entropy H([1 - eps, eps]) = eps * (1 - ln(eps)) - eps^2 / 2 - ...
+      // For eps = 1e-16: 1e-16 * (1 + 16 * ln(10)) = 3.7841361487904734e-15 nats.
+      const analyticHw1e16 = 3.7841361487904734e-15;
+      const maxSep1e16 = decomposeEnsembleEntropy(
+        [certYes, certNo],
+        [1 - 1e-16, 1e-16],
+      );
+      expect(maxSep1e16.jensenShannonDivergenceNats).toBeCloseTo(
+        analyticHw1e16,
+        28,
+      );
+      expect(maxSep1e16.normalizedDisagreementIndex).toBeCloseTo(1, 15);
+
+      const identical1e16 = decomposeEnsembleEntropy(
+        [dA, dA],
+        [1 - 1e-16, 1e-16],
+      );
+      expect(identical1e16.jensenShannonDivergenceNats).toBe(0);
+      expect(identical1e16.normalizedDisagreementIndex).toBe(0);
+
+      // Interior distributions [0.8, 0.2] vs [0.1, 0.9] with weights [1 - 1e-16, 1e-16]:
+      // Analytical asymptotic expansion: JSD_w = eps * KL([0.1, 0.9] || [0.8, 0.2]) + O(eps^2)
+      // KL([0.1, 0.9] || [0.8, 0.2]) = 0.1 * ln(1/8) + 0.9 * ln(9/2) = 1.1457255029306628 nats.
+      const analyticInteriorJsd1e16 = 1.1457255029306628e-16;
+      const interior1e16 = decomposeEnsembleEntropy(
+        [dA, dB],
+        [1 - 1e-16, 1e-16],
+      );
+      expect(interior1e16.jensenShannonDivergenceNats).toBeCloseTo(
+        analyticInteriorJsd1e16,
+        30,
+      );
+      expect(interior1e16.normalizedDisagreementIndex).toBeCloseTo(
+        analyticInteriorJsd1e16 / analyticHw1e16,
+        14,
+      );
+
+      // 8. Positive weight entropy below 1e-15 ([1 - 1e-17, 1e-17] and [1 - 1e-20, 1e-20]):
+      // Analytical H(w) for eps = 1e-17: 1e-17 * (1 + 17 * ln(10)) = 4.014394658089878e-16 nats (< 1e-15).
+      // Analytical H(w) for eps = 1e-20: 1e-20 * (1 + 20 * ln(10)) = 4.705170185988092e-19 nats (< 1e-15).
+      const analyticHw1e17 = 4.014394658089878e-16;
+      const maxSep1e17 = decomposeEnsembleEntropy(
+        [certYes, certNo],
+        [1 - 1e-17, 1e-17],
+      );
+      expect(maxSep1e17.jensenShannonDivergenceNats).toBeLessThan(1e-15);
+      expect(maxSep1e17.jensenShannonDivergenceNats).toBeCloseTo(
+        analyticHw1e17,
+        29,
+      );
+      // Never replaces a meaningful positive ratio JSD_w / H(w) = 1 with 0 when H(w) <= 1e-15:
+      expect(maxSep1e17.normalizedDisagreementIndex).toBeCloseTo(1, 15);
+
+      const analyticHw1e20 = 4.705170185988092e-19;
+      const maxSep1e20 = decomposeEnsembleEntropy(
+        [certYes, certNo],
+        [1 - 1e-20, 1e-20],
+      );
+      expect(maxSep1e20.jensenShannonDivergenceNats).toBeCloseTo(
+        analyticHw1e20,
+        32,
+      );
+      expect(maxSep1e20.normalizedDisagreementIndex).toBeCloseTo(1, 15);
+
+      const identical1e17 = decomposeEnsembleEntropy(
+        [dA, dA],
+        [1 - 1e-17, 1e-17],
+      );
+      expect(identical1e17.jensenShannonDivergenceNats).toBe(0);
+      expect(identical1e17.normalizedDisagreementIndex).toBe(0);
+
+      // validateEntropyDecomposition accepts valid tiny-entropy decomposition (JSD_w <= 1e-15 with index = 1)
+      // and rejects a deliberately invalid JSD exceeding H(w) even when both are << 1e-12:
+      const mix1e17 = [
+        createDualChannelProbabilityFromLog(Math.log1p(-1e-17)),
+        createDualChannelProbability(1e-17),
+      ];
+      expect(
+        validateEntropyDecomposition(
+          maxSep1e17,
+          mix1e17,
+          2,
+          2,
+          [1 - 1e-17, 1e-17],
+        ),
+      ).toEqual(maxSep1e17);
+
+      // Falsified JSD = 2 * H(w) (~8.03e-16 << 1e-12) is rejected because tolerance scales with H(w):
+      expect(() =>
+        validateEntropyDecomposition(
+          {
+            totalPredictiveEntropyNats: maxSep1e17.totalPredictiveEntropyNats,
+            withinMethodExpectedEntropyNats: 0,
+            jensenShannonDivergenceNats: 2 * analyticHw1e17,
+            normalizedDisagreementIndex: 1,
+            closureResidualNats: Math.abs(
+              maxSep1e17.totalPredictiveEntropyNats - 2 * analyticHw1e17,
+            ),
+          },
+          mix1e17,
+          2,
+          2,
+          [1 - 1e-17, 1e-17],
+        ),
+      ).toThrow(/exceeds theoretical upper bound H\(w\)|violates H\(p_bar\) = H_within \+ JSD_w/);
+
+      // Even if totalPredictiveEntropyNats and withinMethodExpectedEntropyNats are crafted to satisfy
+      // H(p_bar) = H_within + JSD_w, JSD_w > H(w) is still rejected by computeNormalizedWeightedJsdIndex:
+      expect(() =>
+        validateEntropyDecomposition(
+          {
+            totalPredictiveEntropyNats: dA[0]!.probability > 0 ? 0.5004024235381879 : 0,
+            withinMethodExpectedEntropyNats:
+              0.5004024235381879 - 2 * analyticHw1e17,
+            jensenShannonDivergenceNats: 2 * analyticHw1e17,
+            normalizedDisagreementIndex: 1,
+            closureResidualNats: 0,
+          },
+          dA,
+          2,
+          2,
+          [1 - 1e-17, 1e-17],
+        ),
+      ).toThrow(/exceeds theoretical upper bound H\(w\)/);
 
       // validateEntropyDecomposition verifies JSD_w / H(w) and rejects the old JSD_w / ln(M) under unequal weights:
       const ensemble9010 = [

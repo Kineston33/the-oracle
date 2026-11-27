@@ -60,6 +60,7 @@ import {
   CALIBRATION_VERIFICATION_STATUSES,
   EPISTEMOLOGICAL_TAG_BY_KIND,
   EVIDENTIAL_FOOTING_TIERS,
+  INDEPENDENCE_CERTIFICATION_TIERS,
   INDEPENDENCE_CERTIFICATION_VERIFICATION_STATUSES,
   assertCalibrationHonesty,
   validateOutcomeSpaceDescriptor,
@@ -77,6 +78,7 @@ import {
   type EpistemologicalClaimKind,
   type EvidentialFootingTier,
   type ForecastDistributionOutput,
+  type IndependenceCertificationTier,
   type IndependenceCertificationValidationContext,
   type IndependenceCertificationVerificationStatus,
   type MethodApplicabilityResult,
@@ -92,10 +94,12 @@ import {
 } from './forecast-types.ts';
 
 export {
+  INDEPENDENCE_CERTIFICATION_TIERS,
   INDEPENDENCE_CERTIFICATION_VERIFICATION_STATUSES,
   validateStatisticalIndependenceCertification,
   type CertifiedIndependenceRelationship,
   type CertifiedIndependentMethodGroup,
+  type IndependenceCertificationTier,
   type IndependenceCertificationValidationContext,
   type IndependenceCertificationVerificationStatus,
   type StatisticalIndependenceCertification,
@@ -1409,31 +1413,28 @@ export function synthesizeForecastDistribution(
         | undefined,
     );
 
-  // Determine honest effectiveIndependentMethodCount & validate auditable certification:
-  let statisticalIndependenceVerified = false;
-  let effectiveIndependentMethodCount = 1;
+  // Determine honest effectiveIndependentMethodCount & validate declared certification:
+  // In Stage 2A-2.3 no trusted runtime verification authority exists to authenticate
+  // external certification references, so statisticalIndependenceVerified is strictly
+  // false and effectiveIndependentMethodCount is strictly 1 for evidence-driven forecasts.
+  if (rawInput.statisticalIndependenceVerified === true) {
+    throw new RangeError(
+      "statisticalIndependenceVerified cannot be true in Stage 2A-2.3: no trusted verification mechanism exists to authenticate external independence references; certifications are preserved as 'declared' with statisticalIndependenceVerified = false and effectiveIndependentMethodCount = 1",
+    );
+  }
+  if (rawInput.verifiedIndependentMethodCount !== undefined) {
+    throw new RangeError(
+      'verifiedIndependentMethodCount cannot be supplied in Stage 2A-2.3: no trusted verification mechanism exists to promote declared certifications or increase effectiveIndependentMethodCount above 1',
+    );
+  }
+
+  const statisticalIndependenceVerified = false;
+  const effectiveIndependentMethodCount = 1;
   let validatedIndependenceCertification:
     | StatisticalIndependenceCertification
     | undefined;
 
-  if (rawInput.independenceCertification === undefined) {
-    if (rawInput.statisticalIndependenceVerified === true) {
-      throw new RangeError(
-        'statisticalIndependenceVerified cannot be true without a valid auditable independenceCertification record',
-      );
-    }
-    if (rawInput.verifiedIndependentMethodCount !== undefined) {
-      throw new RangeError(
-        'verifiedIndependentMethodCount cannot be supplied without a valid auditable independenceCertification record',
-      );
-    }
-  } else {
-    if (rawInput.statisticalIndependenceVerified === false) {
-      throw new RangeError(
-        'statisticalIndependenceVerified cannot be false when independenceCertification is supplied',
-      );
-    }
-
+  if (rawInput.independenceCertification !== undefined) {
     const correlatedMethodSets: Array<readonly ScientificMethodId[]> = [];
     for (const comp of plan.dependenceDiagnostics.connectedComponents) {
       correlatedMethodSets.push(comp.applicableMethodIds);
@@ -1458,24 +1459,6 @@ export function synthesizeForecastDistribution(
             weightingPolicy.evidenceConnectedComponentCount,
         },
       );
-
-    const certifiedGroupCount =
-      validatedIndependenceCertification.certifiedIndependentGroups.length;
-    if (rawInput.verifiedIndependentMethodCount !== undefined) {
-      const vCount = rawInput.verifiedIndependentMethodCount;
-      if (
-        typeof vCount !== 'number' ||
-        !Number.isSafeInteger(vCount) ||
-        vCount !== certifiedGroupCount
-      ) {
-        throw new RangeError(
-          `verifiedIndependentMethodCount (${String(vCount)}) must match independenceCertification.certifiedIndependentGroups.length (${certifiedGroupCount})`,
-        );
-      }
-    }
-
-    statisticalIndependenceVerified = true;
-    effectiveIndependentMethodCount = certifiedGroupCount;
   }
 
   const participatingOutputs = eligibleEvidenceMethodIds.map(
@@ -1612,6 +1595,12 @@ export function synthesizeForecastDistribution(
     );
   }
 
+  if (validatedIndependenceCertification !== undefined) {
+    addLimitation(
+      `Declared independence certification ('${validatedIndependenceCertification.certificationId}', declared status: '${validatedIndependenceCertification.verificationStatus}', ${validatedIndependenceCertification.certifiedIndependentGroups.length} declared independent groups) was structurally validated and recorded with tier = 'declared'. Because no trusted runtime certification-verification mechanism exists in Stage 2A-2.3 to authenticate external evidence references, statisticalIndependenceVerified remains false and effectiveIndependentMethodCount remains 1.`,
+    );
+  }
+
   for (const extra of additionalLimitations) {
     addLimitation(extra);
   }
@@ -1622,14 +1611,21 @@ export function synthesizeForecastDistribution(
     referenceOnlyMethodCount: referenceOnlyMethodIds.length,
     declaredEvidenceComponentCount:
       weightingPolicy.evidenceConnectedComponentCount,
+    ...(validatedIndependenceCertification !== undefined
+      ? {
+          certificationTier: 'declared' as const,
+          declaredIndependentGroupCount:
+            validatedIndependenceCertification.certifiedIndependentGroups
+              .length,
+          independenceCertification: validatedIndependenceCertification,
+        }
+      : {}),
     statisticalIndependenceVerified,
     effectiveIndependentMethodCount,
-    ...(validatedIndependenceCertification !== undefined
-      ? { independenceCertification: validatedIndependenceCertification }
-      : {}),
-    explanation: statisticalIndependenceVerified
-      ? `Statistical independence was explicitly certified (certificationId: '${validatedIndependenceCertification!.certificationId}', status: '${validatedIndependenceCertification!.verificationStatus}') across ${effectiveIndependentMethodCount} independent method group(s) (bounded by ${weightingPolicy.evidenceConnectedComponentCount} declared evidence component(s)).`
-      : `Statistical independence across the ${eligibleEvidenceMethodIds.length} participating evidence-driven method(s) (${weightingPolicy.evidenceConnectedComponentCount} declared dependence component(s)) is not established; effectiveIndependentMethodCount is conservatively fixed at 1 so correlated or unverified methods are never counted as multiple independent votes.`,
+    explanation:
+      validatedIndependenceCertification !== undefined
+        ? `Independence certification '${validatedIndependenceCertification.certificationId}' (${validatedIndependenceCertification.certifiedIndependentGroups.length} declared independent group(s)) is recorded as tier 'declared' (not authenticated by a trusted runtime verification mechanism); statisticalIndependenceVerified remains false and effectiveIndependentMethodCount is conservatively fixed at 1.`
+        : `Statistical independence across the ${eligibleEvidenceMethodIds.length} participating evidence-driven method(s) (${weightingPolicy.evidenceConnectedComponentCount} declared dependence component(s)) is not established; effectiveIndependentMethodCount is conservatively fixed at 1 so correlated or unverified methods are never counted as multiple independent votes.`,
   });
 
   const contrastReport: MultiMethodContrastReport = Object.freeze({
