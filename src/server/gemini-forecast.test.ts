@@ -10,7 +10,7 @@
 import { once } from 'node:events';
 import type { AddressInfo } from 'node:net';
 import { ApiError } from '@google/genai';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { resolveCanonicalQuestion } from '../data/question-resolver.ts';
 import { predictionRecords } from '../data/records.ts';
 import type { PredictionRecord } from '../data/types.ts';
@@ -254,8 +254,11 @@ describe('Stage 2B-2A — Gemini Question Interpreter & Scientific Forecast Back
 
   describe('1. Config, Unconfigured Fail-Closed Behavior & Secret Redaction', () => {
     it('reads env config safely with bounded defaults and never crashes when GEMINI_API_KEY is unset', async () => {
+      expect(DEFAULT_GEMINI_MODEL).toBe('gemini-3.8-flash');
+
       const cfg = readGeminiConfigFromEnv({});
       expect(cfg.apiKey).toBe('');
+      expect(cfg.model).toBe('gemini-3.8-flash');
       expect(cfg.model).toBe(DEFAULT_GEMINI_MODEL);
       expect(cfg.timeoutMs).toBe(DEFAULT_GEMINI_TIMEOUT_MS);
       expect(cfg.maxAttempts).toBe(DEFAULT_GEMINI_MAX_ATTEMPTS);
@@ -329,7 +332,6 @@ describe('Stage 2B-2A — Gemini Question Interpreter & Scientific Forecast Back
       const interpreter = createGeminiQuestionInterpreterFromEnv(
         {
           GEMINI_API_KEY: 'AIzaSyFakeTestKeyForUnitTestOnly12345678',
-          GEMINI_MODEL: 'gemini-2.5-flash',
           GEMINI_TIMEOUT_MS: '7500',
           GEMINI_MAX_ATTEMPTS: '2',
         },
@@ -356,7 +358,7 @@ describe('Stage 2B-2A — Gemini Question Interpreter & Scientific Forecast Back
       expect(interpreter.isConfigured()).toBe(true);
       expect(interpreter.getStatus()).toEqual({
         providerId: 'gemini',
-        model: 'gemini-2.5-flash',
+        model: 'gemini-3.8-flash',
         configured: true,
         status: 'ready',
       });
@@ -366,21 +368,141 @@ describe('Stage 2B-2A — Gemini Question Interpreter & Scientific Forecast Back
         referenceTime: FIXED_NOW,
       });
 
-      expect(capturedConfig?.model).toBe('gemini-2.5-flash');
+      expect(capturedConfig?.model).toBe('gemini-3.8-flash');
       expect(capturedConfig?.timeoutMs).toBe(7500);
       expect(capturedConfig?.maxAttempts).toBe(2);
-      expect(capturedParams?.model).toBe('gemini-2.5-flash');
+      expect(capturedParams?.model).toBe('gemini-3.8-flash');
       expect(capturedParams?.config?.temperature).toBe(0);
       expect(capturedParams?.config?.responseMimeType).toBe('application/json');
       expect(capturedParams?.config?.responseJsonSchema).toBeDefined();
       expect(capturedParams?.config?.tools).toBeUndefined();
       expect(capturedParams?.config?.httpOptions?.retryOptions?.attempts).toBe(2);
+      expect(result.model).toBe('gemini-3.8-flash');
       expect(result.tokenUsage).toEqual({
         promptTokens: 120,
         outputTokens: 85,
         totalTokens: 205,
       });
       expect(result.interpretation.subject.id).toBe('battery-storage');
+    });
+
+    it('serializes gemini-3.8-flash generateContent with structured JSON schema via real @google/genai client and never silently falls back on model unavailability', async () => {
+      const requestedUrls: string[] = [];
+      const requestedBodies: Array<Record<string, unknown>> = [];
+      const originalFetch = globalThis.fetch;
+
+      const fetchSpy = vi
+        .spyOn(globalThis, 'fetch')
+        .mockImplementation(async (input, init) => {
+          const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
+          if (!url.startsWith('https://generativelanguage.googleapis.com/')) {
+            return originalFetch(input, init);
+          }
+          requestedUrls.push(url);
+          const rawBody =
+            typeof init?.body === 'string'
+              ? init.body
+              : input instanceof Request
+                ? await input.clone().text()
+                : '{}';
+          requestedBodies.push(JSON.parse(rawBody) as Record<string, unknown>);
+
+          return new Response(
+            JSON.stringify({
+              candidates: [
+                {
+                  content: {
+                    role: 'model',
+                    parts: [{ text: JSON.stringify(buildValidGeminiJsonPayload()) }],
+                  },
+                  finishReason: 'STOP',
+                },
+              ],
+            }),
+            {
+              status: 200,
+              headers: { 'Content-Type': 'application/json' },
+            },
+          );
+        });
+
+      try {
+        // Default env uses gemini-3.8-flash with structured JSON schema
+        const sdkDefaultInterpreter = createGeminiQuestionInterpreterFromEnv(
+          {
+            GEMINI_API_KEY: 'AIzaSyFakeSdkFetchKeyForUnitTest1234567',
+          },
+          { now: () => FIXED_NOW },
+        );
+        const okRes = await sdkDefaultInterpreter.interpretQuestion({
+          question: 'Will global battery storage exceed 1000 GW by 2030 per IEA?',
+          referenceTime: FIXED_NOW,
+        });
+
+        expect(okRes.model).toBe('gemini-3.8-flash');
+        expect(requestedUrls).toHaveLength(1);
+        expect(requestedUrls[0]).toContain('/models/gemini-3.8-flash:generateContent');
+        expect(requestedUrls[0]).not.toContain('gemini-2.5-flash');
+
+        const genCfg = requestedBodies[0]?.generationConfig as Record<string, unknown>;
+        expect(genCfg?.temperature).toBe(0);
+        expect(genCfg?.maxOutputTokens).toBe(1024);
+        expect(genCfg?.responseMimeType).toBe('application/json');
+        expect(genCfg?.responseJsonSchema).toBeDefined();
+        expect(requestedBodies[0]?.tools).toBeUndefined();
+        expect(requestedBodies[0]?.routingConfig).toBeUndefined();
+        expect(requestedBodies[0]?.modelSelectionConfig).toBeUndefined();
+
+        // Now verify an unavailable model returns HTTP 404 -> clear provider_model_unavailable error with ZERO silent fallback
+        requestedUrls.length = 0;
+        fetchSpy.mockImplementation(async (input, init) => {
+          const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
+          if (!url.startsWith('https://generativelanguage.googleapis.com/')) {
+            return originalFetch(input, init);
+          }
+          requestedUrls.push(url);
+          return new Response(
+            JSON.stringify({
+              error: {
+                code: 404,
+                message: 'models/gemini-3.8-flash is not found for API version v1beta.',
+                status: 'NOT_FOUND',
+              },
+            }),
+            {
+              status: 404,
+              headers: { 'Content-Type': 'application/json' },
+            },
+          );
+        });
+
+        const sdkUnavailableInterpreter = createGeminiQuestionInterpreterFromEnv(
+          {
+            GEMINI_API_KEY: 'AIzaSyFakeSdkFetchKeyForUnitTest1234567',
+            GEMINI_MODEL: 'gemini-3.8-flash',
+          },
+          { now: () => FIXED_NOW },
+        );
+
+        await expect(
+          sdkUnavailableInterpreter.interpretQuestion({
+            question: 'Will global battery storage exceed 1000 GW by 2030 per IEA?',
+            referenceTime: FIXED_NOW,
+          }),
+        ).rejects.toMatchObject({
+          name: 'QuestionInterpretationError',
+          code: 'provider_model_unavailable',
+          httpStatus: 502,
+          retryable: false,
+        });
+
+        // Crucial: strictly ONE request to gemini-3.8-flash; NEVER fell back silently to gemini-2.5-flash or any other model
+        expect(requestedUrls).toHaveLength(1);
+        expect(requestedUrls[0]).toContain('/models/gemini-3.8-flash:generateContent');
+        expect(requestedUrls.some((u) => u.includes('gemini-2.5-flash'))).toBe(false);
+      } finally {
+        fetchSpy.mockRestore();
+      }
     });
   });
 
@@ -456,9 +578,42 @@ describe('Stage 2B-2A — Gemini Question Interpreter & Scientific Forecast Back
       ) =>
         new GeminiQuestionInterpreter({
           apiKey: secretKey,
-          model: 'gemini-2.5-flash',
+          model: 'gemini-3.8-flash',
           client: createMockGeminiClient(impl),
         });
+
+      // Model unavailable / unsupported structured output -> clear provider_model_unavailable without silent fallback
+      let callCount = 0;
+      const calledModels: string[] = [];
+      await expect(
+        makeProvider(async (params) => {
+          callCount += 1;
+          calledModels.push(String(params.model));
+          throw new ApiError({
+            status: 404,
+            message: 'models/gemini-3.8-flash is not found or not supported for generateContent.',
+          });
+        }).interpretQuestion({ question: 'Will X happen in 2029?', referenceTime: FIXED_NOW }),
+      ).rejects.toMatchObject({
+        code: 'provider_model_unavailable',
+        httpStatus: 502,
+        retryable: false,
+      });
+      expect(callCount).toBe(1);
+      expect(calledModels).toEqual(['gemini-3.8-flash']);
+
+      await expect(
+        makeProvider(async () => {
+          throw new ApiError({
+            status: 400,
+            message: 'responseJsonSchema is not supported for this model.',
+          });
+        }).interpretQuestion({ question: 'Will X happen in 2029?', referenceTime: FIXED_NOW }),
+      ).rejects.toMatchObject({
+        code: 'provider_model_unavailable',
+        httpStatus: 502,
+        retryable: false,
+      });
 
       // Timeout
       const timeoutErr = Object.assign(new Error('The operation was aborted due to timeout'), {
@@ -1488,6 +1643,60 @@ describe('Stage 2B-2A — Gemini Question Interpreter & Scientific Forecast Back
       expect(reqErrBody.outcomeKind).toBe('pipeline-failure');
       expect(reqErrBody.error).toBe('scientific_pipeline_request_rejected');
       expect(reqErrBody.pipelineInvoked).toBe(true);
+    });
+
+    it('returns explicit 502 provider_model_unavailable on POST /v1/forecasts without silently falling back to older models', async () => {
+      const attemptedModels: string[] = [];
+      const unavailableInterp = createGeminiQuestionInterpreterFromEnv(
+        {
+          GEMINI_API_KEY: 'AIzaSyFakeTestKeyForUnavailableModel007',
+          // Omitted GEMINI_MODEL -> defaults to gemini-3.8-flash
+        },
+        {
+          now: () => FIXED_NOW,
+          client: createMockGeminiClient(async (params) => {
+            attemptedModels.push(String(params.model));
+            throw new ApiError({
+              status: 404,
+              message: `models/${String(params.model)} is not found`,
+            });
+          }),
+        },
+      );
+
+      const server = await startTestHttpServer({
+        registry: createStubRegistry(),
+        now: () => FIXED_NOW,
+        questionInterpreter: unavailableInterp,
+        forecastHarvestDefaults: { skipRemoteHarvest: true },
+      });
+      cleanups.push(server.close);
+
+      const healthRes = await fetch(`${server.baseUrl}/v1/forecasts/status`);
+      expect(healthRes.status).toBe(200);
+      const healthBody = (await healthRes.json()) as {
+        aiInterpretation: { model: string | null; status: string };
+      };
+      expect(healthBody.aiInterpretation.model).toBe('gemini-3.8-flash');
+      expect(healthBody.aiInterpretation.status).toBe('ready');
+
+      const postRes = await fetch(`${server.baseUrl}/v1/forecasts`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          question: 'Will global battery storage exceed 1000 GW by 2030 per IEA?',
+        }),
+      });
+
+      expect(postRes.status).toBe(502);
+      const postBody = (await postRes.json()) as Record<string, unknown>;
+      expect(postBody.outcomeKind).toBe('provider-failure');
+      expect(postBody.error).toBe('provider_model_unavailable');
+      expect(postBody.retryable).toBe(false);
+      expect(postBody.pipelineInvoked).toBe(false);
+      expect(String(postBody.message)).toContain('gemini-3.8-flash');
+      expect(String(postBody.message)).toContain('no fallback');
+      expect(attemptedModels).toEqual(['gemini-3.8-flash']);
     });
   });
 });

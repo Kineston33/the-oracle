@@ -197,6 +197,7 @@ export interface QuestionInterpreterProvider {
 export type QuestionInterpretationErrorCode =
   | 'provider_unconfigured'
   | 'invalid_request'
+  | 'provider_model_unavailable'
   | 'provider_timeout'
   | 'provider_rate_limited'
   | 'provider_auth_error'

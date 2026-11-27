@@ -34,7 +34,7 @@ import {
   type QuestionInterpreterProvider,
 } from './question-interpreter.ts';
 
-export const DEFAULT_GEMINI_MODEL = 'gemini-2.5-flash' as const;
+export const DEFAULT_GEMINI_MODEL = 'gemini-3.8-flash' as const;
 export const DEFAULT_GEMINI_TIMEOUT_MS = 12_000 as const;
 export const MIN_GEMINI_TIMEOUT_MS = 1_000 as const;
 export const MAX_GEMINI_TIMEOUT_MS = 30_000 as const;
@@ -185,10 +185,19 @@ function defaultCreateGeminiClient(config: GeminiProviderConfig): GeminiClientLi
   });
 }
 
+function isModelUnavailableMessage(message: string): boolean {
+  return (
+    /model[^\n]*(?:not\s+found|unavailable|deprecated|does\s+not\s+exist|not\s+supported|unsupported)|(?:unsupported|unknown)\s+model|response_?(?:json_?)?schema[^\n]*(?:not\s+supported|unsupported)|structured\s+output[^\n]*(?:not\s+supported|unsupported)/i.test(
+      message,
+    )
+  );
+}
+
 function mapProviderFailure(
   err: unknown,
   providerId: string,
   secretKey: string,
+  configuredModel: string,
 ): QuestionInterpretationError {
   if (err instanceof QuestionInterpretationError) {
     return err;
@@ -247,6 +256,20 @@ function mapProviderFailure(
         details: [`HTTP ${apiStatus}`],
       });
     }
+    if (
+      apiStatus === 404 ||
+      apiStatus === 410 ||
+      (apiStatus === 400 && isModelUnavailableMessage(safeMsg))
+    ) {
+      return new QuestionInterpretationError({
+        code: 'provider_model_unavailable',
+        providerId,
+        message: `Configured Gemini model '${configuredModel}' is unavailable or does not support generateContent structured JSON schema output (HTTP ${apiStatus}); no fallback model was used.`,
+        retryable: false,
+        httpStatus: 502,
+        details: [`model=${configuredModel}`, `HTTP ${apiStatus}: ${safeMsg}`],
+      });
+    }
     return new QuestionInterpretationError({
       code: 'provider_upstream_error',
       providerId,
@@ -254,6 +277,17 @@ function mapProviderFailure(
       retryable: apiStatus >= 500,
       httpStatus: 502,
       details: [`HTTP ${apiStatus}: ${safeMsg}`],
+    });
+  }
+
+  if (isModelUnavailableMessage(safeMsg)) {
+    return new QuestionInterpretationError({
+      code: 'provider_model_unavailable',
+      providerId,
+      message: `Configured Gemini model '${configuredModel}' is unavailable or unsupported; no fallback model was used.`,
+      retryable: false,
+      httpStatus: 502,
+      details: [`model=${configuredModel}`, safeMsg],
     });
   }
 
@@ -466,7 +500,12 @@ export class GeminiQuestionInterpreter implements QuestionInterpreterProvider {
         },
       });
     } catch (err) {
-      throw mapProviderFailure(err, this.providerId, this.config.apiKey);
+      throw mapProviderFailure(
+        err,
+        this.providerId,
+        this.config.apiKey,
+        this.config.model,
+      );
     }
 
     const latencyMs = Math.max(0, Date.now() - startedMs);
