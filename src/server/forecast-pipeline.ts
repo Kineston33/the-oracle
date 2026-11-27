@@ -92,6 +92,10 @@ import {
   type UnexecutedApplicableMethodReport,
 } from './forecast-types.ts';
 import {
+  DEFAULT_CREDIBLE_INTERVAL_LEVEL,
+  EXECUTABLE_SCIENTIFIC_METHOD_IDS,
+  MAX_CERTIFIED_SHAPE_PARAMETER,
+  MIN_CERTIFIED_SHAPE_PARAMETER,
   executeScientificMethod,
   type BetaBinomialExecutionInput,
   type DirichletMultinomialExecutionInput,
@@ -129,6 +133,9 @@ import {
 } from './numeric-primitives.ts';
 
 export const FORECAST_PIPELINE_VERSION = '2B-1.0.0' as const;
+const MAX_CERTIFIED_OUTCOME_CARDINALITY = 64 as const;
+const MIN_DEGREES_OF_FREEDOM = 1 as const;
+const MAX_DEGREES_OF_FREEDOM = 2000 as const;
 
 /* -------------------------------------------------------------------------
    1. Pipeline Status, Classification & Trust Boundary Enums
@@ -569,8 +576,17 @@ export type EvidenceVerifier = (
 ) => EvidenceVerificationDecision;
 
 /**
- * Creates a deterministic, auditable `EvidenceVerifier` for server-side
+ * Creates a deterministic, fail-closed `EvidenceVerifier` for server-side
  * verification policies or deterministic offline tests.
+ *
+ * Fail-closed guarantees:
+ *   - If neither an explicit `verifySubmission` callback nor a non-empty
+ *     `verifiedEvidenceIds` allowlist is configured, every submission is
+ *     rejected (`verifiedEmpirical: false`, `isPrimarySourceVerified: false`).
+ *   - `isPrimarySourceVerified` is NEVER assumed `true` by default: it is
+ *     `true` only when `verifiedEmpirical === true` AND primary-source status
+ *     is explicitly affirmed via `primarySourceEvidenceIds` or an explicit
+ *     `isPrimarySourceVerified: true` decision from `verifySubmission`.
  */
 export function createTrustedEvidenceVerifier(options: {
   readonly verifierId: string;
@@ -585,83 +601,189 @@ export function createTrustedEvidenceVerifier(options: {
     Record<string, readonly string[]>
   >;
 }): EvidenceVerifier {
-  const verifierId = options.verifierId.trim();
-  if (verifierId.length === 0) {
+  if (!isPlainObject(options)) {
+    throw new RangeError(
+      'createTrustedEvidenceVerifier requires a non-null options object',
+    );
+  }
+  if (
+    typeof options.verifierId !== 'string' ||
+    options.verifierId.trim().length === 0
+  ) {
     throw new RangeError(
       'createTrustedEvidenceVerifier requires a non-empty verifierId',
     );
   }
+  const verifierId = options.verifierId.trim();
+
+  if (
+    options.verifySubmission !== undefined &&
+    typeof options.verifySubmission !== 'function'
+  ) {
+    throw new RangeError(
+      'createTrustedEvidenceVerifier.verifySubmission must be a function when provided',
+    );
+  }
+  if (
+    options.verifiedEvidenceIds !== undefined &&
+    !Array.isArray(options.verifiedEvidenceIds)
+  ) {
+    throw new RangeError(
+      'createTrustedEvidenceVerifier.verifiedEvidenceIds must be an array of strings when provided',
+    );
+  }
+  if (
+    options.primarySourceEvidenceIds !== undefined &&
+    !Array.isArray(options.primarySourceEvidenceIds)
+  ) {
+    throw new RangeError(
+      'createTrustedEvidenceVerifier.primarySourceEvidenceIds must be an array of strings when provided',
+    );
+  }
+
   const verifiedSet =
     options.verifiedEvidenceIds !== undefined
-      ? new Set(options.verifiedEvidenceIds.map((id) => id.trim()))
+      ? new Set(
+          options.verifiedEvidenceIds
+            .filter((id): id is string => typeof id === 'string')
+            .map((id) => id.trim())
+            .filter((id) => id.length > 0),
+        )
       : null;
   const primarySet =
     options.primarySourceEvidenceIds !== undefined
-      ? new Set(options.primarySourceEvidenceIds.map((id) => id.trim()))
+      ? new Set(
+          options.primarySourceEvidenceIds
+            .filter((id): id is string => typeof id === 'string')
+            .map((id) => id.trim())
+            .filter((id) => id.length > 0),
+        )
       : null;
 
   return (
     context: EvidenceVerificationContext,
   ): EvidenceVerificationDecision => {
+    const normalizedEvidenceId =
+      isPlainObject(context) && typeof context.evidenceId === 'string'
+        ? context.evidenceId.trim()
+        : '';
+
+    if (normalizedEvidenceId.length === 0) {
+      return Object.freeze({
+        verifiedEmpirical: false,
+        isPrimarySourceVerified: false,
+        verifierId,
+        ...(options.verificationArtifactRef !== undefined
+          ? { verificationArtifactRef: options.verificationArtifactRef }
+          : {}),
+        rationale: `Fail-closed rejection by '${verifierId}': missing or empty evidenceId.`,
+      });
+    }
+
+    const mappedEventIds =
+      options.verifiedEventIdsByEvidenceId?.[normalizedEvidenceId];
+
     if (options.verifySubmission !== undefined) {
       const custom = options.verifySubmission(context);
       if (typeof custom === 'boolean') {
+        const allowlistPermits =
+          verifiedSet === null ||
+          (verifiedSet.size > 0 && verifiedSet.has(normalizedEvidenceId));
+        const verified = custom && allowlistPermits;
+        const isPrimary =
+          verified && primarySet !== null && primarySet.has(normalizedEvidenceId);
         return Object.freeze({
-          verifiedEmpirical: custom,
-          isPrimarySourceVerified:
-            custom &&
-            (primarySet === null || primarySet.has(context.evidenceId)),
+          verifiedEmpirical: verified,
+          isPrimarySourceVerified: isPrimary,
           verifierId,
           ...(options.verificationArtifactRef !== undefined
             ? { verificationArtifactRef: options.verificationArtifactRef }
             : {}),
           rationale:
             options.defaultRationale ??
-            (custom
-              ? `Verified empirical provenance for '${context.evidenceId}' via trusted verifier '${verifierId}'.`
-              : `Rejected empirical provenance for '${context.evidenceId}' via trusted verifier '${verifierId}'.`),
-          ...(options.verifiedEventIdsByEvidenceId?.[context.evidenceId] !==
-          undefined
-            ? {
-                verifiedEventIds:
-                  options.verifiedEventIdsByEvidenceId[context.evidenceId]!,
-              }
+            (verified
+              ? `Verified empirical provenance for '${normalizedEvidenceId}' via trusted verifier '${verifierId}'.`
+              : `Rejected empirical provenance for '${normalizedEvidenceId}' via trusted verifier '${verifierId}'.`),
+          ...(mappedEventIds !== undefined
+            ? { verifiedEventIds: mappedEventIds }
             : {}),
         });
       }
-      const verified = custom.verifiedEmpirical === true;
+
+      if (!isPlainObject(custom)) {
+        return Object.freeze({
+          verifiedEmpirical: false,
+          isPrimarySourceVerified: false,
+          verifierId,
+          ...(options.verificationArtifactRef !== undefined
+            ? { verificationArtifactRef: options.verificationArtifactRef }
+            : {}),
+          rationale: `Fail-closed rejection for '${normalizedEvidenceId}': verifySubmission returned a non-decision value.`,
+        });
+      }
+
+      const allowlistPermits =
+        verifiedSet === null ||
+        (verifiedSet.size > 0 && verifiedSet.has(normalizedEvidenceId));
+      const verified = custom.verifiedEmpirical === true && allowlistPermits;
+      const explicitPrimary = custom.isPrimarySourceVerified;
+      const isPrimary =
+        verified &&
+        (explicitPrimary === true ||
+          (explicitPrimary === undefined &&
+            primarySet !== null &&
+            primarySet.has(normalizedEvidenceId)));
+      const effectiveVerifierId =
+        typeof custom.verifierId === 'string' &&
+        custom.verifierId.trim().length > 0
+          ? custom.verifierId.trim()
+          : verifierId;
+      const effectiveRationale =
+        typeof custom.rationale === 'string' && custom.rationale.trim().length > 0
+          ? custom.rationale.trim()
+          : options.defaultRationale ??
+            (verified
+              ? `Verified empirical provenance for '${normalizedEvidenceId}' via trusted verifier '${effectiveVerifierId}'.`
+              : `Rejected empirical provenance for '${normalizedEvidenceId}' via trusted verifier '${effectiveVerifierId}'.`);
+
       return Object.freeze({
         verifiedEmpirical: verified,
-        isPrimarySourceVerified:
-          verified && (custom.isPrimarySourceVerified ?? true),
-        verifierId: custom.verifierId ?? verifierId,
-        ...(custom.verificationArtifactRef !== undefined
-          ? { verificationArtifactRef: custom.verificationArtifactRef }
+        isPrimarySourceVerified: isPrimary,
+        verifierId: effectiveVerifierId,
+        ...(typeof custom.verificationArtifactRef === 'string' &&
+        custom.verificationArtifactRef.trim().length > 0
+          ? { verificationArtifactRef: custom.verificationArtifactRef.trim() }
           : options.verificationArtifactRef !== undefined
             ? { verificationArtifactRef: options.verificationArtifactRef }
             : {}),
-        rationale:
-          custom.rationale ??
-          options.defaultRationale ??
-          (verified
-            ? `Verified empirical provenance for '${context.evidenceId}' via trusted verifier '${verifierId}'.`
-            : `Rejected empirical provenance for '${context.evidenceId}' via trusted verifier '${verifierId}'.`),
+        rationale: effectiveRationale,
         ...(custom.verifiedEventIds !== undefined
           ? { verifiedEventIds: custom.verifiedEventIds }
-          : options.verifiedEventIdsByEvidenceId?.[context.evidenceId] !==
-              undefined
-            ? {
-                verifiedEventIds:
-                  options.verifiedEventIdsByEvidenceId[context.evidenceId]!,
-              }
+          : mappedEventIds !== undefined
+            ? { verifiedEventIds: mappedEventIds }
             : {}),
       });
     }
 
-    const isVerified =
-      verifiedSet === null ? true : verifiedSet.has(context.evidenceId);
+    // Fail-closed: if no explicit verifySubmission callback AND no non-empty
+    // verifiedEvidenceIds allowlist exist, no evidence may be verified.
+    if (verifiedSet === null || verifiedSet.size === 0) {
+      return Object.freeze({
+        verifiedEmpirical: false,
+        isPrimarySourceVerified: false,
+        verifierId,
+        ...(options.verificationArtifactRef !== undefined
+          ? { verificationArtifactRef: options.verificationArtifactRef }
+          : {}),
+        rationale: `Fail-closed rejection for '${normalizedEvidenceId}': verifier '${verifierId}' has neither an explicit verifySubmission callback nor a non-empty verifiedEvidenceIds allowlist.`,
+      });
+    }
+
+    const isVerified = verifiedSet.has(normalizedEvidenceId);
     const isPrimary =
-      isVerified && (primarySet === null || primarySet.has(context.evidenceId));
+      isVerified &&
+      primarySet !== null &&
+      primarySet.has(normalizedEvidenceId);
     return Object.freeze({
       verifiedEmpirical: isVerified,
       isPrimarySourceVerified: isPrimary,
@@ -672,17 +794,903 @@ export function createTrustedEvidenceVerifier(options: {
       rationale:
         options.defaultRationale ??
         (isVerified
-          ? `Independently verified empirical provenance for '${context.evidenceId}' via trusted verifier '${verifierId}'.`
-          : `Submission '${context.evidenceId}' is not in the trusted verifier's verifiedEvidenceIds allowlist.`),
-      ...(options.verifiedEventIdsByEvidenceId?.[context.evidenceId] !==
-      undefined
-        ? {
-            verifiedEventIds:
-              options.verifiedEventIdsByEvidenceId[context.evidenceId]!,
-          }
+          ? `Independently verified empirical provenance for '${normalizedEvidenceId}' via trusted verifier '${verifierId}'.`
+          : `Submission '${normalizedEvidenceId}' is not in the trusted verifier's verifiedEvidenceIds allowlist.`),
+      ...(mappedEventIds !== undefined
+        ? { verifiedEventIds: mappedEventIds }
         : {}),
     });
   };
+}
+
+export const STRUCTURAL_SYMMETRY_BASIS_KINDS = Object.freeze([
+  'transitive-permutation-group',
+  'equal-cardinality-microstate-partition',
+] as const);
+
+export type StructuralSymmetryBasisKind =
+  (typeof STRUCTURAL_SYMMETRY_BASIS_KINDS)[number];
+
+/**
+ * Valid mathematical symmetry contract required to justify
+ * `structural-uniform-baseline` (`P(k) = 1 / K`). A binary outcome space is
+ * never assumed 50/50, and a caller-provided boolean toggle plus prose
+ * rationale is never accepted as proof of symmetry.
+ */
+export interface StructuralSymmetryContract {
+  readonly basisKind: StructuralSymmetryBasisKind;
+  /**
+   * Generating bijections of {0, ..., K-1} whose generated subgroup G <= S_K
+   * acts transitively across all K outcome labels, containing at least one
+   * non-identity permutation.
+   */
+  readonly generatingPermutations: readonly (readonly number[])[];
+  /**
+   * Cardinality m_k of atomic equiprobable microstates assigned to each
+   * outcome k in {0, ..., K-1}. Length must equal K and all m_k must be
+   * identical positive safe integers (m_0 === m_1 === ... === m_{K-1}).
+   */
+  readonly microstateCountsPerOutcome: readonly number[];
+  /**
+   * Formal mathematical invariance proof specifying the symmetry group,
+   * conserved measure-preserving observable, and analytical derivation.
+   */
+  readonly formalInvariant: {
+    readonly groupName: string;
+    readonly invariantObservable: string;
+    readonly derivationReference: string;
+  };
+}
+
+export interface StructuralSymmetryValidationResult {
+  readonly valid: boolean;
+  readonly reasons: readonly string[];
+  readonly orbitSize: number;
+  readonly groupOrderLowerBound: number;
+  readonly microstatesPerOutcome: number | null;
+}
+
+export interface StructuralSymmetryVerificationDecision {
+  readonly verified: boolean;
+  readonly verifierId: string;
+  readonly rationale: string;
+  readonly verificationArtifactRef?: string;
+}
+
+export type StructuralSymmetryVerifier = (context: {
+  readonly question: string;
+  readonly outcomeSpace: OutcomeSpaceDescriptor;
+  readonly contract: StructuralSymmetryContract;
+  readonly validation: StructuralSymmetryValidationResult;
+  readonly referenceTime: IsoDateTime;
+}) => StructuralSymmetryVerificationDecision;
+
+/**
+ * Constructs a fail-closed server-side `StructuralSymmetryVerifier`.
+ *
+ * Fail-closed guarantees:
+ *   - If neither an explicit `verifySymmetry` callback nor a non-empty
+ *     server-side allowlist (`approvedDerivationReferences` or
+ *     `approvedEventDefinitionHashes`) is configured, every symmetry contract
+ *     is rejected (`verified: false`).
+ *   - Mathematically invalid contracts (`validateStructuralSymmetryContract`
+ *     failing) are ALWAYS rejected regardless of callback decisions.
+ *   - Caller-supplied `formalInvariant`, `derivationReference`,
+ *     `generatingPermutations`, and `microstateCountsPerOutcome` are NEVER
+ *     treated as verified symmetry proof by themselves.
+ */
+export function createTrustedStructuralSymmetryVerifier(options: {
+  readonly verifierId: string;
+  readonly verificationArtifactRef?: string;
+  readonly defaultRationale?: string;
+  readonly approvedDerivationReferences?: readonly string[];
+  readonly approvedEventDefinitionHashes?: readonly string[];
+  readonly verifySymmetry?: (context: {
+    readonly question: string;
+    readonly outcomeSpace: OutcomeSpaceDescriptor;
+    readonly contract: StructuralSymmetryContract;
+    readonly validation: StructuralSymmetryValidationResult;
+    readonly referenceTime: IsoDateTime;
+  }) => Partial<StructuralSymmetryVerificationDecision> | boolean;
+}): StructuralSymmetryVerifier {
+  if (!isPlainObject(options)) {
+    throw new RangeError(
+      'createTrustedStructuralSymmetryVerifier requires a non-null options object',
+    );
+  }
+  if (
+    typeof options.verifierId !== 'string' ||
+    options.verifierId.trim().length === 0
+  ) {
+    throw new RangeError(
+      'createTrustedStructuralSymmetryVerifier requires a non-empty verifierId',
+    );
+  }
+  const verifierId = options.verifierId.trim();
+
+  if (
+    options.verifySymmetry !== undefined &&
+    typeof options.verifySymmetry !== 'function'
+  ) {
+    throw new RangeError(
+      'createTrustedStructuralSymmetryVerifier.verifySymmetry must be a function when provided',
+    );
+  }
+  if (
+    options.approvedDerivationReferences !== undefined &&
+    !Array.isArray(options.approvedDerivationReferences)
+  ) {
+    throw new RangeError(
+      'createTrustedStructuralSymmetryVerifier.approvedDerivationReferences must be an array of strings when provided',
+    );
+  }
+  if (
+    options.approvedEventDefinitionHashes !== undefined &&
+    !Array.isArray(options.approvedEventDefinitionHashes)
+  ) {
+    throw new RangeError(
+      'createTrustedStructuralSymmetryVerifier.approvedEventDefinitionHashes must be an array of strings when provided',
+    );
+  }
+
+  const refSet =
+    options.approvedDerivationReferences !== undefined
+      ? new Set(
+          options.approvedDerivationReferences
+            .filter((r): r is string => typeof r === 'string')
+            .map((r) => r.trim())
+            .filter((r) => r.length > 0),
+        )
+      : null;
+  const hashSet =
+    options.approvedEventDefinitionHashes !== undefined
+      ? new Set(
+          options.approvedEventDefinitionHashes
+            .filter((h): h is string => typeof h === 'string')
+            .map((h) => h.trim())
+            .filter((h) => h.length > 0),
+        )
+      : null;
+
+  return (context): StructuralSymmetryVerificationDecision => {
+    const validation =
+      context.validation ??
+      validateStructuralSymmetryContract(context.contract, context.outcomeSpace);
+
+    if (!validation.valid) {
+      return Object.freeze({
+        verified: false,
+        verifierId,
+        ...(options.verificationArtifactRef !== undefined
+          ? { verificationArtifactRef: options.verificationArtifactRef }
+          : {}),
+        rationale: `Fail-closed symmetry rejection by '${verifierId}': ${validation.reasons.join('; ')}`,
+      });
+    }
+
+    const derivationRef = context.contract.formalInvariant.derivationReference.trim();
+    const eventHash = context.outcomeSpace.eventDefinitionHash.trim();
+
+    if (options.verifySymmetry !== undefined) {
+      const custom = options.verifySymmetry({
+        ...context,
+        validation,
+      });
+      const allowlistPermits =
+        (refSet === null || (refSet.size > 0 && refSet.has(derivationRef))) &&
+        (hashSet === null || (hashSet.size > 0 && hashSet.has(eventHash)));
+
+      if (typeof custom === 'boolean') {
+        const verified = custom && allowlistPermits;
+        return Object.freeze({
+          verified,
+          verifierId,
+          ...(options.verificationArtifactRef !== undefined
+            ? { verificationArtifactRef: options.verificationArtifactRef }
+            : {}),
+          rationale:
+            options.defaultRationale ??
+            (verified
+              ? `Verified structural symmetry contract ('${context.contract.formalInvariant.groupName}') via trusted verifier '${verifierId}'.`
+              : `Rejected structural symmetry contract ('${context.contract.formalInvariant.groupName}') via trusted verifier '${verifierId}'.`),
+        });
+      }
+
+      if (!isPlainObject(custom)) {
+        return Object.freeze({
+          verified: false,
+          verifierId,
+          ...(options.verificationArtifactRef !== undefined
+            ? { verificationArtifactRef: options.verificationArtifactRef }
+            : {}),
+          rationale: `Fail-closed symmetry rejection by '${verifierId}': verifySymmetry returned a non-decision value.`,
+        });
+      }
+
+      const verified = custom.verified === true && allowlistPermits;
+      const effectiveVerifierId =
+        typeof custom.verifierId === 'string' &&
+        custom.verifierId.trim().length > 0
+          ? custom.verifierId.trim()
+          : verifierId;
+      const effectiveRationale =
+        typeof custom.rationale === 'string' &&
+        custom.rationale.trim().length > 0
+          ? custom.rationale.trim()
+          : options.defaultRationale ??
+            (verified
+              ? `Verified structural symmetry contract ('${context.contract.formalInvariant.groupName}') via trusted verifier '${effectiveVerifierId}'.`
+              : `Rejected structural symmetry contract ('${context.contract.formalInvariant.groupName}') via trusted verifier '${effectiveVerifierId}'.`);
+
+      return Object.freeze({
+        verified,
+        verifierId: effectiveVerifierId,
+        ...(typeof custom.verificationArtifactRef === 'string' &&
+        custom.verificationArtifactRef.trim().length > 0
+          ? { verificationArtifactRef: custom.verificationArtifactRef.trim() }
+          : options.verificationArtifactRef !== undefined
+            ? { verificationArtifactRef: options.verificationArtifactRef }
+            : {}),
+        rationale: effectiveRationale,
+      });
+    }
+
+    const hasAnyAllowlist =
+      (refSet !== null && refSet.size > 0) ||
+      (hashSet !== null && hashSet.size > 0);
+    if (!hasAnyAllowlist) {
+      return Object.freeze({
+        verified: false,
+        verifierId,
+        ...(options.verificationArtifactRef !== undefined
+          ? { verificationArtifactRef: options.verificationArtifactRef }
+          : {}),
+        rationale: `Fail-closed rejection by '${verifierId}': verifier has neither an explicit verifySymmetry callback nor a non-empty derivation/event-hash allowlist.`,
+      });
+    }
+
+    const refOk = refSet === null || refSet.has(derivationRef);
+    const hashOk = hashSet === null || hashSet.has(eventHash);
+    const verified = refOk && hashOk;
+    return Object.freeze({
+      verified,
+      verifierId,
+      ...(options.verificationArtifactRef !== undefined
+        ? { verificationArtifactRef: options.verificationArtifactRef }
+        : {}),
+      rationale:
+        options.defaultRationale ??
+        (verified
+          ? `Independently verified structural symmetry contract ('${context.contract.formalInvariant.groupName}', ref='${derivationRef}') via trusted verifier '${verifierId}'.`
+          : `Structural symmetry derivation '${derivationRef}' / event '${eventHash}' is not present in trusted verifier '${verifierId}' allowlist.`),
+    });
+  };
+}
+
+const ASYMMETRIC_BINARY_LABEL_PAIRS: ReadonlySet<string> = new Set([
+  'yes|no',
+  'no|yes',
+  'true|false',
+  'false|true',
+  'success|failure',
+  'failure|success',
+  'pass|fail',
+  'fail|pass',
+  'win|loss',
+  'loss|win',
+  'approve|reject',
+  'reject|approve',
+  'approved|rejected',
+  'rejected|approved',
+  'occur|not occur',
+  'not occur|occur',
+  'occurs|does not occur',
+  'does not occur|occurs',
+  'above|below',
+  'below|above',
+  'exceed|not exceed',
+  'not exceed|exceed',
+  'breach|no breach',
+  'no breach|breach',
+  'barrier breached|no breach',
+  'no breach|barrier breached',
+  'ratified|not ratified',
+  'not ratified|ratified',
+  'present|absent',
+  'absent|present',
+  'positive|negative',
+  'negative|positive',
+]);
+
+function normalizeSymmetryLabel(label: string): string {
+  return label
+    .trim()
+    .toLowerCase()
+    .replace(/[-_]+/g, ' ')
+    .replace(/\s+/g, ' ');
+}
+
+function isAsymmetricNegationOrThresholdPair(
+  labels: readonly string[],
+): string | null {
+  if (labels.length === 2) {
+    const a = normalizeSymmetryLabel(labels[0]!);
+    const b = normalizeSymmetryLabel(labels[1]!);
+    if (ASYMMETRIC_BINARY_LABEL_PAIRS.has(`${a}|${b}`)) {
+      return `Binary partition ['${labels[0]}', '${labels[1]}'] is an asymmetric occurrence/polarity complement pair, which is not invariant under label permutation`;
+    }
+    const negPrefixes = ['no ', 'not ', 'non ', 'un'];
+    for (const prefix of negPrefixes) {
+      if (b === `${prefix}${a}` || a === `${prefix}${b}`) {
+        return `Binary partition ['${labels[0]}', '${labels[1]}'] is a logical negation pair (P vs not-P), which violates permutation symmetry`;
+      }
+    }
+  }
+  for (const raw of labels) {
+    const norm = raw.trim().toLowerCase();
+    if (
+      /^(<=|>=|<|>)/.test(norm) ||
+      /\b(at least|at most|less than|greater than|more than|fewer than|before|after)\b/.test(
+        norm,
+      )
+    ) {
+      return `Outcome label '${raw}' encodes an asymmetric inequality or temporal ordering bound incompatible with uniform label-exchange symmetry`;
+    }
+  }
+  return null;
+}
+
+/**
+ * Validates that a `StructuralSymmetryContract` provides a mathematically sound
+ * group-theoretic and equal-microstate justification for `structural-uniform-baseline`
+ * on the given `OutcomeSpaceDescriptor`.
+ */
+export function validateStructuralSymmetryContract(
+  contract: unknown,
+  outcomeSpace: OutcomeSpaceDescriptor,
+): StructuralSymmetryValidationResult {
+  const reasons: string[] = [];
+  const outcomeCount = outcomeSpace.outcomeLabels.length;
+
+  if (
+    outcomeSpace.kind !== 'binary' &&
+    outcomeSpace.kind !== 'categorical-exhaustive'
+  ) {
+    reasons.push(
+      `structural-uniform-baseline is incompatible with outcomeSpace.kind '${outcomeSpace.kind}' (only 'binary' and 'categorical-exhaustive' discrete partitions are supported)`,
+    );
+  }
+  if (outcomeCount < 2) {
+    reasons.push(
+      `Outcome space must contain at least 2 outcomes, found ${outcomeCount}`,
+    );
+  }
+
+  const labelAsymmetry = isAsymmetricNegationOrThresholdPair(
+    outcomeSpace.outcomeLabels,
+  );
+  if (labelAsymmetry !== null) {
+    reasons.push(labelAsymmetry);
+  }
+
+  if (!isPlainObject(contract)) {
+    reasons.push('structuralSymmetryContract must be a non-null plain object');
+    return Object.freeze({
+      valid: false,
+      reasons: Object.freeze(reasons),
+      orbitSize: 0,
+      groupOrderLowerBound: 0,
+      microstatesPerOutcome: null,
+    });
+  }
+
+  if (
+    typeof contract.basisKind !== 'string' ||
+    !STRUCTURAL_SYMMETRY_BASIS_KINDS.includes(
+      contract.basisKind as StructuralSymmetryBasisKind,
+    )
+  ) {
+    reasons.push(
+      `structuralSymmetryContract.basisKind must be one of [${STRUCTURAL_SYMMETRY_BASIS_KINDS.join(', ')}]`,
+    );
+  }
+
+  // Validate generating permutations form a transitive bijection group on {0..K-1}:
+  let orbitSize = 0;
+  let validBijectionCount = 0;
+  let hasNonIdentityGenerator = false;
+  const validGenerators: number[][] = [];
+
+  if (
+    !Array.isArray(contract.generatingPermutations) ||
+    contract.generatingPermutations.length === 0
+  ) {
+    reasons.push(
+      'structuralSymmetryContract.generatingPermutations must be a non-empty array of permutations over {0, ..., K-1}',
+    );
+  } else {
+    for (let gIdx = 0; gIdx < contract.generatingPermutations.length; gIdx++) {
+      const gen = contract.generatingPermutations[gIdx];
+      if (!Array.isArray(gen) || gen.length !== outcomeCount) {
+        reasons.push(
+          `generatingPermutations[${gIdx}] must have length ${outcomeCount}`,
+        );
+        continue;
+      }
+      const seenImages = new Set<number>();
+      let genValid = true;
+      let isIdentity = true;
+      const normalizedGen: number[] = [];
+      for (let i = 0; i < outcomeCount; i++) {
+        const img = gen[i];
+        if (
+          typeof img !== 'number' ||
+          !Number.isSafeInteger(img) ||
+          img < 0 ||
+          img >= outcomeCount
+        ) {
+          reasons.push(
+            `generatingPermutations[${gIdx}][${i}] must be an integer in [0, ${outcomeCount - 1}]`,
+          );
+          genValid = false;
+          break;
+        }
+        if (seenImages.has(img)) {
+          reasons.push(
+            `generatingPermutations[${gIdx}] is not a bijection (duplicate image index ${img})`,
+          );
+          genValid = false;
+          break;
+        }
+        seenImages.add(img);
+        normalizedGen.push(img);
+        if (img !== i) {
+          isIdentity = false;
+        }
+      }
+      if (genValid) {
+        validBijectionCount += 1;
+        validGenerators.push(normalizedGen);
+        if (!isIdentity) {
+          hasNonIdentityGenerator = true;
+        }
+      }
+    }
+
+    if (!hasNonIdentityGenerator) {
+      reasons.push(
+        'generatingPermutations must include at least one non-identity bijection',
+      );
+    }
+
+    if (
+      validGenerators.length > 0 &&
+      validBijectionCount === contract.generatingPermutations.length
+    ) {
+      // Exact finite-group orbit computation via BFS from outcome 0.
+      // Because every generator g in S_K has finite order, forward closure under
+      // generators equals closure under the generated subgroup G = <generators>.
+      const visited = new Set<number>([0]);
+      const queue: number[] = [0];
+      while (queue.length > 0) {
+        const curr = queue.shift()!;
+        for (const gen of validGenerators) {
+          const next = gen[curr]!;
+          if (!visited.has(next)) {
+            visited.add(next);
+            queue.push(next);
+          }
+        }
+      }
+      orbitSize = visited.size;
+      if (orbitSize !== outcomeCount) {
+        reasons.push(
+          `generatingPermutations do not act transitively on all ${outcomeCount} outcome labels (orbit from index 0 covers only [${[...visited].sort((a, b) => a - b).join(', ')}])`,
+        );
+      }
+    }
+  }
+
+  // Validate equal microstate fiber cardinalities across all K outcomes:
+  let microstatesPerOutcome: number | null = null;
+  if (
+    !Array.isArray(contract.microstateCountsPerOutcome) ||
+    contract.microstateCountsPerOutcome.length !== outcomeCount
+  ) {
+    reasons.push(
+      `microstateCountsPerOutcome must be an array of length ${outcomeCount}`,
+    );
+  } else {
+    let allPositiveSafeInts = true;
+    const counts: number[] = [];
+    for (let k = 0; k < outcomeCount; k++) {
+      const c = contract.microstateCountsPerOutcome[k];
+      if (
+        typeof c !== 'number' ||
+        !Number.isSafeInteger(c) ||
+        c < 1
+      ) {
+        reasons.push(
+          `microstateCountsPerOutcome[${k}] must be a positive safe integer >= 1, received ${String(c)}`,
+        );
+        allPositiveSafeInts = false;
+      } else {
+        counts.push(c);
+      }
+    }
+    if (allPositiveSafeInts && counts.length === outcomeCount) {
+      const expected = counts[0]!;
+      const unequalIndex = counts.findIndex((c) => c !== expected);
+      if (unequalIndex !== -1) {
+        reasons.push(
+          `microstateCountsPerOutcome must be strictly equal across all outcomes to justify uniform 1/${outcomeCount} probabilities (outcome 0 has ${expected}, outcome ${unequalIndex} has ${counts[unequalIndex]})`,
+        );
+      } else {
+        microstatesPerOutcome = expected;
+      }
+    }
+  }
+
+  // Validate formal mathematical invariant specification:
+  if (!isPlainObject(contract.formalInvariant)) {
+    reasons.push(
+      'structuralSymmetryContract.formalInvariant must be a non-null plain object',
+    );
+  } else {
+    const fi = contract.formalInvariant;
+    const fields = [
+      ['groupName', fi.groupName],
+      ['invariantObservable', fi.invariantObservable],
+      ['derivationReference', fi.derivationReference],
+    ] as const;
+    for (const [fieldName, rawVal] of fields) {
+      if (typeof rawVal !== 'string' || rawVal.trim().length < 5) {
+        reasons.push(
+          `formalInvariant.${fieldName} must be a substantive non-empty mathematical specification (at least 5 characters)`,
+        );
+      }
+    }
+  }
+
+  return Object.freeze({
+    valid: reasons.length === 0,
+    reasons: Object.freeze(reasons),
+    orbitSize,
+    groupOrderLowerBound: orbitSize,
+    microstatesPerOutcome,
+  });
+}
+
+export const MULTI_SOURCE_COMBINATION_BASES = Object.freeze([
+  'disjoint-exchangeable-cohorts',
+  'disjoint-poisson-exposure-windows',
+  'disjoint-exogenous-weighted-cohorts',
+] as const);
+
+export type MultiSourceCombinationBasis =
+  (typeof MULTI_SOURCE_COMBINATION_BASES)[number];
+
+/**
+ * Explicit mathematical justification required before combining multiple
+ * independently verified submissions that target the same quantitative method.
+ */
+export interface MultiSourceCombinationJustification {
+  readonly basis: MultiSourceCombinationBasis;
+  /**
+   * Exact set of verified submission `evidenceId`s being jointly combined for
+   * this method (must include at least 2 distinct IDs and cover every verified
+   * source contributing to the method).
+   */
+  readonly contributingEvidenceIds: readonly string[];
+  /**
+   * Certifies zero overlap across populations, trials, or exposure intervals
+   * so pooled sums do not double-count observations.
+   */
+  readonly disjointPopulationsOrWindowsVerified: boolean;
+  /**
+   * Certifies homogeneous latent parameter space and identical priors across
+   * all combined sources.
+   */
+  readonly homogeneousParameterSpaceVerified: boolean;
+  /**
+   * Required for `weighted-kish-effective-binomial`: certifies all combined
+   * cohorts express weights on a commensurate exogenous scale.
+   */
+  readonly commonExogenousWeightScaleVerified?: boolean;
+  /**
+   * Explicit mathematical audit explanation preserving source dependence.
+   */
+  readonly mathematicalRationale: string;
+}
+
+export interface MultiSourceCombinationVerificationContext {
+  readonly methodId: ExecutableScientificMethodId;
+  readonly expectedBasis: MultiSourceCombinationBasis;
+  readonly justification?: MultiSourceCombinationJustification;
+  readonly contributingSubmissions: readonly PipelineEvidenceSubmission[];
+  readonly contributingEvidenceIds: readonly string[];
+  readonly contributingSourceUrls: readonly string[];
+  readonly outcomeSpace: OutcomeSpaceDescriptor;
+  readonly referenceTime: IsoDateTime;
+}
+
+export interface MultiSourceCombinationVerificationDecision {
+  readonly verified: boolean;
+  readonly verifierId: string;
+  readonly rationale: string;
+  readonly verificationArtifactRef?: string;
+  readonly verifiedEvidenceIds?: readonly string[];
+}
+
+export type MultiSourceCombinationVerifier = (
+  context: MultiSourceCombinationVerificationContext,
+) => MultiSourceCombinationVerificationDecision;
+
+/**
+ * Constructs a fail-closed server-side `MultiSourceCombinationVerifier`.
+ *
+ * Fail-closed guarantees:
+ *   - If neither an explicit `verifyCombination` callback nor a non-empty
+ *     `approvedMethodCombinations` mapping is configured, EVERY combination
+ *     request is rejected (`verified: false`).
+ *   - Caller-declared booleans (`disjointPopulationsOrWindowsVerified`,
+ *     `homogeneousParameterSpaceVerified`, `commonExogenousWeightScaleVerified`)
+ *     and prose `mathematicalRationale` are NEVER trusted on their own; they are
+ *     preconditions checked alongside independent server-side verification.
+ */
+export function createTrustedCombinationVerifier(options: {
+  readonly verifierId: string;
+  readonly verificationArtifactRef?: string;
+  readonly defaultRationale?: string;
+  readonly approvedMethodCombinations?: Readonly<
+    Partial<
+      Record<ExecutableScientificMethodId, readonly (readonly string[])[]>
+    >
+  >;
+  readonly verifyCombination?: (
+    context: MultiSourceCombinationVerificationContext,
+  ) => Partial<MultiSourceCombinationVerificationDecision> | boolean;
+}): MultiSourceCombinationVerifier {
+  if (!isPlainObject(options)) {
+    throw new RangeError(
+      'createTrustedCombinationVerifier requires a non-null options object',
+    );
+  }
+  if (
+    typeof options.verifierId !== 'string' ||
+    options.verifierId.trim().length === 0
+  ) {
+    throw new RangeError(
+      'createTrustedCombinationVerifier requires a non-empty verifierId',
+    );
+  }
+  const verifierId = options.verifierId.trim();
+
+  if (
+    options.verifyCombination !== undefined &&
+    typeof options.verifyCombination !== 'function'
+  ) {
+    throw new RangeError(
+      'createTrustedCombinationVerifier.verifyCombination must be a function when provided',
+    );
+  }
+
+  const approvedSetByMethod = new Map<string, Set<string>>();
+  if (options.approvedMethodCombinations !== undefined) {
+    if (!isPlainObject(options.approvedMethodCombinations)) {
+      throw new RangeError(
+        'createTrustedCombinationVerifier.approvedMethodCombinations must be an object when provided',
+      );
+    }
+    for (const [mId, groups] of Object.entries(
+      options.approvedMethodCombinations,
+    )) {
+      if (!Array.isArray(groups)) {
+        continue;
+      }
+      const keySet = new Set<string>();
+      for (const group of groups) {
+        if (!Array.isArray(group)) {
+          continue;
+        }
+        const normIds = group
+          .filter((id): id is string => typeof id === 'string')
+          .map((id) => id.trim())
+          .filter((id) => id.length > 0);
+        if (normIds.length >= 2) {
+          keySet.add(JSON.stringify([...new Set(normIds)].sort()));
+        }
+      }
+      if (keySet.size > 0) {
+        approvedSetByMethod.set(mId, keySet);
+      }
+    }
+  }
+
+  return (
+    context: MultiSourceCombinationVerificationContext,
+  ): MultiSourceCombinationVerificationDecision => {
+    const j = context.justification;
+    const expectedIds = [...new Set(context.contributingEvidenceIds)].sort();
+    const expectedKey = JSON.stringify(expectedIds);
+
+    const hasValidContractFields =
+      isPlainObject(j) &&
+      j.basis === context.expectedBasis &&
+      j.disjointPopulationsOrWindowsVerified === true &&
+      j.homogeneousParameterSpaceVerified === true &&
+      (context.methodId !== 'weighted-kish-effective-binomial' ||
+        j.commonExogenousWeightScaleVerified === true) &&
+      typeof j.mathematicalRationale === 'string' &&
+      j.mathematicalRationale.trim().length >= 10 &&
+      Array.isArray(j.contributingEvidenceIds) &&
+      j.contributingEvidenceIds.length === expectedIds.length &&
+      JSON.stringify(
+        [
+          ...new Set(
+            j.contributingEvidenceIds
+              .filter((id): id is string => typeof id === 'string')
+              .map((id) => id.trim())
+              .filter((id) => id.length > 0),
+          ),
+        ].sort(),
+      ) === expectedKey;
+
+    if (!hasValidContractFields) {
+      return Object.freeze({
+        verified: false,
+        verifierId,
+        ...(options.verificationArtifactRef !== undefined
+          ? { verificationArtifactRef: options.verificationArtifactRef }
+          : {}),
+        rationale: `Fail-closed rejection by '${verifierId}': missing or incomplete MultiSourceCombinationJustification contract for '${context.methodId}'.`,
+      });
+    }
+
+    const methodAllowlist = approvedSetByMethod.get(context.methodId);
+    const allowlistConfigured = approvedSetByMethod.size > 0;
+    const allowlistPermits =
+      !allowlistConfigured ||
+      (methodAllowlist !== undefined && methodAllowlist.has(expectedKey));
+
+    if (options.verifyCombination !== undefined) {
+      const custom = options.verifyCombination(context);
+      if (typeof custom === 'boolean') {
+        const verified = custom && allowlistPermits;
+        return Object.freeze({
+          verified,
+          verifierId,
+          ...(options.verificationArtifactRef !== undefined
+            ? { verificationArtifactRef: options.verificationArtifactRef }
+            : {}),
+          rationale:
+            options.defaultRationale ??
+            (verified
+              ? `Verified disjoint multi-source combination for '${context.methodId}' (${context.contributingEvidenceIds.join(', ')}) via trusted verifier '${verifierId}'.`
+              : `Rejected multi-source combination for '${context.methodId}' (${context.contributingEvidenceIds.join(', ')}) via trusted verifier '${verifierId}'.`),
+          ...(verified
+            ? { verifiedEvidenceIds: Object.freeze([...context.contributingEvidenceIds]) }
+            : {}),
+        });
+      }
+
+      if (!isPlainObject(custom)) {
+        return Object.freeze({
+          verified: false,
+          verifierId,
+          ...(options.verificationArtifactRef !== undefined
+            ? { verificationArtifactRef: options.verificationArtifactRef }
+            : {}),
+          rationale: `Fail-closed rejection by '${verifierId}': verifyCombination returned a non-decision value.`,
+        });
+      }
+
+      const verified = custom.verified === true && allowlistPermits;
+      const effectiveVerifierId =
+        typeof custom.verifierId === 'string' &&
+        custom.verifierId.trim().length > 0
+          ? custom.verifierId.trim()
+          : verifierId;
+      const effectiveRationale =
+        typeof custom.rationale === 'string' &&
+        custom.rationale.trim().length > 0
+          ? custom.rationale.trim()
+          : options.defaultRationale ??
+            (verified
+              ? `Verified disjoint multi-source combination for '${context.methodId}' (${context.contributingEvidenceIds.join(', ')}) via trusted verifier '${effectiveVerifierId}'.`
+              : `Rejected multi-source combination for '${context.methodId}' (${context.contributingEvidenceIds.join(', ')}) via trusted verifier '${effectiveVerifierId}'.`);
+
+      return Object.freeze({
+        verified,
+        verifierId: effectiveVerifierId,
+        ...(typeof custom.verificationArtifactRef === 'string' &&
+        custom.verificationArtifactRef.trim().length > 0
+          ? { verificationArtifactRef: custom.verificationArtifactRef.trim() }
+          : options.verificationArtifactRef !== undefined
+            ? { verificationArtifactRef: options.verificationArtifactRef }
+            : {}),
+        rationale: effectiveRationale,
+        ...(custom.verifiedEvidenceIds !== undefined
+          ? { verifiedEvidenceIds: custom.verifiedEvidenceIds }
+          : verified
+            ? { verifiedEvidenceIds: Object.freeze([...context.contributingEvidenceIds]) }
+            : {}),
+      });
+    }
+
+    if (!allowlistConfigured) {
+      return Object.freeze({
+        verified: false,
+        verifierId,
+        ...(options.verificationArtifactRef !== undefined
+          ? { verificationArtifactRef: options.verificationArtifactRef }
+          : {}),
+        rationale: `Fail-closed rejection by '${verifierId}': verifier has neither an explicit verifyCombination callback nor a non-empty approvedMethodCombinations allowlist.`,
+      });
+    }
+
+    return Object.freeze({
+      verified: allowlistPermits,
+      verifierId,
+      ...(options.verificationArtifactRef !== undefined
+        ? { verificationArtifactRef: options.verificationArtifactRef }
+        : {}),
+      rationale:
+        options.defaultRationale ??
+        (allowlistPermits
+          ? `Independently verified multi-source combination for '${context.methodId}' (${context.contributingEvidenceIds.join(', ')}) via trusted verifier '${verifierId}'.`
+          : `Source cohort set [${context.contributingEvidenceIds.join(', ')}] for '${context.methodId}' is not present in trusted verifier '${verifierId}' allowlist.`),
+      ...(allowlistPermits
+        ? { verifiedEvidenceIds: Object.freeze([...context.contributingEvidenceIds]) }
+        : {}),
+    });
+  };
+}
+
+export interface MultiSourceCombinationDiagnostic {
+  readonly methodId: ExecutableScientificMethodId;
+  readonly combinationMode:
+    | 'global-event-deduplication'
+    | 'mathematically-justified-disjoint-combination';
+  readonly combinationBasis:
+    | 'event-level-global-deduplication'
+    | MultiSourceCombinationBasis;
+  readonly contributingEvidenceIds: readonly string[];
+  readonly contributingSourceUrls: readonly string[];
+  readonly dependencePreserved: true;
+  readonly verifiedByVerifierId: string | null;
+  readonly verificationArtifactRef: string | null;
+  readonly mathematicalRationale: string;
+  readonly dependenceNote: string;
+}
+
+export interface RejectedMultiSourceCombinationDiagnostic {
+  readonly methodId: ExecutableScientificMethodId;
+  readonly expectedBasis: MultiSourceCombinationBasis;
+  readonly contributingEvidenceIds: readonly string[];
+  readonly contributingSourceUrls: readonly string[];
+  readonly rejectionCode:
+    | 'missing-combination-justification'
+    | 'invalid-combination-justification'
+    | 'missing-trusted-combination-verifier'
+    | 'rejected-by-trusted-combination-verifier';
+  readonly verifiedByVerifierId: string | null;
+  readonly verificationArtifactRef: string | null;
+  readonly preservedIndividualSources: true;
+  readonly explanation: string;
+}
+
+export interface StructuralSymmetryVerificationDiagnostic {
+  readonly status:
+    | 'verified'
+    | 'rejected-no-trusted-verifier'
+    | 'rejected-by-trusted-verifier'
+    | 'rejected-legacy-premise-without-contract'
+    | 'rejected-baseline-not-opted-in';
+  readonly verifierId: string | null;
+  readonly verificationArtifactRef: string | null;
+  readonly contractBasisKind: StructuralSymmetryBasisKind | null;
+  readonly explanation: string;
 }
 
 export interface PipelineEvidenceProvenanceRecord {
@@ -750,6 +1758,9 @@ export interface EvidenceAssessmentReport {
   readonly unsupportedOrUnverifiedClaims: readonly PipelineEvidenceProvenanceRecord[];
   readonly invalidObservationDiagnostics: readonly InvalidObservationDiagnostic[];
   readonly deduplicatedEventDiagnostics: readonly DeduplicatedEventObservationDiagnostic[];
+  readonly multiSourceCombinations: readonly MultiSourceCombinationDiagnostic[];
+  readonly rejectedMultiSourceCombinations: readonly RejectedMultiSourceCombinationDiagnostic[];
+  readonly structuralSymmetryVerification: StructuralSymmetryVerificationDiagnostic | null;
   readonly derivedAvailableEvidence: AvailableEvidenceInput;
   readonly supportedMethodIds: readonly ScientificMethodId[];
   readonly missingRequirementsByMethod: Readonly<
@@ -870,7 +1881,16 @@ export interface ForecastPipelineRequest {
     readonly skipRemoteHarvest?: boolean;
   };
   readonly submittedEvidence?: readonly PipelineEvidenceSubmission[];
+  readonly multiSourceCombinationJustifications?: Readonly<
+    Record<string, MultiSourceCombinationJustification>
+  >;
   readonly assumptions?: Partial<AssumptionDeclarationsInput>;
+  readonly structuralSymmetryContract?: StructuralSymmetryContract;
+  /**
+   * @deprecated Unverified boolean + rationale premises never justify
+   * `structural-uniform-baseline` symmetry and are rejected at the trust gate.
+   * Supply a mathematically valid `structuralSymmetryContract` instead.
+   */
   readonly structuralSymmetryPremise?: StructuralUniformExecutionInput['symmetryPremise'];
   readonly computationalCapabilities?: Partial<ComputationalCapabilitiesInput>;
   readonly footingTier?: EvidentialFootingTier;
@@ -898,6 +1918,8 @@ export interface ForecastPipelineDependencies {
    * verified quantitative method channels.
    */
   readonly evidenceVerifier?: EvidenceVerifier;
+  readonly symmetryVerifier?: StructuralSymmetryVerifier;
+  readonly combinationVerifier?: MultiSourceCombinationVerifier;
   readonly registry?: ScientificMethodRegistry;
   readonly applicabilityPlanner?: (
     input: MethodApplicabilityPlanningInput,
@@ -924,7 +1946,7 @@ export class ForecastPipelineRequestError extends RangeError {
 }
 
 /* -------------------------------------------------------------------------
-   4. Internal Helpers, URL/Field Validators & Global Deduplication Types
+   4. Internal Helpers, Mathematical Validators & Multi-Source Types
    ------------------------------------------------------------------------- */
 
 function isPlainObject(value: unknown): value is Record<string, unknown> {
@@ -976,6 +1998,607 @@ function isPositiveFiniteNumber(value: unknown): value is number {
 
 function isNonNegativeSafeInteger(value: unknown): value is number {
   return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0;
+}
+
+function canonicalJsonKey(value: unknown): string {
+  if (value === null || typeof value !== 'object') {
+    return JSON.stringify(value);
+  }
+  if (Array.isArray(value)) {
+    return `[${value.map((item) => canonicalJsonKey(item)).join(',')}]`;
+  }
+  const obj = value as Record<string, unknown>;
+  const keys = Object.keys(obj).sort();
+  return `{${keys
+    .filter((k) => obj[k] !== undefined)
+    .map((k) => `${JSON.stringify(k)}:${canonicalJsonKey(obj[k])}`)
+    .join(',')}}`;
+}
+
+function validateCredibleIntervalLevel(
+  value: unknown,
+  contextLabel: string,
+): number | undefined {
+  if (value === undefined) {
+    return undefined;
+  }
+  if (
+    typeof value !== 'number' ||
+    !Number.isFinite(value) ||
+    value <= 0 ||
+    value >= 1
+  ) {
+    throw new ForecastPipelineRequestError(
+      `${contextLabel}.credibleIntervalLevel must be a finite number strictly inside (0, 1), received ${String(value)}`,
+    );
+  }
+  return value;
+}
+
+function validateCertifiedShapeNumber(
+  value: unknown,
+  fieldName: string,
+): number {
+  if (
+    !isPositiveFiniteNumber(value) ||
+    value < MIN_CERTIFIED_SHAPE_PARAMETER ||
+    value > MAX_CERTIFIED_SHAPE_PARAMETER
+  ) {
+    throw new ForecastPipelineRequestError(
+      `${fieldName} must lie within certified numerical domain [${MIN_CERTIFIED_SHAPE_PARAMETER}, ${MAX_CERTIFIED_SHAPE_PARAMETER}], received ${String(value)}`,
+    );
+  }
+  return value;
+}
+
+function validateStrictTrimmedUnit(
+  value: unknown,
+  fieldName: string,
+): string {
+  if (typeof value !== 'string' || value.trim().length === 0) {
+    throw new ForecastPipelineRequestError(
+      `${fieldName} must be a non-empty string, received ${String(value)}`,
+    );
+  }
+  if (value !== value.trim()) {
+    throw new ForecastPipelineRequestError(
+      `${fieldName} must not contain leading or trailing whitespace ('${value}')`,
+    );
+  }
+  return value;
+}
+
+function validateBetaPrior(
+  prior: unknown,
+  contextLabel: string,
+): { readonly alpha: number; readonly beta: number } {
+  if (!isPlainObject(prior)) {
+    throw new ForecastPipelineRequestError(
+      `${contextLabel}.prior must be a non-null plain object { alpha, beta }`,
+    );
+  }
+  if (
+    'scale' in prior &&
+    prior.scale !== undefined
+  ) {
+    throw new ForecastPipelineRequestError(
+      `${contextLabel}.prior must not specify a 'scale' parameter`,
+    );
+  }
+  const alpha = validateCertifiedShapeNumber(
+    prior.alpha,
+    `${contextLabel}.prior.alpha`,
+  );
+  const beta = validateCertifiedShapeNumber(
+    prior.beta,
+    `${contextLabel}.prior.beta`,
+  );
+  return Object.freeze({ alpha, beta });
+}
+
+function validateBetaCountsAndPosterior(
+  prior: { readonly alpha: number; readonly beta: number },
+  successes: unknown,
+  failures: unknown,
+  contextLabel: string,
+): { readonly successes: number; readonly failures: number } {
+  if (
+    !isNonNegativeSafeInteger(successes) ||
+    !isNonNegativeSafeInteger(failures)
+  ) {
+    throw new ForecastPipelineRequestError(
+      `${contextLabel} requires non-negative safe integer successes and failures`,
+    );
+  }
+  const totalTrials = kahanNeumaierSum([successes, failures]);
+  if (!Number.isSafeInteger(totalTrials) || totalTrials < 1) {
+    throw new ForecastPipelineRequestError(
+      `${contextLabel} requires safe integer total trials (successes + failures) >= 1, received ${totalTrials}`,
+    );
+  }
+  const alphaPost = kahanNeumaierSum([prior.alpha, successes]);
+  const betaPost = kahanNeumaierSum([prior.beta, failures]);
+  if (
+    !Number.isFinite(alphaPost) ||
+    alphaPost > MAX_CERTIFIED_SHAPE_PARAMETER ||
+    !Number.isFinite(betaPost) ||
+    betaPost > MAX_CERTIFIED_SHAPE_PARAMETER
+  ) {
+    throw new ForecastPipelineRequestError(
+      `${contextLabel} posterior Beta parameters (alphaPost=${alphaPost}, betaPost=${betaPost}) exceed certified numerical domain [${MIN_CERTIFIED_SHAPE_PARAMETER}, ${MAX_CERTIFIED_SHAPE_PARAMETER}]`,
+    );
+  }
+  return { successes, failures };
+}
+
+function validateWeightedKishPayload(
+  params: {
+    readonly weightedSuccessMass: unknown;
+    readonly weightedFailureMass: unknown;
+    readonly sumSquaredWeights: unknown;
+    readonly observationCount: unknown;
+    readonly prior: unknown;
+  },
+  contextLabel: string,
+): {
+  readonly weightedSuccessMass: number;
+  readonly weightedFailureMass: number;
+  readonly sumSquaredWeights: number;
+  readonly observationCount: number;
+  readonly prior: { readonly alpha: number; readonly beta: number };
+  readonly totalW: number;
+  readonly nEff: number;
+} {
+  const {
+    weightedSuccessMass,
+    weightedFailureMass,
+    sumSquaredWeights,
+    observationCount,
+    prior,
+  } = params;
+  if (
+    typeof weightedSuccessMass !== 'number' ||
+    !Number.isFinite(weightedSuccessMass) ||
+    weightedSuccessMass < 0 ||
+    typeof weightedFailureMass !== 'number' ||
+    !Number.isFinite(weightedFailureMass) ||
+    weightedFailureMass < 0 ||
+    !isPositiveFiniteNumber(sumSquaredWeights) ||
+    !isNonNegativeSafeInteger(observationCount) ||
+    observationCount < 1
+  ) {
+    throw new ForecastPipelineRequestError(
+      `${contextLabel} requires finite non-negative weighted masses, positive finite sumSquaredWeights, and safe integer observationCount >= 1`,
+    );
+  }
+  const validatedPrior = validateBetaPrior(prior, contextLabel);
+
+  const totalW = kahanNeumaierSum([weightedSuccessMass, weightedFailureMass]);
+  if (!Number.isFinite(totalW) || totalW <= 0) {
+    throw new ForecastPipelineRequestError(
+      `${contextLabel} requires total weighted mass (weightedSuccessMass + weightedFailureMass) to be finite and strictly positive, received ${totalW}`,
+    );
+  }
+  const totalW2 = totalW * totalW;
+  if (!Number.isFinite(totalW2) || totalW2 <= 0) {
+    throw new ForecastPipelineRequestError(
+      `${contextLabel} squared total weighted mass overflows finite IEEE-754 binary64 arithmetic`,
+    );
+  }
+  const nEff = totalW2 / sumSquaredWeights;
+  if (!Number.isFinite(nEff) || nEff <= 0) {
+    throw new ForecastPipelineRequestError(
+      `${contextLabel} Kish effective sample size must be finite and positive, received ${nEff}`,
+    );
+  }
+  const kishTol = 64 * Number.EPSILON * Math.max(1, observationCount);
+  if (nEff < 1 - kishTol || nEff > observationCount + kishTol) {
+    throw new ForecastPipelineRequestError(
+      `${contextLabel} violates Kish Cauchy-Schwarz bounds (1 <= n_eff <= N=${observationCount}): computed n_eff=${nEff}`,
+    );
+  }
+  if (
+    observationCount === 1 &&
+    weightedSuccessMass > 0 &&
+    weightedFailureMass > 0
+  ) {
+    throw new ForecastPipelineRequestError(
+      `${contextLabel} cannot have both weightedSuccessMass > 0 and weightedFailureMass > 0 when observationCount === 1`,
+    );
+  }
+
+  const boundedNEff = Math.min(observationCount, Math.max(1, nEff));
+  const effSuccesses = boundedNEff * (weightedSuccessMass / totalW);
+  const effFailures = boundedNEff * (weightedFailureMass / totalW);
+  const alphaPost = kahanNeumaierSum([validatedPrior.alpha, effSuccesses]);
+  const betaPost = kahanNeumaierSum([validatedPrior.beta, effFailures]);
+  if (
+    !Number.isFinite(alphaPost) ||
+    alphaPost > MAX_CERTIFIED_SHAPE_PARAMETER ||
+    !Number.isFinite(betaPost) ||
+    betaPost > MAX_CERTIFIED_SHAPE_PARAMETER
+  ) {
+    throw new ForecastPipelineRequestError(
+      `${contextLabel} effective posterior Beta parameters (alphaPost=${alphaPost}, betaPost=${betaPost}) exceed certified domain [${MIN_CERTIFIED_SHAPE_PARAMETER}, ${MAX_CERTIFIED_SHAPE_PARAMETER}]`,
+    );
+  }
+
+  return {
+    weightedSuccessMass,
+    weightedFailureMass,
+    sumSquaredWeights,
+    observationCount,
+    prior: validatedPrior,
+    totalW,
+    nEff: boundedNEff,
+  };
+}
+
+function validateGammaPrior(
+  prior: unknown,
+  contextLabel: string,
+): { readonly shape: number; readonly rate: number } {
+  if (!isPlainObject(prior)) {
+    throw new ForecastPipelineRequestError(
+      `${contextLabel}.prior must be a non-null plain object { shape, rate }`,
+    );
+  }
+  if ('scale' in prior && prior.scale !== undefined) {
+    throw new ForecastPipelineRequestError(
+      `${contextLabel}.prior must use shape-rate parameterization and forbid 'scale'`,
+    );
+  }
+  if (
+    prior.parameterization !== undefined &&
+    prior.parameterization !== 'shape-rate'
+  ) {
+    throw new ForecastPipelineRequestError(
+      `${contextLabel}.prior.parameterization must be 'shape-rate', received '${String(prior.parameterization)}'`,
+    );
+  }
+  const shape = validateCertifiedShapeNumber(
+    prior.shape,
+    `${contextLabel}.prior.shape`,
+  );
+  if (!isPositiveFiniteNumber(prior.rate)) {
+    throw new ForecastPipelineRequestError(
+      `${contextLabel}.prior.rate must be a positive finite number, received ${String(prior.rate)}`,
+    );
+  }
+  return Object.freeze({ shape, rate: prior.rate });
+}
+
+function validatePoissonExposuresUnitsAndPosterior(
+  params: {
+    readonly eventCount: unknown;
+    readonly exposureDuration: unknown;
+    readonly exposureUnit: unknown;
+    readonly forecastExposureDuration: unknown;
+    readonly forecastExposureUnit: unknown;
+    readonly prior: unknown;
+  },
+  contextLabel: string,
+): {
+  readonly eventCount: number;
+  readonly exposureDuration: number;
+  readonly exposureUnit: string;
+  readonly forecastExposureDuration: number;
+  readonly forecastExposureUnit: string;
+  readonly prior: { readonly shape: number; readonly rate: number };
+} {
+  const {
+    eventCount,
+    exposureDuration,
+    exposureUnit,
+    forecastExposureDuration,
+    forecastExposureUnit,
+    prior,
+  } = params;
+  if (!isNonNegativeSafeInteger(eventCount)) {
+    throw new ForecastPipelineRequestError(
+      `${contextLabel}.eventCount must be a non-negative safe integer, received ${String(eventCount)}`,
+    );
+  }
+  if (!isPositiveFiniteNumber(exposureDuration)) {
+    throw new ForecastPipelineRequestError(
+      `${contextLabel}.exposureDuration must be a positive finite number, received ${String(exposureDuration)}`,
+    );
+  }
+  if (!isPositiveFiniteNumber(forecastExposureDuration)) {
+    throw new ForecastPipelineRequestError(
+      `${contextLabel}.forecastExposureDuration must be a positive finite number, received ${String(forecastExposureDuration)}`,
+    );
+  }
+  const histUnit = validateStrictTrimmedUnit(
+    exposureUnit,
+    `${contextLabel}.exposureUnit`,
+  );
+  const foreUnit =
+    forecastExposureUnit !== undefined
+      ? validateStrictTrimmedUnit(
+          forecastExposureUnit,
+          `${contextLabel}.forecastExposureUnit`,
+        )
+      : histUnit;
+  if (foreUnit !== histUnit) {
+    throw new ForecastPipelineRequestError(
+      `${contextLabel} has incompatible Poisson exposure units: observed '${histUnit}' vs forecast '${foreUnit}'`,
+    );
+  }
+
+  const validatedPrior = validateGammaPrior(prior, contextLabel);
+  const shapePost = kahanNeumaierSum([validatedPrior.shape, eventCount]);
+  if (
+    !Number.isFinite(shapePost) ||
+    shapePost > MAX_CERTIFIED_SHAPE_PARAMETER
+  ) {
+    throw new ForecastPipelineRequestError(
+      `${contextLabel} posterior Gamma shape (${shapePost}) exceeds certified domain [${MIN_CERTIFIED_SHAPE_PARAMETER}, ${MAX_CERTIFIED_SHAPE_PARAMETER}]`,
+    );
+  }
+  const ratePost = kahanNeumaierSum([validatedPrior.rate, exposureDuration]);
+  if (!Number.isFinite(ratePost) || ratePost <= 0) {
+    throw new ForecastPipelineRequestError(
+      `${contextLabel} posterior Gamma rate (${ratePost}) must be finite and positive`,
+    );
+  }
+  const predictiveOddsRatio = forecastExposureDuration / ratePost;
+  if (!Number.isFinite(predictiveOddsRatio) || predictiveOddsRatio <= 0) {
+    throw new ForecastPipelineRequestError(
+      `${contextLabel} predictive exposure-to-rate ratio (${predictiveOddsRatio}) overflows or underflows IEEE-754 arithmetic`,
+    );
+  }
+
+  return {
+    eventCount,
+    exposureDuration,
+    exposureUnit: histUnit,
+    forecastExposureDuration,
+    forecastExposureUnit: foreUnit,
+    prior: validatedPrior,
+  };
+}
+
+function validateDirichletPrior(
+  prior: unknown,
+  outcomeCount: number,
+  contextLabel: string,
+): { readonly alpha: readonly number[] } {
+  if (!isPlainObject(prior) || !Array.isArray(prior.alpha)) {
+    throw new ForecastPipelineRequestError(
+      `${contextLabel}.prior.alpha must be an array of length ${outcomeCount}`,
+    );
+  }
+  if (prior.alpha.length !== outcomeCount) {
+    throw new ForecastPipelineRequestError(
+      `${contextLabel}.prior.alpha length (${prior.alpha.length}) must match outcomeSpace cardinality (${outcomeCount})`,
+    );
+  }
+  const alpha: number[] = [];
+  for (let k = 0; k < outcomeCount; k++) {
+    alpha.push(
+      validateCertifiedShapeNumber(
+        prior.alpha[k],
+        `${contextLabel}.prior.alpha[${k}]`,
+      ),
+    );
+  }
+  return Object.freeze({ alpha: Object.freeze(alpha) });
+}
+
+function validateMultinomialDimensionCountsAndPosterior(
+  counts: unknown,
+  prior: unknown,
+  outcomeSpace: OutcomeSpaceDescriptor,
+  contextLabel: string,
+): {
+  readonly counts: readonly number[];
+  readonly prior: { readonly alpha: readonly number[] };
+  readonly totalCount: number;
+} {
+  const outcomeCount = outcomeSpace.outcomeLabels.length;
+  if (outcomeSpace.kind === 'first-passage-before-horizon') {
+    throw new ForecastPipelineRequestError(
+      `${contextLabel} multinomial model is incompatible with outcomeSpace.kind 'first-passage-before-horizon'`,
+    );
+  }
+  if (
+    outcomeCount < 2 ||
+    outcomeCount > MAX_CERTIFIED_OUTCOME_CARDINALITY
+  ) {
+    throw new ForecastPipelineRequestError(
+      `${contextLabel} outcome cardinality (${outcomeCount}) must lie in [2, ${MAX_CERTIFIED_OUTCOME_CARDINALITY}]`,
+    );
+  }
+  if (!Array.isArray(counts) || counts.length !== outcomeCount) {
+    throw new ForecastPipelineRequestError(
+      `${contextLabel}.counts must be an array of length ${outcomeCount}`,
+    );
+  }
+  const validatedCounts: number[] = [];
+  for (let k = 0; k < outcomeCount; k++) {
+    if (!isNonNegativeSafeInteger(counts[k])) {
+      throw new ForecastPipelineRequestError(
+        `${contextLabel}.counts[${k}] must be a non-negative safe integer, received ${String(counts[k])}`,
+      );
+    }
+    validatedCounts.push(counts[k] as number);
+  }
+  const totalCount = kahanNeumaierSum(validatedCounts);
+  if (!Number.isSafeInteger(totalCount) || totalCount < 1) {
+    throw new ForecastPipelineRequestError(
+      `${contextLabel} total multinomial count must be a safe integer >= 1, received ${totalCount}`,
+    );
+  }
+
+  const validatedPrior = validateDirichletPrior(
+    prior,
+    outcomeCount,
+    contextLabel,
+  );
+  const posteriorAlphas: number[] = [];
+  for (let k = 0; k < outcomeCount; k++) {
+    const postK = kahanNeumaierSum([
+      validatedPrior.alpha[k]!,
+      validatedCounts[k]!,
+    ]);
+    if (!Number.isFinite(postK) || postK > MAX_CERTIFIED_SHAPE_PARAMETER) {
+      throw new ForecastPipelineRequestError(
+        `${contextLabel} posterior Dirichlet alpha[${k}] (${postK}) exceeds certified domain [${MIN_CERTIFIED_SHAPE_PARAMETER}, ${MAX_CERTIFIED_SHAPE_PARAMETER}]`,
+      );
+    }
+    posteriorAlphas.push(postK);
+  }
+  for (let k = 0; k < outcomeCount; k++) {
+    const complementSum = kahanNeumaierSum(
+      posteriorAlphas.filter((_, idx) => idx !== k),
+    );
+    if (
+      !Number.isFinite(complementSum) ||
+      complementSum < MIN_CERTIFIED_SHAPE_PARAMETER ||
+      complementSum > MAX_CERTIFIED_SHAPE_PARAMETER
+    ) {
+      throw new ForecastPipelineRequestError(
+        `${contextLabel} Dirichlet marginal complement shape sum for outcome ${k} (${complementSum}) exceeds certified domain [${MIN_CERTIFIED_SHAPE_PARAMETER}, ${MAX_CERTIFIED_SHAPE_PARAMETER}]`,
+      );
+    }
+  }
+
+  return {
+    counts: Object.freeze(validatedCounts),
+    prior: validatedPrior,
+    totalCount,
+  };
+}
+
+function validateContinuousTrajectoryInputs(
+  params: {
+    readonly observationCount: unknown;
+    readonly estimatedDrift: unknown;
+    readonly estimatedScaleOrVolatility: unknown;
+    readonly degreesOfFreedom: unknown;
+    readonly initialStateLevel: unknown;
+  },
+  outcomeSpace: OutcomeSpaceDescriptor,
+  targetMethodId: UnimplementedScientificMethodId | null,
+  contextLabel: string,
+): {
+  readonly observationCount: number;
+  readonly estimatedDrift: number;
+  readonly estimatedScaleOrVolatility: number;
+  readonly degreesOfFreedom?: number;
+  readonly initialStateLevel?: number;
+} {
+  const {
+    observationCount,
+    estimatedDrift,
+    estimatedScaleOrVolatility,
+    degreesOfFreedom,
+    initialStateLevel,
+  } = params;
+
+  if (!isNonNegativeSafeInteger(observationCount) || observationCount < 1) {
+    throw new ForecastPipelineRequestError(
+      `${contextLabel} requires positive safe integer trajectory observation count >= 1, received ${String(observationCount)}`,
+    );
+  }
+  if (typeof estimatedDrift !== 'number' || !Number.isFinite(estimatedDrift)) {
+    throw new ForecastPipelineRequestError(
+      `${contextLabel}.estimatedDrift must be a finite number, received ${String(estimatedDrift)}`,
+    );
+  }
+  if (!isPositiveFiniteNumber(estimatedScaleOrVolatility)) {
+    throw new ForecastPipelineRequestError(
+      `${contextLabel}.estimatedScaleOrVolatility must be strictly positive and finite, received ${String(estimatedScaleOrVolatility)}`,
+    );
+  }
+
+  let validDf: number | undefined;
+  if (degreesOfFreedom !== undefined) {
+    if (
+      typeof degreesOfFreedom !== 'number' ||
+      !Number.isFinite(degreesOfFreedom) ||
+      degreesOfFreedom < MIN_DEGREES_OF_FREEDOM ||
+      degreesOfFreedom > MAX_DEGREES_OF_FREEDOM
+    ) {
+      throw new ForecastPipelineRequestError(
+        `${contextLabel}.degreesOfFreedom must be a finite number in [${MIN_DEGREES_OF_FREEDOM}, ${MAX_DEGREES_OF_FREEDOM}], received ${String(degreesOfFreedom)}`,
+      );
+    }
+    validDf = degreesOfFreedom;
+  }
+
+  let validInitialState: number | undefined;
+  if (initialStateLevel !== undefined) {
+    if (
+      typeof initialStateLevel !== 'number' ||
+      !Number.isFinite(initialStateLevel)
+    ) {
+      throw new ForecastPipelineRequestError(
+        `${contextLabel}.initialStateLevel must be a finite number, received ${String(initialStateLevel)}`,
+      );
+    }
+    if (
+      outcomeSpace.barrierLevel !== undefined &&
+      outcomeSpace.barrierDirection !== undefined
+    ) {
+      const barrier = outcomeSpace.barrierLevel;
+      const dir = outcomeSpace.barrierDirection;
+      const alreadyCrossed =
+        (dir === 'up-and-in' && initialStateLevel >= barrier) ||
+        (dir === 'down-and-in' && initialStateLevel <= barrier);
+      if (alreadyCrossed) {
+        throw new ForecastPipelineRequestError(
+          `${contextLabel}.initialStateLevel (${initialStateLevel}) is already at or beyond '${dir}' absorbing barrier (${barrier})`,
+        );
+      }
+    }
+    validInitialState = initialStateLevel;
+  }
+
+  if (targetMethodId === 'student-t-terminal-diffusion') {
+    if (validDf === undefined) {
+      throw new ForecastPipelineRequestError(
+        `${contextLabel} targeting 'student-t-terminal-diffusion' requires degreesOfFreedom in [${MIN_DEGREES_OF_FREEDOM}, ${MAX_DEGREES_OF_FREEDOM}]`,
+      );
+    }
+    if (
+      outcomeSpace.kind !== 'discretized-continuous-partition' ||
+      !Array.isArray(outcomeSpace.partitionThresholds) ||
+      outcomeSpace.partitionThresholds.length === 0
+    ) {
+      throw new ForecastPipelineRequestError(
+        `${contextLabel} targeting 'student-t-terminal-diffusion' requires outcomeSpace.kind === 'discretized-continuous-partition' with valid partitionThresholds`,
+      );
+    }
+  }
+
+  if (targetMethodId === 'first-passage-barrier-diffusion') {
+    if (
+      outcomeSpace.kind !== 'first-passage-before-horizon' ||
+      outcomeSpace.barrierLevel === undefined ||
+      outcomeSpace.barrierDirection === undefined
+    ) {
+      throw new ForecastPipelineRequestError(
+        `${contextLabel} targeting 'first-passage-barrier-diffusion' requires outcomeSpace.kind === 'first-passage-before-horizon' with barrierLevel and barrierDirection`,
+      );
+    }
+    if (validInitialState === undefined) {
+      throw new ForecastPipelineRequestError(
+        `${contextLabel} targeting 'first-passage-barrier-diffusion' requires finite initialStateLevel strictly outside the absorbing barrier`,
+      );
+    }
+  }
+
+  return {
+    observationCount,
+    estimatedDrift,
+    estimatedScaleOrVolatility,
+    ...(validDf !== undefined ? { degreesOfFreedom: validDf } : {}),
+    ...(validInitialState !== undefined
+      ? { initialStateLevel: validInitialState }
+      : {}),
+  };
 }
 
 interface PreparedMethodExecutionBundle {
@@ -1043,6 +2666,7 @@ interface PendingPoissonHistoricalSubmission {
   readonly historicalExposureDuration: number;
   readonly historicalExposureUnit: string;
   readonly exposureWindowId: string;
+  readonly hasExplicitWindowId: boolean;
   readonly forecastExposureDuration: number;
   readonly forecastExposureUnit: string;
   readonly credibleIntervalLevel?: number;
@@ -1073,6 +2697,308 @@ interface PendingMultinomialHistoricalSubmission {
   readonly canonicalEventKeys: readonly string[];
 }
 
+interface BetaMethodContribution {
+  readonly sourceKind:
+    | 'historical-observations-pool'
+    | 'structured-numerical-dataset'
+    | 'statistical-sufficient-statistics';
+  readonly evidenceIds: readonly string[];
+  readonly sourceUrls: readonly string[];
+  readonly successOutcomeIndex: 0 | 1;
+  readonly successes: number;
+  readonly failures: number;
+  readonly prior: { readonly alpha: number; readonly beta: number };
+  readonly credibleIntervalLevel?: number;
+}
+
+interface WeightedKishMethodContribution {
+  readonly sourceKind:
+    | 'historical-observations-pool'
+    | 'structured-numerical-dataset'
+    | 'statistical-sufficient-statistics';
+  readonly evidenceIds: readonly string[];
+  readonly sourceUrls: readonly string[];
+  readonly successOutcomeIndex: 0 | 1;
+  readonly weightedSuccessMass: number;
+  readonly weightedFailureMass: number;
+  readonly sumSquaredWeights: number;
+  readonly observationCount: number;
+  readonly prior: { readonly alpha: number; readonly beta: number };
+  readonly credibleIntervalLevel?: number;
+}
+
+interface PoissonMethodContribution {
+  readonly sourceKind:
+    | 'historical-observations-pool'
+    | 'structured-numerical-dataset'
+    | 'statistical-sufficient-statistics';
+  readonly evidenceIds: readonly string[];
+  readonly sourceUrls: readonly string[];
+  readonly eventOutcomeIndex: 0 | 1;
+  readonly eventCount: number;
+  readonly exposureDuration: number;
+  readonly exposureUnit: string;
+  readonly forecastExposureDuration: number;
+  readonly forecastExposureUnit: string;
+  readonly prior: { readonly shape: number; readonly rate: number };
+  readonly credibleIntervalLevel?: number;
+  readonly preVerifiedCombination?: {
+    readonly justification: MultiSourceCombinationJustification;
+    readonly verifiedByVerifierId: string;
+    readonly verificationArtifactRef: string | null;
+    readonly verifierRationale: string;
+  };
+}
+
+interface DirichletMethodContribution {
+  readonly sourceKind:
+    | 'historical-observations-pool'
+    | 'structured-numerical-dataset'
+    | 'statistical-sufficient-statistics';
+  readonly evidenceIds: readonly string[];
+  readonly sourceUrls: readonly string[];
+  readonly counts: readonly number[];
+  readonly priorAlpha: readonly number[];
+  readonly credibleIntervalLevel?: number;
+}
+
+interface ContinuousTrajectoryContribution {
+  readonly evidenceId: string;
+  readonly observationCount: number;
+  readonly estimatedDrift: number;
+  readonly estimatedScaleOrVolatility: number;
+  readonly degreesOfFreedom?: number;
+  readonly initialStateLevel?: number;
+  readonly targetMethodIds: readonly UnimplementedScientificMethodId[];
+}
+
+type MultiSourceCombinationGateResult =
+  | {
+      readonly approved: true;
+      readonly justification: MultiSourceCombinationJustification;
+      readonly verifiedByVerifierId: string;
+      readonly verificationArtifactRef: string | null;
+      readonly verifierRationale: string;
+    }
+  | {
+      readonly approved: false;
+      readonly rejection: RejectedMultiSourceCombinationDiagnostic;
+    };
+
+function evaluateMultiSourceCombinationGate(params: {
+  readonly methodId: ExecutableScientificMethodId;
+  readonly expectedBasis: MultiSourceCombinationBasis;
+  readonly allContributingIds: readonly string[];
+  readonly allContributingUrls: readonly string[];
+  readonly contributingSubmissions: readonly PipelineEvidenceSubmission[];
+  readonly outcomeSpace: OutcomeSpaceDescriptor;
+  readonly referenceTime: IsoDateTime;
+  readonly justifications?: Readonly<
+    Record<string, MultiSourceCombinationJustification>
+  >;
+  readonly combinationVerifier?: MultiSourceCombinationVerifier;
+}): MultiSourceCombinationGateResult {
+  const {
+    methodId,
+    expectedBasis,
+    allContributingIds,
+    allContributingUrls,
+    contributingSubmissions,
+    outcomeSpace,
+    referenceTime,
+    justifications,
+    combinationVerifier,
+  } = params;
+
+  const frozenIds = Object.freeze([...allContributingIds]);
+  const frozenUrls = Object.freeze([...allContributingUrls]);
+
+  const makeRejection = (
+    rejectionCode: RejectedMultiSourceCombinationDiagnostic['rejectionCode'],
+    explanation: string,
+    verifiedByVerifierId: string | null = null,
+    verificationArtifactRef: string | null = null,
+  ): MultiSourceCombinationGateResult => ({
+    approved: false,
+    rejection: Object.freeze({
+      methodId,
+      expectedBasis,
+      contributingEvidenceIds: frozenIds,
+      contributingSourceUrls: frozenUrls,
+      rejectionCode,
+      verifiedByVerifierId,
+      verificationArtifactRef,
+      preservedIndividualSources: true,
+      explanation,
+    }),
+  });
+
+  const j = justifications?.[methodId];
+  if (!isPlainObject(j)) {
+    return makeRejection(
+      'missing-combination-justification',
+      `Rejected multi-source combination for '${methodId}' over [${allContributingIds.join(', ')}]: silent overwriting is prohibited, and combining separate sources requires a server-verified MultiSourceCombinationJustification with basis='${expectedBasis}'. All individual sources and provenance records were preserved.`,
+    );
+  }
+
+  const invalidReasons: string[] = [];
+  if (j.basis !== expectedBasis) {
+    invalidReasons.push(
+      `basis must be '${expectedBasis}', received '${String(j.basis)}'`,
+    );
+  }
+  if (j.disjointPopulationsOrWindowsVerified !== true) {
+    invalidReasons.push('disjointPopulationsOrWindowsVerified must be true');
+  }
+  if (j.homogeneousParameterSpaceVerified !== true) {
+    invalidReasons.push('homogeneousParameterSpaceVerified must be true');
+  }
+  if (
+    methodId === 'weighted-kish-effective-binomial' &&
+    j.commonExogenousWeightScaleVerified !== true
+  ) {
+    invalidReasons.push('commonExogenousWeightScaleVerified must be true');
+  }
+  if (
+    typeof j.mathematicalRationale !== 'string' ||
+    j.mathematicalRationale.trim().length < 10
+  ) {
+    invalidReasons.push(
+      'mathematicalRationale must be a substantive explanation (at least 10 characters)',
+    );
+  }
+
+  let declaredIds: string[] = [];
+  if (!Array.isArray(j.contributingEvidenceIds)) {
+    invalidReasons.push(
+      `contributingEvidenceIds must be an array matching [${allContributingIds.join(', ')}]`,
+    );
+  } else {
+    declaredIds = j.contributingEvidenceIds
+      .filter((id): id is string => typeof id === 'string')
+      .map((id) => id.trim())
+      .filter((id) => id.length > 0);
+    if (
+      declaredIds.length !== j.contributingEvidenceIds.length ||
+      new Set(declaredIds).size !== declaredIds.length ||
+      declaredIds.length < 2
+    ) {
+      invalidReasons.push(
+        'contributingEvidenceIds must contain at least 2 unique non-empty evidenceIds',
+      );
+    } else {
+      const declaredSet = new Set(declaredIds);
+      const expectedSet = new Set(allContributingIds);
+      const missing = allContributingIds.filter((id) => !declaredSet.has(id));
+      const extra = declaredIds.filter((id) => !expectedSet.has(id));
+      if (missing.length > 0 || extra.length > 0) {
+        invalidReasons.push(
+          `contributingEvidenceIds does not match active contributing evidenceIds [${allContributingIds.join(', ')}] (missing=[${missing.join(', ')}], unexpected=[${extra.join(', ')}])`,
+        );
+      }
+    }
+  }
+
+  if (invalidReasons.length > 0) {
+    return makeRejection(
+      'invalid-combination-justification',
+      `Rejected invalid multi-source combination justification for '${methodId}' over [${allContributingIds.join(', ')}]: ${invalidReasons.join('; ')}. All individual sources and provenance records were preserved.`,
+    );
+  }
+
+  const normalizedJustification: MultiSourceCombinationJustification =
+    Object.freeze({
+      basis: j.basis as MultiSourceCombinationBasis,
+      contributingEvidenceIds: Object.freeze(declaredIds),
+      disjointPopulationsOrWindowsVerified: true,
+      homogeneousParameterSpaceVerified: true,
+      ...(j.commonExogenousWeightScaleVerified !== undefined
+        ? {
+            commonExogenousWeightScaleVerified:
+              j.commonExogenousWeightScaleVerified,
+          }
+        : {}),
+      mathematicalRationale: (j.mathematicalRationale as string).trim(),
+    });
+
+  // Fail-closed server-side verification gate: caller-declared booleans and
+  // rationale prose are NEVER trusted without an independent combinationVerifier.
+  if (combinationVerifier === undefined) {
+    return makeRejection(
+      'missing-trusted-combination-verifier',
+      `Rejected multi-source combination for '${methodId}' over [${allContributingIds.join(', ')}] (fail-closed): no trusted server-side combinationVerifier was supplied. Caller-declared disjointPopulationsOrWindowsVerified/homogeneousParameterSpaceVerified booleans and rationale text do not establish independence or shared parameters by themselves. All individual sources and provenance records were preserved.`,
+    );
+  }
+
+  const decision = combinationVerifier({
+    methodId,
+    expectedBasis,
+    justification: normalizedJustification,
+    contributingSubmissions: Object.freeze([...contributingSubmissions]),
+    contributingEvidenceIds: frozenIds,
+    contributingSourceUrls: frozenUrls,
+    outcomeSpace,
+    referenceTime,
+  });
+
+  const vId =
+    isPlainObject(decision) && typeof decision.verifierId === 'string'
+      ? decision.verifierId.trim()
+      : '';
+  const vRat =
+    isPlainObject(decision) && typeof decision.rationale === 'string'
+      ? decision.rationale.trim()
+      : '';
+  const artifactRef =
+    isPlainObject(decision) &&
+    typeof decision.verificationArtifactRef === 'string' &&
+    decision.verificationArtifactRef.trim().length > 0
+      ? decision.verificationArtifactRef.trim()
+      : null;
+
+  if (vId.length === 0 || vRat.length === 0 || decision.verified !== true) {
+    return makeRejection(
+      'rejected-by-trusted-combination-verifier',
+      `Rejected multi-source combination for '${methodId}' over [${allContributingIds.join(', ')}] at trusted combinationVerifier ('${vId || 'invalid'}'): ${vRat || 'did not return verified=true with non-empty verifierId and rationale'}. All individual sources and provenance records were preserved.`,
+      vId || null,
+      artifactRef,
+    );
+  }
+
+  if (decision.verifiedEvidenceIds !== undefined) {
+    if (!Array.isArray(decision.verifiedEvidenceIds)) {
+      return makeRejection(
+        'rejected-by-trusted-combination-verifier',
+        `Rejected multi-source combination for '${methodId}' at trusted combinationVerifier ('${vId}'): verifiedEvidenceIds must be an array when supplied. All individual sources and provenance records were preserved.`,
+        vId,
+        artifactRef,
+      );
+    }
+    const verifiedSet = new Set(
+      decision.verifiedEvidenceIds
+        .filter((id): id is string => typeof id === 'string')
+        .map((id) => id.trim()),
+    );
+    const unverified = allContributingIds.filter((id) => !verifiedSet.has(id));
+    if (unverified.length > 0) {
+      return makeRejection(
+        'rejected-by-trusted-combination-verifier',
+        `Rejected multi-source combination for '${methodId}' at trusted combinationVerifier ('${vId}'): contributor(s) [${unverified.join(', ')}] were not covered in verifiedEvidenceIds. All individual sources and provenance records were preserved.`,
+        vId,
+        artifactRef,
+      );
+    }
+  }
+
+  return {
+    approved: true,
+    justification: normalizedJustification,
+    verifiedByVerifierId: vId,
+    verificationArtifactRef: artifactRef,
+    verifierRationale: vRat,
+  };
+}
+
 /* -------------------------------------------------------------------------
    5. Step C — Evidence Trust Boundary, Strict Validation & Global Deduplication
    ------------------------------------------------------------------------- */
@@ -1092,16 +3018,27 @@ interface PendingMultinomialHistoricalSubmission {
  *   3. Pipeline-wide global event deduplication across all verified
  *      `historical-observations` submissions by canonical event identity
  *      (`${schemaKind}::${eventFamily}::${eventId}`).
+ *   4. Fail-closed server-side verification for both `StructuralSymmetryContract`
+ *      (`symmetryVerifier`) and `MultiSourceCombinationJustification`
+ *      (`combinationVerifier`).
  */
 export function assessCollectedEvidence(params: {
   readonly harvestResult: EvidenceHarvestResult;
   readonly submittedEvidence: readonly PipelineEvidenceSubmission[];
   readonly outcomeSpace: OutcomeSpaceDescriptor;
   readonly referenceTime: IsoDateTime;
+  readonly executedAt?: IsoDateTime;
+  readonly question?: string;
+  readonly structuralSymmetryContract?: StructuralSymmetryContract;
   readonly structuralSymmetryPremise?: StructuralUniformExecutionInput['symmetryPremise'];
   readonly allowStructuralBaseline: boolean;
+  readonly multiSourceCombinationJustifications?: Readonly<
+    Record<string, MultiSourceCombinationJustification>
+  >;
   readonly registry: ScientificMethodRegistry;
   readonly evidenceVerifier?: EvidenceVerifier;
+  readonly symmetryVerifier?: StructuralSymmetryVerifier;
+  readonly combinationVerifier?: MultiSourceCombinationVerifier;
 }): {
   readonly report: EvidenceAssessmentReport;
   readonly provenanceRecords: readonly PipelineEvidenceProvenanceRecord[];
@@ -1115,12 +3052,20 @@ export function assessCollectedEvidence(params: {
     submittedEvidence,
     outcomeSpace,
     referenceTime,
+    executedAt,
+    question,
+    structuralSymmetryContract,
     structuralSymmetryPremise,
     allowStructuralBaseline,
+    multiSourceCombinationJustifications,
     registry,
     evidenceVerifier,
+    symmetryVerifier,
+    combinationVerifier,
   } = params;
 
+  const effectiveExecutedAt: IsoDateTime =
+    executedAt ?? new Date().toISOString().replace(/\.\d{3}Z$/, 'Z');
   const referenceMs = parseIsoDateTimeMs(referenceTime)!;
   const outcomeCount = outcomeSpace.outcomeLabels.length;
 
@@ -1134,8 +3079,18 @@ export function assessCollectedEvidence(params: {
   const invalidObservationDiagnostics: InvalidObservationDiagnostic[] = [];
   const deduplicatedEventDiagnostics: DeduplicatedEventObservationDiagnostic[] =
     [];
+  const multiSourceCombinations: MultiSourceCombinationDiagnostic[] = [];
+  const rejectedMultiSourceCombinations: RejectedMultiSourceCombinationDiagnostic[] =
+    [];
+  const rejectedCombinationMessageByMethod = new Map<
+    ScientificMethodId,
+    string
+  >();
+  let structuralSymmetryVerification: StructuralSymmetryVerificationDiagnostic | null =
+    null;
   const allProvenanceRecords: PipelineEvidenceProvenanceRecord[] = [];
   const assessmentNotes: string[] = [];
+  const verifiedSubmissionById = new Map<string, PipelineEvidenceSubmission>();
 
   // 1. Classify all harvested items from EvidenceHarvester as documentary-evidence:
   for (const item of harvestResult.items) {
@@ -1204,6 +3159,13 @@ export function assessCollectedEvidence(params: {
   >();
   const supportedMethodSet = new Set<ScientificMethodId>();
 
+  // Non-overwriting per-method contribution accumulators:
+  const betaContributions: BetaMethodContribution[] = [];
+  const kishContributions: WeightedKishMethodContribution[] = [];
+  const poissonContributions: PoissonMethodContribution[] = [];
+  const dirichletContributions: DirichletMethodContribution[] = [];
+  const continuousContributions: ContinuousTrajectoryContribution[] = [];
+
   // Global event deduplication registries across all verified historical-observations submissions:
   const globalBinaryEvents = new Map<
     string,
@@ -1239,8 +3201,8 @@ export function assessCollectedEvidence(params: {
   const pendingMultinomialSubmissions: PendingMultinomialHistoricalSubmission[] =
     [];
 
-  // Deduplicate caller-submitted evidence by evidenceId:
-  const seenSubmissionIds = new Set<string>();
+  // Deduplicate identical caller-submitted evidence by evidenceId; fail closed on conflicting payloads:
+  const seenSubmissionPayloads = new Map<string, string>();
 
   for (let idx = 0; idx < submittedEvidence.length; idx++) {
     const rawSub = submittedEvidence[idx];
@@ -1256,13 +3218,20 @@ export function assessCollectedEvidence(params: {
         ? rawSub.evidenceId.trim()
         : `sub-${idx}`;
 
-    if (seenSubmissionIds.has(evidenceId)) {
+    const payloadSignature = canonicalJsonKey(rawSub);
+    const priorPayloadSignature = seenSubmissionPayloads.get(evidenceId);
+    if (priorPayloadSignature !== undefined) {
+      if (priorPayloadSignature !== payloadSignature) {
+        throw new ForecastPipelineRequestError(
+          `Conflicting duplicate submittedEvidence entries share evidenceId '${evidenceId}' with non-identical payloads`,
+        );
+      }
       assessmentNotes.push(
-        `Skipped duplicate submittedEvidence entry with evidenceId '${evidenceId}' so duplicate submissions never double-count observations.`,
+        `Skipped identical duplicate submittedEvidence entry with evidenceId '${evidenceId}' so duplicate submissions never double-count observations.`,
       );
       continue;
     }
-    seenSubmissionIds.add(evidenceId);
+    seenSubmissionPayloads.set(evidenceId, payloadSignature);
 
     const cat = rawSub.category;
     if (
@@ -1306,7 +3275,7 @@ export function assessCollectedEvidence(params: {
           isValidIsoDateTime(sub.publishedAt)
             ? sub.publishedAt
             : null,
-        retrievedAt: referenceTime,
+        retrievedAt: effectiveExecutedAt,
         sourceProvider: `caller:${originLabel}`,
         isPrimarySourceVerified: false,
         usableForQuantitativeMethods: false,
@@ -1358,7 +3327,7 @@ export function assessCollectedEvidence(params: {
           publisher: publisher || 'unknown',
           url,
           publishedAt: pubMs !== null ? publishedAt : null,
-          retrievedAt: referenceTime,
+          retrievedAt: effectiveExecutedAt,
           sourceProvider: 'caller:documentary',
           isPrimarySourceVerified: false,
           usableForQuantitativeMethods: false,
@@ -1380,6 +3349,8 @@ export function assessCollectedEvidence(params: {
       let docArtifactRef: string | null = null;
       let docOutcome: EvidenceVerificationOutcome =
         'downgraded-no-trusted-verifier';
+      let docRejectionNote: string | null = null;
+
       if (evidenceVerifier !== undefined) {
         const decision = evidenceVerifier({
           evidenceId,
@@ -1388,22 +3359,37 @@ export function assessCollectedEvidence(params: {
           referenceTime,
           harvestedItems: harvestResult.items,
         });
-        if (
+        const verifierIdValid =
           isPlainObject(decision) &&
           typeof decision.verifierId === 'string' &&
-          decision.verifierId.trim().length > 0 &&
+          decision.verifierId.trim().length > 0;
+        const rationaleValid =
+          isPlainObject(decision) &&
           typeof decision.rationale === 'string' &&
-          decision.rationale.trim().length > 0 &&
+          decision.rationale.trim().length > 0;
+        docVerifierId = verifierIdValid ? decision.verifierId.trim() : null;
+        docArtifactRef =
+          isPlainObject(decision) &&
+          typeof decision.verificationArtifactRef === 'string' &&
+          decision.verificationArtifactRef.trim().length > 0
+            ? decision.verificationArtifactRef.trim()
+            : null;
+
+        if (
+          verifierIdValid &&
+          rationaleValid &&
           decision.verifiedEmpirical === true
         ) {
           docVerifiedPrimary = decision.isPrimarySourceVerified === true;
-          docVerifierId = decision.verifierId.trim();
-          docArtifactRef =
-            typeof decision.verificationArtifactRef === 'string' &&
-            decision.verificationArtifactRef.trim().length > 0
-              ? decision.verificationArtifactRef.trim()
-              : null;
           docOutcome = 'verified-by-trusted-verifier';
+        } else {
+          docVerifiedPrimary = false;
+          docOutcome = 'rejected-by-trusted-verifier';
+          const rejReason = rationaleValid
+            ? decision.rationale.trim()
+            : 'Trusted evidenceVerifier rejected documentary evidence verification.';
+          docRejectionNote = `Documentary submission '${evidenceId}' was rejected by trusted verifier ('${docVerifierId ?? 'invalid'}'): ${rejReason}`;
+          assessmentNotes.push(docRejectionNote);
         }
       }
 
@@ -1425,7 +3411,7 @@ export function assessCollectedEvidence(params: {
         publisher,
         url,
         publishedAt,
-        retrievedAt: referenceTime,
+        retrievedAt: effectiveExecutedAt,
         sourceProvider: 'caller:documentary',
         isPrimarySourceVerified: docVerifiedPrimary,
         usableForQuantitativeMethods: false,
@@ -1435,6 +3421,7 @@ export function assessCollectedEvidence(params: {
           Object.freeze({ evidenceId, publisher, url, publishedAt }),
         ]),
         assessmentNote:
+          docRejectionNote ??
           'Caller-submitted documentary evidence preserved for provenance; qualitative text is never converted into numerical likelihoods or sample sizes, and caller-supplied isPrimarySourceVerified is never trusted without an independent EvidenceVerifier.',
       });
       documentaryEvidence.push(record);
@@ -1516,7 +3503,7 @@ export function assessCollectedEvidence(params: {
         publisher: publisher || 'unverified',
         url,
         publishedAt: pubMs !== null ? publishedAt : null,
-        retrievedAt: referenceTime,
+        retrievedAt: effectiveExecutedAt,
         sourceProvider: `caller:${cat}`,
         isPrimarySourceVerified: false,
         usableForQuantitativeMethods: false,
@@ -1540,13 +3527,6 @@ export function assessCollectedEvidence(params: {
 
     /* -------------------------------------------------------------------
        Explicit Evidence Trust & Verification Boundary Gate
-       -------------------------------------------------------------------
-       Caller-supplied booleans (`verifiedEmpirical: true`,
-       `isPrimarySourceVerified: true`), publisher names, URLs, titles, or
-       timestamps NEVER independently establish empirical verification.
-       Without a successful decision from a trusted `evidenceVerifier`, the
-       submission is preserved as declared/unverified evidence and prevented
-       from entering verified quantitative channels.
        ------------------------------------------------------------------- */
     if (evidenceVerifier === undefined) {
       const downgradeNote = `Downgraded caller-submitted '${cat}' ('${evidenceId}', publisher='${publisher}', url='${url}', claimedVerifiedEmpirical=${String(qSub.verifiedEmpirical)}) to declared/unverified evidence: caller-supplied booleans, publisher names, URLs, titles, or timestamps cannot independently establish empirical verification without a trusted server-side evidenceVerifier.`;
@@ -1569,7 +3549,7 @@ export function assessCollectedEvidence(params: {
         publisher,
         url,
         publishedAt,
-        retrievedAt: referenceTime,
+        retrievedAt: effectiveExecutedAt,
         sourceProvider: `caller:${cat}`,
         isPrimarySourceVerified: false,
         usableForQuantitativeMethods: false,
@@ -1640,7 +3620,7 @@ export function assessCollectedEvidence(params: {
         publisher,
         url,
         publishedAt,
-        retrievedAt: referenceTime,
+        retrievedAt: effectiveExecutedAt,
         sourceProvider: `caller:${cat}`,
         isPrimarySourceVerified: false,
         usableForQuantitativeMethods: false,
@@ -1656,6 +3636,14 @@ export function assessCollectedEvidence(params: {
       continue;
     }
 
+    // Fail closed if verifiedEventIds was supplied as an empty array on historical-observations:
+    const rawVerifiedEventIds = verificationDecision.verifiedEventIds;
+    if (rawVerifiedEventIds !== undefined && !Array.isArray(rawVerifiedEventIds)) {
+      throw new ForecastPipelineRequestError(
+        `EvidenceVerifier decision for '${evidenceId}' returned invalid non-array verifiedEventIds`,
+      );
+    }
+
     const trustMetadata: VerifiedSubmissionTrustMetadata = Object.freeze({
       isPrimarySourceVerified:
         verificationDecision.isPrimarySourceVerified === true,
@@ -1667,9 +3655,9 @@ export function assessCollectedEvidence(params: {
           : null,
       rationale: verificationDecision.rationale.trim(),
       verifiedEventIdSet:
-        Array.isArray(verificationDecision.verifiedEventIds)
+        Array.isArray(rawVerifiedEventIds)
           ? new Set(
-              verificationDecision.verifiedEventIds
+              rawVerifiedEventIds
                 .filter((id): id is string => typeof id === 'string')
                 .map((id) => id.trim())
                 .filter((id) => id.length > 0),
@@ -1686,12 +3674,10 @@ export function assessCollectedEvidence(params: {
     if (qSub.lowConfidenceEvidence === true) {
       lowConfidenceEvidence = true;
     }
+    verifiedSubmissionById.set(evidenceId, qSub);
 
     /* -------------------------------------------------------------------
        Category 2: Historical Observations (`historical-observations`)
-       -------------------------------------------------------------------
-       Validates every observation field strictly and registers valid
-       observations into the pipeline-wide global deduplication registry.
        ------------------------------------------------------------------- */
     if (cat === 'historical-observations') {
       const hSub = qSub as HistoricalObservationsSubmission;
@@ -1706,15 +3692,20 @@ export function assessCollectedEvidence(params: {
         if (
           (schema.successOutcomeIndex !== 0 &&
             schema.successOutcomeIndex !== 1) ||
-          !isPlainObject(schema.prior) ||
-          !isPositiveFiniteNumber(schema.prior.alpha) ||
-          !isPositiveFiniteNumber(schema.prior.beta) ||
           !Array.isArray(schema.observations)
         ) {
           throw new ForecastPipelineRequestError(
-            `submittedEvidence[${idx}] ('${evidenceId}') binary-trials schema requires successOutcomeIndex (0 | 1), positive finite prior { alpha, beta }, and observations array`,
+            `submittedEvidence[${idx}] ('${evidenceId}') binary-trials schema requires successOutcomeIndex (0 | 1) and observations array`,
           );
         }
+        const validatedPrior = validateBetaPrior(
+          schema.prior,
+          `submittedEvidence[${idx}] ('${evidenceId}')`,
+        );
+        const ciLevel = validateCredibleIntervalLevel(
+          schema.credibleIntervalLevel,
+          `submittedEvidence[${idx}] ('${evidenceId}')`,
+        );
 
         const schemaEventFamily =
           typeof schema.eventFamily === 'string' &&
@@ -1796,8 +3787,6 @@ export function assessCollectedEvidence(params: {
             );
           }
 
-          // Strict binary outcome validation: ONLY 1, 'success', 0, or 'failure' are accepted!
-          // Never silently map arbitrary values to 0.
           const rawOutcome = (obs as { outcome?: unknown }).outcome;
           const isValidSuccessOutcome =
             rawOutcome === 1 || rawOutcome === 'success';
@@ -1812,6 +3801,14 @@ export function assessCollectedEvidence(params: {
 
           const rawWeight = (obs as { weight?: unknown }).weight;
           if (
+            schema.enableWeightedKishChannel === true &&
+            rawWeight === undefined
+          ) {
+            invalidFields.push('weight');
+            reasons.push(
+              'weight is required on every binary trial observation when enableWeightedKishChannel is true',
+            );
+          } else if (
             rawWeight !== undefined &&
             !isPositiveFiniteNumber(rawWeight)
           ) {
@@ -1892,13 +3889,10 @@ export function assessCollectedEvidence(params: {
             baseCitation,
             trust: trustMetadata,
             successOutcomeIndex: schema.successOutcomeIndex,
-            prior: Object.freeze({
-              alpha: schema.prior.alpha,
-              beta: schema.prior.beta,
-            }),
+            prior: validatedPrior,
             enableWeightedKishChannel: schema.enableWeightedKishChannel === true,
-            ...(schema.credibleIntervalLevel !== undefined
-              ? { credibleIntervalLevel: schema.credibleIntervalLevel }
+            ...(ciLevel !== undefined
+              ? { credibleIntervalLevel: ciLevel }
               : {}),
             rawObservationCount: schema.observations.length,
             canonicalEventKeys: Object.freeze(submissionCanonicalKeys),
@@ -1910,15 +3904,8 @@ export function assessCollectedEvidence(params: {
       if (schema.kind === 'poisson-arrivals') {
         if (
           (schema.eventOutcomeIndex !== 0 && schema.eventOutcomeIndex !== 1) ||
-          !isPlainObject(schema.prior) ||
-          !isPositiveFiniteNumber(schema.prior.shape) ||
-          !isPositiveFiniteNumber(schema.prior.rate) ||
           !isPlainObject(schema.historicalExposure) ||
-          !isPositiveFiniteNumber(schema.historicalExposure.exposureDuration) ||
-          typeof schema.historicalExposure.exposureUnit !== 'string' ||
-          schema.historicalExposure.exposureUnit.trim().length === 0 ||
           !isPlainObject(schema.forecastExposure) ||
-          !isPositiveFiniteNumber(schema.forecastExposure.exposureDuration) ||
           !Array.isArray(schema.events)
         ) {
           throw new ForecastPipelineRequestError(
@@ -1926,15 +3913,30 @@ export function assessCollectedEvidence(params: {
           );
         }
 
-        const histUnit = schema.historicalExposure.exposureUnit.trim();
-        const foreUnit =
-          schema.forecastExposure.exposureUnit !== undefined
-            ? schema.forecastExposure.exposureUnit.trim()
-            : histUnit;
-        if (foreUnit.length === 0 || foreUnit !== histUnit) {
-          throw new ForecastPipelineRequestError(
-            `submittedEvidence[${idx}] ('${evidenceId}') poisson-arrivals schema requires matching historicalExposure.exposureUnit ('${histUnit}') and forecastExposure.exposureUnit ('${foreUnit}')`,
+        const validatedPoisson = validatePoissonExposuresUnitsAndPosterior(
+          {
+            eventCount: 0,
+            exposureDuration: schema.historicalExposure.exposureDuration,
+            exposureUnit: schema.historicalExposure.exposureUnit,
+            forecastExposureDuration: schema.forecastExposure.exposureDuration,
+            forecastExposureUnit: schema.forecastExposure.exposureUnit,
+            prior: schema.prior,
+          },
+          `submittedEvidence[${idx}] ('${evidenceId}')`,
+        );
+        const ciLevel = validateCredibleIntervalLevel(
+          schema.credibleIntervalLevel,
+          `submittedEvidence[${idx}] ('${evidenceId}')`,
+        );
+
+        let hasExplicitWindowId = false;
+        let exposureWindowId = '__implicit-default-poisson-window__';
+        if (schema.historicalExposure.exposureWindowId !== undefined) {
+          exposureWindowId = validateStrictTrimmedUnit(
+            schema.historicalExposure.exposureWindowId,
+            `submittedEvidence[${idx}] ('${evidenceId}').historicalExposure.exposureWindowId`,
           );
+          hasExplicitWindowId = true;
         }
 
         const schemaEventFamily =
@@ -1942,11 +3944,6 @@ export function assessCollectedEvidence(params: {
           schema.eventFamily.trim().length > 0
             ? schema.eventFamily.trim()
             : 'poisson-arrivals';
-        const exposureWindowId =
-          typeof schema.historicalExposure.exposureWindowId === 'string' &&
-          schema.historicalExposure.exposureWindowId.trim().length > 0
-            ? schema.historicalExposure.exposureWindowId.trim()
-            : `default-window:${histUnit}:${schema.historicalExposure.exposureDuration}`;
         const submissionCanonicalKeys: string[] = [];
 
         for (let obsIdx = 0; obsIdx < schema.events.length; obsIdx++) {
@@ -2022,7 +4019,6 @@ export function assessCollectedEvidence(params: {
             );
           }
 
-          // Strict check for any unexpected outcome or eventCount field on Poisson event record:
           const extraOutcome = (ev as Record<string, unknown>).outcome;
           if (
             extraOutcome !== undefined &&
@@ -2107,18 +4103,16 @@ export function assessCollectedEvidence(params: {
             baseCitation,
             trust: trustMetadata,
             eventOutcomeIndex: schema.eventOutcomeIndex,
-            prior: Object.freeze({
-              shape: schema.prior.shape,
-              rate: schema.prior.rate,
-            }),
-            historicalExposureDuration:
-              schema.historicalExposure.exposureDuration,
-            historicalExposureUnit: histUnit,
+            prior: validatedPoisson.prior,
+            historicalExposureDuration: validatedPoisson.exposureDuration,
+            historicalExposureUnit: validatedPoisson.exposureUnit,
             exposureWindowId,
-            forecastExposureDuration: schema.forecastExposure.exposureDuration,
-            forecastExposureUnit: foreUnit,
-            ...(schema.credibleIntervalLevel !== undefined
-              ? { credibleIntervalLevel: schema.credibleIntervalLevel }
+            hasExplicitWindowId,
+            forecastExposureDuration:
+              validatedPoisson.forecastExposureDuration,
+            forecastExposureUnit: validatedPoisson.forecastExposureUnit,
+            ...(ciLevel !== undefined
+              ? { credibleIntervalLevel: ciLevel }
               : {}),
             rawEventCount: schema.events.length,
             canonicalEventKeys: Object.freeze(submissionCanonicalKeys),
@@ -2128,17 +4122,33 @@ export function assessCollectedEvidence(params: {
       }
 
       if (schema.kind === 'multinomial-trials') {
-        if (
-          !isPlainObject(schema.prior) ||
-          !Array.isArray(schema.prior.alpha) ||
-          schema.prior.alpha.length !== outcomeCount ||
-          !schema.prior.alpha.every((a) => isPositiveFiniteNumber(a)) ||
-          !Array.isArray(schema.observations)
-        ) {
+        if (outcomeSpace.kind === 'first-passage-before-horizon') {
           throw new ForecastPipelineRequestError(
-            `submittedEvidence[${idx}] ('${evidenceId}') multinomial-trials schema requires prior.alpha of length ${outcomeCount} with positive finite numbers and an observations array`,
+            `submittedEvidence[${idx}] ('${evidenceId}') multinomial-trials is incompatible with outcomeSpace.kind 'first-passage-before-horizon'`,
           );
         }
+        if (
+          outcomeCount < 2 ||
+          outcomeCount > MAX_CERTIFIED_OUTCOME_CARDINALITY
+        ) {
+          throw new ForecastPipelineRequestError(
+            `submittedEvidence[${idx}] ('${evidenceId}') outcome cardinality (${outcomeCount}) must lie in [2, ${MAX_CERTIFIED_OUTCOME_CARDINALITY}]`,
+          );
+        }
+        if (!Array.isArray(schema.observations)) {
+          throw new ForecastPipelineRequestError(
+            `submittedEvidence[${idx}] ('${evidenceId}') multinomial-trials schema requires an observations array`,
+          );
+        }
+        const validatedPrior = validateDirichletPrior(
+          schema.prior,
+          outcomeCount,
+          `submittedEvidence[${idx}] ('${evidenceId}')`,
+        );
+        const ciLevel = validateCredibleIntervalLevel(
+          schema.credibleIntervalLevel,
+          `submittedEvidence[${idx}] ('${evidenceId}')`,
+        );
 
         const schemaEventFamily =
           typeof schema.eventFamily === 'string' &&
@@ -2220,7 +4230,6 @@ export function assessCollectedEvidence(params: {
             );
           }
 
-          // Strict multinomial outcome validation:
           const rawIndex = (obs as { outcomeIndex?: unknown }).outcomeIndex;
           const rawLabel = (obs as { outcomeLabel?: unknown }).outcomeLabel;
           let resolvedIndex: number | null = null;
@@ -2328,9 +4337,9 @@ export function assessCollectedEvidence(params: {
             publishedAt,
             baseCitation,
             trust: trustMetadata,
-            priorAlpha: Object.freeze([...schema.prior.alpha]),
-            ...(schema.credibleIntervalLevel !== undefined
-              ? { credibleIntervalLevel: schema.credibleIntervalLevel }
+            priorAlpha: validatedPrior.alpha,
+            ...(ciLevel !== undefined
+              ? { credibleIntervalLevel: ciLevel }
               : {}),
             rawObservationCount: schema.observations.length,
             canonicalEventKeys: Object.freeze(submissionCanonicalKeys),
@@ -2357,45 +4366,35 @@ export function assessCollectedEvidence(params: {
       }
 
       if (ds.kind === 'binary-cohort-table') {
-        if (
-          (ds.successOutcomeIndex !== 0 && ds.successOutcomeIndex !== 1) ||
-          !isNonNegativeSafeInteger(ds.successes) ||
-          !isNonNegativeSafeInteger(ds.failures) ||
-          ds.successes + ds.failures < 1 ||
-          !isPlainObject(ds.prior) ||
-          !isPositiveFiniteNumber(ds.prior.alpha) ||
-          !isPositiveFiniteNumber(ds.prior.beta)
-        ) {
+        if (ds.successOutcomeIndex !== 0 && ds.successOutcomeIndex !== 1) {
           throw new ForecastPipelineRequestError(
-            `submittedEvidence[${idx}] ('${evidenceId}') binary-cohort-table requires non-negative integer successes/failures with total >= 1 and positive finite prior { alpha, beta }`,
+            `submittedEvidence[${idx}] ('${evidenceId}') binary-cohort-table requires successOutcomeIndex (0 | 1)`,
           );
         }
+        const validatedPrior = validateBetaPrior(
+          ds.prior,
+          `submittedEvidence[${idx}] ('${evidenceId}')`,
+        );
+        const validatedCounts = validateBetaCountsAndPosterior(
+          validatedPrior,
+          ds.successes,
+          ds.failures,
+          `submittedEvidence[${idx}] ('${evidenceId}')`,
+        );
+        const ciLevel = validateCredibleIntervalLevel(
+          ds.credibleIntervalLevel,
+          `submittedEvidence[${idx}] ('${evidenceId}')`,
+        );
 
-        binaryTrialSuccesses = ds.successes;
-        binaryTrialFailures = ds.failures;
-        hasVerifiableEmpiricalData = true;
-        availableChannelSet.add('binary-trial-counts');
-        availableChannelSet.add('prior-hyperparameters');
-        supportedMethodSet.add('beta-binomial-conjugate');
-
-        const betaInput: BetaBinomialExecutionInput = Object.freeze({
-          methodId: 'beta-binomial-conjugate',
-          outcomeSpace,
-          successOutcomeIndex: ds.successOutcomeIndex,
-          prior: Object.freeze({ alpha: ds.prior.alpha, beta: ds.prior.beta }),
-          observed: Object.freeze({
-            successes: ds.successes,
-            failures: ds.failures,
-          }),
-          ...(ds.credibleIntervalLevel !== undefined
-            ? { credibleIntervalLevel: ds.credibleIntervalLevel }
-            : {}),
-        });
-        preparedMethodInputs.set('beta-binomial-conjugate', {
-          methodId: 'beta-binomial-conjugate',
-          executionInput: betaInput,
-          provenanceIds: Object.freeze([evidenceId]),
+        betaContributions.push({
+          sourceKind: 'structured-numerical-dataset',
+          evidenceIds: Object.freeze([evidenceId]),
           sourceUrls: Object.freeze([url]),
+          successOutcomeIndex: ds.successOutcomeIndex,
+          successes: validatedCounts.successes,
+          failures: validatedCounts.failures,
+          prior: validatedPrior,
+          ...(ciLevel !== undefined ? { credibleIntervalLevel: ciLevel } : {}),
         });
 
         const record: PipelineEvidenceProvenanceRecord = Object.freeze({
@@ -2423,7 +4422,7 @@ export function assessCollectedEvidence(params: {
           publisher,
           url,
           publishedAt,
-          retrievedAt: referenceTime,
+          retrievedAt: effectiveExecutedAt,
           sourceProvider: 'caller:structured-numerical-dataset',
           isPrimarySourceVerified: trustMetadata.isPrimarySourceVerified,
           usableForQuantitativeMethods: true,
@@ -2433,7 +4432,7 @@ export function assessCollectedEvidence(params: {
             'prior-hyperparameters',
           ] as const),
           mergedSourceCitations: Object.freeze([baseCitation]),
-          assessmentNote: `Validated structured binary cohort dataset (successes=${ds.successes}, failures=${ds.failures}; verified by '${trustMetadata.verifiedByVerifierId}': ${trustMetadata.rationale}).`,
+          assessmentNote: `Validated structured binary cohort dataset (successes=${validatedCounts.successes}, failures=${validatedCounts.failures}; verified by '${trustMetadata.verifiedByVerifierId}': ${trustMetadata.rationale}).`,
         });
         structuredNumericalDatasets.push(record);
         allProvenanceRecords.push(record);
@@ -2441,59 +4440,37 @@ export function assessCollectedEvidence(params: {
       }
 
       if (ds.kind === 'weighted-binary-cohort-table') {
-        if (
-          (ds.successOutcomeIndex !== 0 && ds.successOutcomeIndex !== 1) ||
-          typeof ds.weightedSuccessMass !== 'number' ||
-          !Number.isFinite(ds.weightedSuccessMass) ||
-          ds.weightedSuccessMass < 0 ||
-          typeof ds.weightedFailureMass !== 'number' ||
-          !Number.isFinite(ds.weightedFailureMass) ||
-          ds.weightedFailureMass < 0 ||
-          !isPositiveFiniteNumber(ds.sumSquaredWeights) ||
-          !isNonNegativeSafeInteger(ds.observationCount) ||
-          ds.observationCount < 1 ||
-          !isPlainObject(ds.prior) ||
-          !isPositiveFiniteNumber(ds.prior.alpha) ||
-          !isPositiveFiniteNumber(ds.prior.beta)
-        ) {
+        if (ds.successOutcomeIndex !== 0 && ds.successOutcomeIndex !== 1) {
           throw new ForecastPipelineRequestError(
-            `submittedEvidence[${idx}] ('${evidenceId}') weighted-binary-cohort-table has invalid weighted masses, observationCount, or prior parameters`,
+            `submittedEvidence[${idx}] ('${evidenceId}') weighted-binary-cohort-table requires successOutcomeIndex (0 | 1)`,
           );
         }
-
-        const totalW = ds.weightedSuccessMass + ds.weightedFailureMass;
-        const nEff =
-          ds.sumSquaredWeights > 0
-            ? (totalW * totalW) / ds.sumSquaredWeights
-            : 0;
-        weightedSampleSize = ds.observationCount;
-        kishEffectiveSampleSize = nEff;
-        hasVerifiableEmpiricalData = true;
-        availableChannelSet.add('weighted-binary-trials');
-        availableChannelSet.add('kish-effective-sample-size');
-        availableChannelSet.add('prior-hyperparameters');
-        supportedMethodSet.add('weighted-kish-effective-binomial');
-
-        const kishInput: WeightedKishExecutionInput = Object.freeze({
-          methodId: 'weighted-kish-effective-binomial',
-          outcomeSpace,
-          successOutcomeIndex: ds.successOutcomeIndex,
-          prior: Object.freeze({ alpha: ds.prior.alpha, beta: ds.prior.beta }),
-          observed: Object.freeze({
+        const validatedKish = validateWeightedKishPayload(
+          {
             weightedSuccessMass: ds.weightedSuccessMass,
             weightedFailureMass: ds.weightedFailureMass,
             sumSquaredWeights: ds.sumSquaredWeights,
             observationCount: ds.observationCount,
-          }),
-          ...(ds.credibleIntervalLevel !== undefined
-            ? { credibleIntervalLevel: ds.credibleIntervalLevel }
-            : {}),
-        });
-        preparedMethodInputs.set('weighted-kish-effective-binomial', {
-          methodId: 'weighted-kish-effective-binomial',
-          executionInput: kishInput,
-          provenanceIds: Object.freeze([evidenceId]),
+            prior: ds.prior,
+          },
+          `submittedEvidence[${idx}] ('${evidenceId}')`,
+        );
+        const ciLevel = validateCredibleIntervalLevel(
+          ds.credibleIntervalLevel,
+          `submittedEvidence[${idx}] ('${evidenceId}')`,
+        );
+
+        kishContributions.push({
+          sourceKind: 'structured-numerical-dataset',
+          evidenceIds: Object.freeze([evidenceId]),
           sourceUrls: Object.freeze([url]),
+          successOutcomeIndex: ds.successOutcomeIndex,
+          weightedSuccessMass: validatedKish.weightedSuccessMass,
+          weightedFailureMass: validatedKish.weightedFailureMass,
+          sumSquaredWeights: validatedKish.sumSquaredWeights,
+          observationCount: validatedKish.observationCount,
+          prior: validatedKish.prior,
+          ...(ciLevel !== undefined ? { credibleIntervalLevel: ciLevel } : {}),
         });
 
         const record: PipelineEvidenceProvenanceRecord = Object.freeze({
@@ -2521,7 +4498,7 @@ export function assessCollectedEvidence(params: {
           publisher,
           url,
           publishedAt,
-          retrievedAt: referenceTime,
+          retrievedAt: effectiveExecutedAt,
           sourceProvider: 'caller:structured-numerical-dataset',
           isPrimarySourceVerified: trustMetadata.isPrimarySourceVerified,
           usableForQuantitativeMethods: true,
@@ -2534,7 +4511,7 @@ export function assessCollectedEvidence(params: {
             'prior-hyperparameters',
           ] as const),
           mergedSourceCitations: Object.freeze([baseCitation]),
-          assessmentNote: `Validated structured weighted binary cohort dataset (n=${ds.observationCount}, n_eff=${nEff.toFixed(4)}; verified by '${trustMetadata.verifiedByVerifierId}': ${trustMetadata.rationale}).`,
+          assessmentNote: `Validated structured weighted binary cohort dataset (n=${validatedKish.observationCount}, n_eff=${validatedKish.nEff.toFixed(4)}; verified by '${trustMetadata.verifiedByVerifierId}': ${trustMetadata.rationale}).`,
         });
         structuredNumericalDatasets.push(record);
         allProvenanceRecords.push(record);
@@ -2542,59 +4519,39 @@ export function assessCollectedEvidence(params: {
       }
 
       if (ds.kind === 'poisson-exposure-table') {
-        if (
-          (ds.eventOutcomeIndex !== 0 && ds.eventOutcomeIndex !== 1) ||
-          !isNonNegativeSafeInteger(ds.eventCount) ||
-          !isPositiveFiniteNumber(ds.exposureDuration) ||
-          typeof ds.exposureUnit !== 'string' ||
-          ds.exposureUnit.trim().length === 0 ||
-          !isPositiveFiniteNumber(ds.forecastExposureDuration) ||
-          !isPlainObject(ds.prior) ||
-          !isPositiveFiniteNumber(ds.prior.shape) ||
-          !isPositiveFiniteNumber(ds.prior.rate)
-        ) {
+        if (ds.eventOutcomeIndex !== 0 && ds.eventOutcomeIndex !== 1) {
           throw new ForecastPipelineRequestError(
-            `submittedEvidence[${idx}] ('${evidenceId}') poisson-exposure-table has invalid eventCount, exposureDuration, or prior parameters`,
+            `submittedEvidence[${idx}] ('${evidenceId}') poisson-exposure-table requires eventOutcomeIndex (0 | 1)`,
           );
         }
-
-        const foreUnit = ds.forecastExposureUnit ?? ds.exposureUnit;
-        poissonEventCount = ds.eventCount;
-        poissonExposureDuration = ds.exposureDuration;
-        hasVerifiableEmpiricalData = true;
-        availableChannelSet.add('poisson-event-counts');
-        availableChannelSet.add('continuous-exposure-duration');
-        availableChannelSet.add('prior-hyperparameters');
-        supportedMethodSet.add('poisson-gamma-hazard');
-
-        const poissonInput: PoissonGammaExecutionInput = Object.freeze({
-          methodId: 'poisson-gamma-hazard',
-          outcomeSpace,
-          eventOutcomeIndex: ds.eventOutcomeIndex,
-          prior: Object.freeze({
-            shape: ds.prior.shape,
-            rate: ds.prior.rate,
-            parameterization: 'shape-rate' as const,
-          }),
-          observed: Object.freeze({
+        const validatedPoisson = validatePoissonExposuresUnitsAndPosterior(
+          {
             eventCount: ds.eventCount,
             exposureDuration: ds.exposureDuration,
             exposureUnit: ds.exposureUnit,
-          }),
-          forecast: Object.freeze({
-            exposureDuration: ds.forecastExposureDuration,
-            exposureUnit: foreUnit,
-          }),
-          exposureUnit: ds.exposureUnit,
-          ...(ds.credibleIntervalLevel !== undefined
-            ? { credibleIntervalLevel: ds.credibleIntervalLevel }
-            : {}),
-        });
-        preparedMethodInputs.set('poisson-gamma-hazard', {
-          methodId: 'poisson-gamma-hazard',
-          executionInput: poissonInput,
-          provenanceIds: Object.freeze([evidenceId]),
+            forecastExposureDuration: ds.forecastExposureDuration,
+            forecastExposureUnit: ds.forecastExposureUnit,
+            prior: ds.prior,
+          },
+          `submittedEvidence[${idx}] ('${evidenceId}')`,
+        );
+        const ciLevel = validateCredibleIntervalLevel(
+          ds.credibleIntervalLevel,
+          `submittedEvidence[${idx}] ('${evidenceId}')`,
+        );
+
+        poissonContributions.push({
+          sourceKind: 'structured-numerical-dataset',
+          evidenceIds: Object.freeze([evidenceId]),
           sourceUrls: Object.freeze([url]),
+          eventOutcomeIndex: ds.eventOutcomeIndex,
+          eventCount: validatedPoisson.eventCount,
+          exposureDuration: validatedPoisson.exposureDuration,
+          exposureUnit: validatedPoisson.exposureUnit,
+          forecastExposureDuration: validatedPoisson.forecastExposureDuration,
+          forecastExposureUnit: validatedPoisson.forecastExposureUnit,
+          prior: validatedPoisson.prior,
+          ...(ciLevel !== undefined ? { credibleIntervalLevel: ciLevel } : {}),
         });
 
         const record: PipelineEvidenceProvenanceRecord = Object.freeze({
@@ -2622,7 +4579,7 @@ export function assessCollectedEvidence(params: {
           publisher,
           url,
           publishedAt,
-          retrievedAt: referenceTime,
+          retrievedAt: effectiveExecutedAt,
           sourceProvider: 'caller:structured-numerical-dataset',
           isPrimarySourceVerified: trustMetadata.isPrimarySourceVerified,
           usableForQuantitativeMethods: true,
@@ -2633,7 +4590,7 @@ export function assessCollectedEvidence(params: {
             'prior-hyperparameters',
           ] as const),
           mergedSourceCitations: Object.freeze([baseCitation]),
-          assessmentNote: `Validated structured Poisson exposure dataset (k=${ds.eventCount}, T=${ds.exposureDuration} ${ds.exposureUnit}; verified by '${trustMetadata.verifiedByVerifierId}': ${trustMetadata.rationale}).`,
+          assessmentNote: `Validated structured Poisson exposure dataset (k=${validatedPoisson.eventCount}, T=${validatedPoisson.exposureDuration} ${validatedPoisson.exposureUnit}; verified by '${trustMetadata.verifiedByVerifierId}': ${trustMetadata.rationale}).`,
         });
         structuredNumericalDatasets.push(record);
         allProvenanceRecords.push(record);
@@ -2641,42 +4598,25 @@ export function assessCollectedEvidence(params: {
       }
 
       if (ds.kind === 'multinomial-contingency-table') {
-        if (
-          !Array.isArray(ds.counts) ||
-          ds.counts.length !== outcomeCount ||
-          !ds.counts.every((c) => isNonNegativeSafeInteger(c)) ||
-          ds.counts.reduce((a, b) => a + b, 0) < 1 ||
-          !isPlainObject(ds.prior) ||
-          !Array.isArray(ds.prior.alpha) ||
-          ds.prior.alpha.length !== outcomeCount ||
-          !ds.prior.alpha.every((a) => isPositiveFiniteNumber(a))
-        ) {
-          throw new ForecastPipelineRequestError(
-            `submittedEvidence[${idx}] ('${evidenceId}') multinomial-contingency-table requires counts and prior.alpha arrays of length ${outcomeCount}`,
-          );
-        }
-
-        multinomialOutcomeCounts = Object.freeze([...ds.counts]);
-        hasVerifiableEmpiricalData = true;
-        availableChannelSet.add('multinomial-category-counts');
-        availableChannelSet.add('prior-hyperparameters');
-        supportedMethodSet.add('dirichlet-multinomial-symmetry');
-
-        const dirichletInput: DirichletMultinomialExecutionInput =
-          Object.freeze({
-            methodId: 'dirichlet-multinomial-symmetry',
+        const validatedMultinomial =
+          validateMultinomialDimensionCountsAndPosterior(
+            ds.counts,
+            ds.prior,
             outcomeSpace,
-            prior: Object.freeze({ alpha: Object.freeze([...ds.prior.alpha]) }),
-            observed: Object.freeze({ counts: Object.freeze([...ds.counts]) }),
-            ...(ds.credibleIntervalLevel !== undefined
-              ? { credibleIntervalLevel: ds.credibleIntervalLevel }
-              : {}),
-          });
-        preparedMethodInputs.set('dirichlet-multinomial-symmetry', {
-          methodId: 'dirichlet-multinomial-symmetry',
-          executionInput: dirichletInput,
-          provenanceIds: Object.freeze([evidenceId]),
+            `submittedEvidence[${idx}] ('${evidenceId}')`,
+          );
+        const ciLevel = validateCredibleIntervalLevel(
+          ds.credibleIntervalLevel,
+          `submittedEvidence[${idx}] ('${evidenceId}')`,
+        );
+
+        dirichletContributions.push({
+          sourceKind: 'structured-numerical-dataset',
+          evidenceIds: Object.freeze([evidenceId]),
           sourceUrls: Object.freeze([url]),
+          counts: validatedMultinomial.counts,
+          priorAlpha: validatedMultinomial.prior.alpha,
+          ...(ciLevel !== undefined ? { credibleIntervalLevel: ciLevel } : {}),
         });
 
         const record: PipelineEvidenceProvenanceRecord = Object.freeze({
@@ -2704,7 +4644,7 @@ export function assessCollectedEvidence(params: {
           publisher,
           url,
           publishedAt,
-          retrievedAt: referenceTime,
+          retrievedAt: effectiveExecutedAt,
           sourceProvider: 'caller:structured-numerical-dataset',
           isPrimarySourceVerified: trustMetadata.isPrimarySourceVerified,
           usableForQuantitativeMethods: true,
@@ -2716,7 +4656,7 @@ export function assessCollectedEvidence(params: {
             'prior-hyperparameters',
           ] as const),
           mergedSourceCitations: Object.freeze([baseCitation]),
-          assessmentNote: `Validated structured multinomial contingency table ([${ds.counts.join(', ')}]; verified by '${trustMetadata.verifiedByVerifierId}': ${trustMetadata.rationale}).`,
+          assessmentNote: `Validated structured multinomial contingency table ([${validatedMultinomial.counts.join(', ')}]; verified by '${trustMetadata.verifiedByVerifierId}': ${trustMetadata.rationale}).`,
         });
         structuredNumericalDatasets.push(record);
         allProvenanceRecords.push(record);
@@ -2724,48 +4664,51 @@ export function assessCollectedEvidence(params: {
       }
 
       if (ds.kind === 'continuous-state-trajectory-table') {
-        if (
-          !isNonNegativeSafeInteger(ds.observationCount) ||
-          ds.observationCount < 1 ||
-          typeof ds.estimatedDrift !== 'number' ||
-          !Number.isFinite(ds.estimatedDrift) ||
-          !isPositiveFiniteNumber(ds.estimatedScaleOrVolatility)
-        ) {
-          throw new ForecastPipelineRequestError(
-            `submittedEvidence[${idx}] ('${evidenceId}') continuous-state-trajectory-table has invalid observationCount, estimatedDrift, or estimatedScaleOrVolatility`,
-          );
-        }
+        const validatedCont = validateContinuousTrajectoryInputs(
+          {
+            observationCount: ds.observationCount,
+            estimatedDrift: ds.estimatedDrift,
+            estimatedScaleOrVolatility: ds.estimatedScaleOrVolatility,
+            degreesOfFreedom: ds.degreesOfFreedom,
+            initialStateLevel: ds.initialStateLevel,
+          },
+          outcomeSpace,
+          null,
+          `submittedEvidence[${idx}] ('${evidenceId}')`,
+        );
 
-        continuousTrajectoryObservations = ds.observationCount;
-        estimatedDrift = ds.estimatedDrift;
-        estimatedScaleOrVolatility = ds.estimatedScaleOrVolatility;
-        hasVerifiableEmpiricalData = true;
         const channels: MethodDataChannelId[] = [
           'continuous-state-trajectory',
           'drift-and-scale-estimates',
         ];
-        const methods: ScientificMethodId[] = [];
-        availableChannelSet.add('continuous-state-trajectory');
-        availableChannelSet.add('drift-and-scale-estimates');
+        const methods: UnimplementedScientificMethodId[] = [];
 
-        if (ds.degreesOfFreedom !== undefined) {
-          degreesOfFreedom = ds.degreesOfFreedom;
-          availableChannelSet.add('tail-degrees-of-freedom');
+        if (validatedCont.degreesOfFreedom !== undefined) {
           channels.push('tail-degrees-of-freedom');
           methods.push('student-t-terminal-diffusion');
-          supportedMethodSet.add('student-t-terminal-diffusion');
         }
         if (
-          ds.initialStateLevel !== undefined &&
+          validatedCont.initialStateLevel !== undefined &&
           outcomeSpace.barrierLevel !== undefined &&
           outcomeSpace.barrierDirection !== undefined
         ) {
-          initialStateLevel = ds.initialStateLevel;
-          availableChannelSet.add('absorbing-barrier-specification');
           channels.push('absorbing-barrier-specification');
           methods.push('first-passage-barrier-diffusion');
-          supportedMethodSet.add('first-passage-barrier-diffusion');
         }
+
+        continuousContributions.push({
+          evidenceId,
+          observationCount: validatedCont.observationCount,
+          estimatedDrift: validatedCont.estimatedDrift,
+          estimatedScaleOrVolatility: validatedCont.estimatedScaleOrVolatility,
+          ...(validatedCont.degreesOfFreedom !== undefined
+            ? { degreesOfFreedom: validatedCont.degreesOfFreedom }
+            : {}),
+          ...(validatedCont.initialStateLevel !== undefined
+            ? { initialStateLevel: validatedCont.initialStateLevel }
+            : {}),
+          targetMethodIds: Object.freeze(methods),
+        });
 
         const record: PipelineEvidenceProvenanceRecord = Object.freeze({
           evidenceId,
@@ -2792,14 +4735,14 @@ export function assessCollectedEvidence(params: {
           publisher,
           url,
           publishedAt,
-          retrievedAt: referenceTime,
+          retrievedAt: effectiveExecutedAt,
           sourceProvider: 'caller:structured-numerical-dataset',
           isPrimarySourceVerified: trustMetadata.isPrimarySourceVerified,
           usableForQuantitativeMethods: true,
           supportedMethodIds: Object.freeze(methods),
           supportedDataChannels: Object.freeze(channels),
           mergedSourceCitations: Object.freeze([baseCitation]),
-          assessmentNote: `Validated continuous state trajectory dataset (n=${ds.observationCount}, drift=${ds.estimatedDrift}, scale=${ds.estimatedScaleOrVolatility}; verified by '${trustMetadata.verifiedByVerifierId}': ${trustMetadata.rationale}).`,
+          assessmentNote: `Validated continuous state trajectory dataset (n=${validatedCont.observationCount}, drift=${validatedCont.estimatedDrift}, scale=${validatedCont.estimatedScaleOrVolatility}; verified by '${trustMetadata.verifiedByVerifierId}': ${trustMetadata.rationale}).`,
         });
         structuredNumericalDatasets.push(record);
         allProvenanceRecords.push(record);
@@ -2825,48 +4768,37 @@ export function assessCollectedEvidence(params: {
 
       if (stats.targetMethodId === 'beta-binomial-conjugate') {
         if (
-          (stats.successOutcomeIndex !== 0 &&
-            stats.successOutcomeIndex !== 1) ||
-          !isNonNegativeSafeInteger(stats.successes) ||
-          !isNonNegativeSafeInteger(stats.failures) ||
-          stats.successes + stats.failures < 1 ||
-          !isPlainObject(stats.prior) ||
-          !isPositiveFiniteNumber(stats.prior.alpha) ||
-          !isPositiveFiniteNumber(stats.prior.beta)
+          stats.successOutcomeIndex !== 0 &&
+          stats.successOutcomeIndex !== 1
         ) {
           throw new ForecastPipelineRequestError(
-            `submittedEvidence[${idx}] ('${evidenceId}') beta-binomial-conjugate statistics require non-negative integer successes/failures with total >= 1 and positive finite prior { alpha, beta }`,
+            `submittedEvidence[${idx}] ('${evidenceId}') beta-binomial-conjugate statistics require successOutcomeIndex (0 | 1)`,
           );
         }
+        const validatedPrior = validateBetaPrior(
+          stats.prior,
+          `submittedEvidence[${idx}] ('${evidenceId}')`,
+        );
+        const validatedCounts = validateBetaCountsAndPosterior(
+          validatedPrior,
+          stats.successes,
+          stats.failures,
+          `submittedEvidence[${idx}] ('${evidenceId}')`,
+        );
+        const ciLevel = validateCredibleIntervalLevel(
+          stats.credibleIntervalLevel,
+          `submittedEvidence[${idx}] ('${evidenceId}')`,
+        );
 
-        binaryTrialSuccesses = stats.successes;
-        binaryTrialFailures = stats.failures;
-        hasVerifiableEmpiricalData = true;
-        availableChannelSet.add('binary-trial-counts');
-        availableChannelSet.add('prior-hyperparameters');
-        supportedMethodSet.add('beta-binomial-conjugate');
-
-        const betaInput: BetaBinomialExecutionInput = Object.freeze({
-          methodId: 'beta-binomial-conjugate',
-          outcomeSpace,
-          successOutcomeIndex: stats.successOutcomeIndex,
-          prior: Object.freeze({
-            alpha: stats.prior.alpha,
-            beta: stats.prior.beta,
-          }),
-          observed: Object.freeze({
-            successes: stats.successes,
-            failures: stats.failures,
-          }),
-          ...(stats.credibleIntervalLevel !== undefined
-            ? { credibleIntervalLevel: stats.credibleIntervalLevel }
-            : {}),
-        });
-        preparedMethodInputs.set('beta-binomial-conjugate', {
-          methodId: 'beta-binomial-conjugate',
-          executionInput: betaInput,
-          provenanceIds: Object.freeze([evidenceId]),
+        betaContributions.push({
+          sourceKind: 'statistical-sufficient-statistics',
+          evidenceIds: Object.freeze([evidenceId]),
           sourceUrls: Object.freeze([url]),
+          successOutcomeIndex: stats.successOutcomeIndex,
+          successes: validatedCounts.successes,
+          failures: validatedCounts.failures,
+          prior: validatedPrior,
+          ...(ciLevel !== undefined ? { credibleIntervalLevel: ciLevel } : {}),
         });
 
         const record: PipelineEvidenceProvenanceRecord = Object.freeze({
@@ -2894,7 +4826,7 @@ export function assessCollectedEvidence(params: {
           publisher,
           url,
           publishedAt,
-          retrievedAt: referenceTime,
+          retrievedAt: effectiveExecutedAt,
           sourceProvider: 'caller:statistical-sufficient-statistics',
           isPrimarySourceVerified: trustMetadata.isPrimarySourceVerified,
           usableForQuantitativeMethods: true,
@@ -2904,7 +4836,7 @@ export function assessCollectedEvidence(params: {
             'prior-hyperparameters',
           ] as const),
           mergedSourceCitations: Object.freeze([baseCitation]),
-          assessmentNote: `Validated Beta-Binomial sufficient statistics (successes=${stats.successes}, failures=${stats.failures}; verified by '${trustMetadata.verifiedByVerifierId}': ${trustMetadata.rationale}).`,
+          assessmentNote: `Validated Beta-Binomial sufficient statistics (successes=${validatedCounts.successes}, failures=${validatedCounts.failures}; verified by '${trustMetadata.verifiedByVerifierId}': ${trustMetadata.rationale}).`,
         });
         statisticalSufficientStatistics.push(record);
         allProvenanceRecords.push(record);
@@ -2913,62 +4845,39 @@ export function assessCollectedEvidence(params: {
 
       if (stats.targetMethodId === 'weighted-kish-effective-binomial') {
         if (
-          (stats.successOutcomeIndex !== 0 &&
-            stats.successOutcomeIndex !== 1) ||
-          typeof stats.weightedSuccessMass !== 'number' ||
-          !Number.isFinite(stats.weightedSuccessMass) ||
-          stats.weightedSuccessMass < 0 ||
-          typeof stats.weightedFailureMass !== 'number' ||
-          !Number.isFinite(stats.weightedFailureMass) ||
-          stats.weightedFailureMass < 0 ||
-          !isPositiveFiniteNumber(stats.sumSquaredWeights) ||
-          !isNonNegativeSafeInteger(stats.observationCount) ||
-          stats.observationCount < 1 ||
-          !isPlainObject(stats.prior) ||
-          !isPositiveFiniteNumber(stats.prior.alpha) ||
-          !isPositiveFiniteNumber(stats.prior.beta)
+          stats.successOutcomeIndex !== 0 &&
+          stats.successOutcomeIndex !== 1
         ) {
           throw new ForecastPipelineRequestError(
-            `submittedEvidence[${idx}] ('${evidenceId}') weighted-kish-effective-binomial statistics have invalid weighted masses, observationCount, or prior parameters`,
+            `submittedEvidence[${idx}] ('${evidenceId}') weighted-kish-effective-binomial statistics require successOutcomeIndex (0 | 1)`,
           );
         }
-
-        const totalW = stats.weightedSuccessMass + stats.weightedFailureMass;
-        const nEff =
-          stats.sumSquaredWeights > 0
-            ? (totalW * totalW) / stats.sumSquaredWeights
-            : 0;
-        weightedSampleSize = stats.observationCount;
-        kishEffectiveSampleSize = nEff;
-        hasVerifiableEmpiricalData = true;
-        availableChannelSet.add('weighted-binary-trials');
-        availableChannelSet.add('kish-effective-sample-size');
-        availableChannelSet.add('prior-hyperparameters');
-        supportedMethodSet.add('weighted-kish-effective-binomial');
-
-        const kishInput: WeightedKishExecutionInput = Object.freeze({
-          methodId: 'weighted-kish-effective-binomial',
-          outcomeSpace,
-          successOutcomeIndex: stats.successOutcomeIndex,
-          prior: Object.freeze({
-            alpha: stats.prior.alpha,
-            beta: stats.prior.beta,
-          }),
-          observed: Object.freeze({
+        const validatedKish = validateWeightedKishPayload(
+          {
             weightedSuccessMass: stats.weightedSuccessMass,
             weightedFailureMass: stats.weightedFailureMass,
             sumSquaredWeights: stats.sumSquaredWeights,
             observationCount: stats.observationCount,
-          }),
-          ...(stats.credibleIntervalLevel !== undefined
-            ? { credibleIntervalLevel: stats.credibleIntervalLevel }
-            : {}),
-        });
-        preparedMethodInputs.set('weighted-kish-effective-binomial', {
-          methodId: 'weighted-kish-effective-binomial',
-          executionInput: kishInput,
-          provenanceIds: Object.freeze([evidenceId]),
+            prior: stats.prior,
+          },
+          `submittedEvidence[${idx}] ('${evidenceId}')`,
+        );
+        const ciLevel = validateCredibleIntervalLevel(
+          stats.credibleIntervalLevel,
+          `submittedEvidence[${idx}] ('${evidenceId}')`,
+        );
+
+        kishContributions.push({
+          sourceKind: 'statistical-sufficient-statistics',
+          evidenceIds: Object.freeze([evidenceId]),
           sourceUrls: Object.freeze([url]),
+          successOutcomeIndex: stats.successOutcomeIndex,
+          weightedSuccessMass: validatedKish.weightedSuccessMass,
+          weightedFailureMass: validatedKish.weightedFailureMass,
+          sumSquaredWeights: validatedKish.sumSquaredWeights,
+          observationCount: validatedKish.observationCount,
+          prior: validatedKish.prior,
+          ...(ciLevel !== undefined ? { credibleIntervalLevel: ciLevel } : {}),
         });
 
         const record: PipelineEvidenceProvenanceRecord = Object.freeze({
@@ -2996,7 +4905,7 @@ export function assessCollectedEvidence(params: {
           publisher,
           url,
           publishedAt,
-          retrievedAt: referenceTime,
+          retrievedAt: effectiveExecutedAt,
           sourceProvider: 'caller:statistical-sufficient-statistics',
           isPrimarySourceVerified: trustMetadata.isPrimarySourceVerified,
           usableForQuantitativeMethods: true,
@@ -3009,7 +4918,7 @@ export function assessCollectedEvidence(params: {
             'prior-hyperparameters',
           ] as const),
           mergedSourceCitations: Object.freeze([baseCitation]),
-          assessmentNote: `Validated Kish weighted binomial sufficient statistics (n=${stats.observationCount}, n_eff=${nEff.toFixed(4)}; verified by '${trustMetadata.verifiedByVerifierId}': ${trustMetadata.rationale}).`,
+          assessmentNote: `Validated Kish weighted binomial sufficient statistics (n=${validatedKish.observationCount}, n_eff=${validatedKish.nEff.toFixed(4)}; verified by '${trustMetadata.verifiedByVerifierId}': ${trustMetadata.rationale}).`,
         });
         statisticalSufficientStatistics.push(record);
         allProvenanceRecords.push(record);
@@ -3017,59 +4926,39 @@ export function assessCollectedEvidence(params: {
       }
 
       if (stats.targetMethodId === 'poisson-gamma-hazard') {
-        if (
-          (stats.eventOutcomeIndex !== 0 && stats.eventOutcomeIndex !== 1) ||
-          !isNonNegativeSafeInteger(stats.eventCount) ||
-          !isPositiveFiniteNumber(stats.exposureDuration) ||
-          typeof stats.exposureUnit !== 'string' ||
-          stats.exposureUnit.trim().length === 0 ||
-          !isPositiveFiniteNumber(stats.forecastExposureDuration) ||
-          !isPlainObject(stats.prior) ||
-          !isPositiveFiniteNumber(stats.prior.shape) ||
-          !isPositiveFiniteNumber(stats.prior.rate)
-        ) {
+        if (stats.eventOutcomeIndex !== 0 && stats.eventOutcomeIndex !== 1) {
           throw new ForecastPipelineRequestError(
-            `submittedEvidence[${idx}] ('${evidenceId}') poisson-gamma-hazard statistics have invalid eventCount, exposureDuration, or prior parameters`,
+            `submittedEvidence[${idx}] ('${evidenceId}') poisson-gamma-hazard statistics require eventOutcomeIndex (0 | 1)`,
           );
         }
-
-        const foreUnit = stats.forecastExposureUnit ?? stats.exposureUnit;
-        poissonEventCount = stats.eventCount;
-        poissonExposureDuration = stats.exposureDuration;
-        hasVerifiableEmpiricalData = true;
-        availableChannelSet.add('poisson-event-counts');
-        availableChannelSet.add('continuous-exposure-duration');
-        availableChannelSet.add('prior-hyperparameters');
-        supportedMethodSet.add('poisson-gamma-hazard');
-
-        const poissonInput: PoissonGammaExecutionInput = Object.freeze({
-          methodId: 'poisson-gamma-hazard',
-          outcomeSpace,
-          eventOutcomeIndex: stats.eventOutcomeIndex,
-          prior: Object.freeze({
-            shape: stats.prior.shape,
-            rate: stats.prior.rate,
-            parameterization: 'shape-rate' as const,
-          }),
-          observed: Object.freeze({
+        const validatedPoisson = validatePoissonExposuresUnitsAndPosterior(
+          {
             eventCount: stats.eventCount,
             exposureDuration: stats.exposureDuration,
             exposureUnit: stats.exposureUnit,
-          }),
-          forecast: Object.freeze({
-            exposureDuration: stats.forecastExposureDuration,
-            exposureUnit: foreUnit,
-          }),
-          exposureUnit: stats.exposureUnit,
-          ...(stats.credibleIntervalLevel !== undefined
-            ? { credibleIntervalLevel: stats.credibleIntervalLevel }
-            : {}),
-        });
-        preparedMethodInputs.set('poisson-gamma-hazard', {
-          methodId: 'poisson-gamma-hazard',
-          executionInput: poissonInput,
-          provenanceIds: Object.freeze([evidenceId]),
+            forecastExposureDuration: stats.forecastExposureDuration,
+            forecastExposureUnit: stats.forecastExposureUnit,
+            prior: stats.prior,
+          },
+          `submittedEvidence[${idx}] ('${evidenceId}')`,
+        );
+        const ciLevel = validateCredibleIntervalLevel(
+          stats.credibleIntervalLevel,
+          `submittedEvidence[${idx}] ('${evidenceId}')`,
+        );
+
+        poissonContributions.push({
+          sourceKind: 'statistical-sufficient-statistics',
+          evidenceIds: Object.freeze([evidenceId]),
           sourceUrls: Object.freeze([url]),
+          eventOutcomeIndex: stats.eventOutcomeIndex,
+          eventCount: validatedPoisson.eventCount,
+          exposureDuration: validatedPoisson.exposureDuration,
+          exposureUnit: validatedPoisson.exposureUnit,
+          forecastExposureDuration: validatedPoisson.forecastExposureDuration,
+          forecastExposureUnit: validatedPoisson.forecastExposureUnit,
+          prior: validatedPoisson.prior,
+          ...(ciLevel !== undefined ? { credibleIntervalLevel: ciLevel } : {}),
         });
 
         const record: PipelineEvidenceProvenanceRecord = Object.freeze({
@@ -3097,7 +4986,7 @@ export function assessCollectedEvidence(params: {
           publisher,
           url,
           publishedAt,
-          retrievedAt: referenceTime,
+          retrievedAt: effectiveExecutedAt,
           sourceProvider: 'caller:statistical-sufficient-statistics',
           isPrimarySourceVerified: trustMetadata.isPrimarySourceVerified,
           usableForQuantitativeMethods: true,
@@ -3108,7 +4997,7 @@ export function assessCollectedEvidence(params: {
             'prior-hyperparameters',
           ] as const),
           mergedSourceCitations: Object.freeze([baseCitation]),
-          assessmentNote: `Validated Poisson-Gamma sufficient statistics (k=${stats.eventCount}, T=${stats.exposureDuration} ${stats.exposureUnit}; verified by '${trustMetadata.verifiedByVerifierId}': ${trustMetadata.rationale}).`,
+          assessmentNote: `Validated Poisson-Gamma sufficient statistics (k=${validatedPoisson.eventCount}, T=${validatedPoisson.exposureDuration} ${validatedPoisson.exposureUnit}; verified by '${trustMetadata.verifiedByVerifierId}': ${trustMetadata.rationale}).`,
         });
         statisticalSufficientStatistics.push(record);
         allProvenanceRecords.push(record);
@@ -3116,46 +5005,25 @@ export function assessCollectedEvidence(params: {
       }
 
       if (stats.targetMethodId === 'dirichlet-multinomial-symmetry') {
-        if (
-          !Array.isArray(stats.counts) ||
-          stats.counts.length !== outcomeCount ||
-          !stats.counts.every((c) => isNonNegativeSafeInteger(c)) ||
-          stats.counts.reduce((a, b) => a + b, 0) < 1 ||
-          !isPlainObject(stats.prior) ||
-          !Array.isArray(stats.prior.alpha) ||
-          stats.prior.alpha.length !== outcomeCount ||
-          !stats.prior.alpha.every((a) => isPositiveFiniteNumber(a))
-        ) {
-          throw new ForecastPipelineRequestError(
-            `submittedEvidence[${idx}] ('${evidenceId}') dirichlet-multinomial-symmetry statistics require counts and prior.alpha arrays of length ${outcomeCount}`,
-          );
-        }
-
-        multinomialOutcomeCounts = Object.freeze([...stats.counts]);
-        hasVerifiableEmpiricalData = true;
-        availableChannelSet.add('multinomial-category-counts');
-        availableChannelSet.add('prior-hyperparameters');
-        supportedMethodSet.add('dirichlet-multinomial-symmetry');
-
-        const dirichletInput: DirichletMultinomialExecutionInput =
-          Object.freeze({
-            methodId: 'dirichlet-multinomial-symmetry',
+        const validatedMultinomial =
+          validateMultinomialDimensionCountsAndPosterior(
+            stats.counts,
+            stats.prior,
             outcomeSpace,
-            prior: Object.freeze({
-              alpha: Object.freeze([...stats.prior.alpha]),
-            }),
-            observed: Object.freeze({
-              counts: Object.freeze([...stats.counts]),
-            }),
-            ...(stats.credibleIntervalLevel !== undefined
-              ? { credibleIntervalLevel: stats.credibleIntervalLevel }
-              : {}),
-          });
-        preparedMethodInputs.set('dirichlet-multinomial-symmetry', {
-          methodId: 'dirichlet-multinomial-symmetry',
-          executionInput: dirichletInput,
-          provenanceIds: Object.freeze([evidenceId]),
+            `submittedEvidence[${idx}] ('${evidenceId}')`,
+          );
+        const ciLevel = validateCredibleIntervalLevel(
+          stats.credibleIntervalLevel,
+          `submittedEvidence[${idx}] ('${evidenceId}')`,
+        );
+
+        dirichletContributions.push({
+          sourceKind: 'statistical-sufficient-statistics',
+          evidenceIds: Object.freeze([evidenceId]),
           sourceUrls: Object.freeze([url]),
+          counts: validatedMultinomial.counts,
+          priorAlpha: validatedMultinomial.prior.alpha,
+          ...(ciLevel !== undefined ? { credibleIntervalLevel: ciLevel } : {}),
         });
 
         const record: PipelineEvidenceProvenanceRecord = Object.freeze({
@@ -3183,7 +5051,7 @@ export function assessCollectedEvidence(params: {
           publisher,
           url,
           publishedAt,
-          retrievedAt: referenceTime,
+          retrievedAt: effectiveExecutedAt,
           sourceProvider: 'caller:statistical-sufficient-statistics',
           isPrimarySourceVerified: trustMetadata.isPrimarySourceVerified,
           usableForQuantitativeMethods: true,
@@ -3195,7 +5063,7 @@ export function assessCollectedEvidence(params: {
             'prior-hyperparameters',
           ] as const),
           mergedSourceCitations: Object.freeze([baseCitation]),
-          assessmentNote: `Validated Dirichlet-Multinomial sufficient statistics ([${stats.counts.join(', ')}]; verified by '${trustMetadata.verifiedByVerifierId}': ${trustMetadata.rationale}).`,
+          assessmentNote: `Validated Dirichlet-Multinomial sufficient statistics ([${validatedMultinomial.counts.join(', ')}]; verified by '${trustMetadata.verifiedByVerifierId}': ${trustMetadata.rationale}).`,
         });
         statisticalSufficientStatistics.push(record);
         allProvenanceRecords.push(record);
@@ -3206,34 +5074,48 @@ export function assessCollectedEvidence(params: {
         stats.targetMethodId === 'student-t-terminal-diffusion' ||
         stats.targetMethodId === 'first-passage-barrier-diffusion'
       ) {
-        continuousTrajectoryObservations =
-          stats.continuousTrajectoryObservations;
-        estimatedDrift = stats.estimatedDrift;
-        estimatedScaleOrVolatility = stats.estimatedScaleOrVolatility;
-        hasVerifiableEmpiricalData = true;
+        const validatedCont = validateContinuousTrajectoryInputs(
+          {
+            observationCount: stats.continuousTrajectoryObservations,
+            estimatedDrift: stats.estimatedDrift,
+            estimatedScaleOrVolatility: stats.estimatedScaleOrVolatility,
+            degreesOfFreedom: stats.degreesOfFreedom,
+            initialStateLevel: stats.initialStateLevel,
+          },
+          outcomeSpace,
+          stats.targetMethodId,
+          `submittedEvidence[${idx}] ('${evidenceId}')`,
+        );
+
         const channels: MethodDataChannelId[] = [
           'continuous-state-trajectory',
           'drift-and-scale-estimates',
         ];
-        availableChannelSet.add('continuous-state-trajectory');
-        availableChannelSet.add('drift-and-scale-estimates');
 
-        if (stats.degreesOfFreedom !== undefined) {
-          degreesOfFreedom = stats.degreesOfFreedom;
-          availableChannelSet.add('tail-degrees-of-freedom');
+        if (validatedCont.degreesOfFreedom !== undefined) {
           channels.push('tail-degrees-of-freedom');
         }
-        if (stats.initialStateLevel !== undefined) {
-          initialStateLevel = stats.initialStateLevel;
-          if (
-            outcomeSpace.barrierLevel !== undefined &&
-            outcomeSpace.barrierDirection !== undefined
-          ) {
-            availableChannelSet.add('absorbing-barrier-specification');
-            channels.push('absorbing-barrier-specification');
-          }
+        if (
+          validatedCont.initialStateLevel !== undefined &&
+          outcomeSpace.barrierLevel !== undefined &&
+          outcomeSpace.barrierDirection !== undefined
+        ) {
+          channels.push('absorbing-barrier-specification');
         }
-        supportedMethodSet.add(stats.targetMethodId);
+
+        continuousContributions.push({
+          evidenceId,
+          observationCount: validatedCont.observationCount,
+          estimatedDrift: validatedCont.estimatedDrift,
+          estimatedScaleOrVolatility: validatedCont.estimatedScaleOrVolatility,
+          ...(validatedCont.degreesOfFreedom !== undefined
+            ? { degreesOfFreedom: validatedCont.degreesOfFreedom }
+            : {}),
+          ...(validatedCont.initialStateLevel !== undefined
+            ? { initialStateLevel: validatedCont.initialStateLevel }
+            : {}),
+          targetMethodIds: Object.freeze([stats.targetMethodId]),
+        });
 
         const record: PipelineEvidenceProvenanceRecord = Object.freeze({
           evidenceId,
@@ -3260,14 +5142,14 @@ export function assessCollectedEvidence(params: {
           publisher,
           url,
           publishedAt,
-          retrievedAt: referenceTime,
+          retrievedAt: effectiveExecutedAt,
           sourceProvider: 'caller:statistical-sufficient-statistics',
           isPrimarySourceVerified: trustMetadata.isPrimarySourceVerified,
           usableForQuantitativeMethods: true,
           supportedMethodIds: Object.freeze([stats.targetMethodId]),
           supportedDataChannels: Object.freeze(channels),
           mergedSourceCitations: Object.freeze([baseCitation]),
-          assessmentNote: `Validated continuous diffusion/barrier sufficient statistics for '${stats.targetMethodId}' (n=${stats.continuousTrajectoryObservations}; verified by '${trustMetadata.verifiedByVerifierId}': ${trustMetadata.rationale}).`,
+          assessmentNote: `Validated continuous diffusion/barrier sufficient statistics for '${stats.targetMethodId}' (n=${validatedCont.observationCount}; verified by '${trustMetadata.verifiedByVerifierId}': ${trustMetadata.rationale}).`,
         });
         statisticalSufficientStatistics.push(record);
         allProvenanceRecords.push(record);
@@ -3284,6 +5166,9 @@ export function assessCollectedEvidence(params: {
      Phase 2A: Global Deduplication Resolution for `binary-trials`
      ----------------------------------------------------------------------- */
   if (pendingBinarySubmissions.length > 0) {
+    const anyWeightedEnabledGlobal = pendingBinarySubmissions.some(
+      (s) => s.enableWeightedKishChannel,
+    );
     const resolvedBinaryEvents = new Map<
       string,
       {
@@ -3310,7 +5195,19 @@ export function assessCollectedEvidence(params: {
         entry.reports.map((r) => r.realizedOutcomeIndex),
       );
 
-      if (outcomeIndices.size > 1) {
+      const reportWeights = entry.reports
+        .map((r) => r.weight)
+        .filter((w): w is number => w !== undefined);
+      const hasConflictingWeights =
+        reportWeights.length > 0 &&
+        (reportWeights.some((w) => Math.abs(w - reportWeights[0]!) > 1e-12) ||
+          reportWeights.length < entry.reports.length);
+
+      if (outcomeIndices.size > 1 || hasConflictingWeights) {
+        const conflictReason =
+          outcomeIndices.size > 1
+            ? `${entry.reports.length} conflicting outcome reports`
+            : `conflicting observation weights [${reportWeights.join(', ')}]`;
         const diag: DeduplicatedEventObservationDiagnostic = Object.freeze({
           evidenceId: contributingIds[0]!,
           contributingEvidenceIds: Object.freeze(contributingIds),
@@ -3322,7 +5219,7 @@ export function assessCollectedEvidence(params: {
           deduplicatedCount: 0,
           status: 'quarantined-conflicting-outcomes',
           reportingSources: Object.freeze(citations),
-          explanation: `Event '${entry.eventId}' (family '${entry.eventFamily}') had ${entry.reports.length} conflicting outcome reports across submission(s) [${contributingIds.join(', ')}] and was quarantined globally.`,
+          explanation: `Event '${entry.eventId}' (family '${entry.eventFamily}') had ${conflictReason} across submission(s) [${contributingIds.join(', ')}] and was quarantined globally.`,
         });
         deduplicatedEventDiagnostics.push(diag);
         assessmentNotes.push(diag.explanation);
@@ -3352,13 +5249,11 @@ export function assessCollectedEvidence(params: {
       }
 
       const realizedOutcomeIndex = [...outcomeIndices][0]!;
-      const firstWeighted = entry.reports.find((r) => r.weight !== undefined);
+      const consensusWeight = reportWeights[0];
       resolvedBinaryEvents.set(canonicalKey, {
         status: 'deduplicated-consistent',
         realizedOutcomeIndex,
-        ...(firstWeighted?.weight !== undefined
-          ? { weight: firstWeighted.weight }
-          : {}),
+        ...(consensusWeight !== undefined ? { weight: consensusWeight } : {}),
         contributingEvidenceIds: Object.freeze(contributingIds),
         citations: Object.freeze(citations),
       });
@@ -3374,12 +5269,17 @@ export function assessCollectedEvidence(params: {
       referenceSub.successOutcomeIndex === 0
         ? referenceSub.prior.beta
         : referenceSub.prior.alpha;
+    const refCi =
+      referenceSub.credibleIntervalLevel ?? DEFAULT_CREDIBLE_INTERVAL_LEVEL;
+
     for (let i = 1; i < pendingBinarySubmissions.length; i++) {
       const other = pendingBinarySubmissions[i]!;
       const otherOutcome0Alpha =
         other.successOutcomeIndex === 0 ? other.prior.alpha : other.prior.beta;
       const otherOutcome1Beta =
         other.successOutcomeIndex === 0 ? other.prior.beta : other.prior.alpha;
+      const otherCi =
+        other.credibleIntervalLevel ?? DEFAULT_CREDIBLE_INTERVAL_LEVEL;
       if (
         Math.abs(otherOutcome0Alpha - refOutcome0Alpha) > 1e-12 ||
         Math.abs(otherOutcome1Beta - refOutcome1Beta) > 1e-12
@@ -3388,7 +5288,13 @@ export function assessCollectedEvidence(params: {
           `Conflicting binary-trials prior hyperparameters across submissions '${referenceSub.evidenceId}' and '${other.evidenceId}'`,
         );
       }
+      if (Math.abs(otherCi - refCi) > 1e-12) {
+        throw new ForecastPipelineRequestError(
+          `Conflicting binary-trials credibleIntervalLevel across submissions '${referenceSub.evidenceId}' (${refCi}) and '${other.evidenceId}' (${otherCi})`,
+        );
+      }
     }
+
     let globalSuccesses = 0;
     let globalFailures = 0;
     const globalWeights: number[] = [];
@@ -3396,7 +5302,6 @@ export function assessCollectedEvidence(params: {
     const allBinaryCitations: EvidenceSourceCitation[] = [];
     const seenGlobalUrls = new Set<string>();
     const activeBinarySubmissionIds: string[] = [];
-    let anyWeightedEnabled = false;
 
     for (const [, resolved] of resolvedBinaryEvents.entries()) {
       if (resolved.status !== 'deduplicated-consistent') {
@@ -3424,14 +5329,11 @@ export function assessCollectedEvidence(params: {
 
     const totalGlobalTrials = globalSuccesses + globalFailures;
     const canRunGlobalKish =
-      pendingBinarySubmissions.some((s) => s.enableWeightedKishChannel) &&
+      anyWeightedEnabledGlobal &&
       globalWeights.length === totalGlobalTrials &&
       totalGlobalTrials >= 2;
 
     for (const sub of pendingBinarySubmissions) {
-      if (sub.enableWeightedKishChannel) {
-        anyWeightedEnabled = true;
-      }
       const subCitations: EvidenceSourceCitation[] = [sub.baseCitation];
       const seenSubUrls = new Set<string>([sub.baseCitation.url]);
       let subConsistentCount = 0;
@@ -3475,7 +5377,7 @@ export function assessCollectedEvidence(params: {
           publisher: sub.publisher,
           url: sub.url,
           publishedAt: sub.publishedAt,
-          retrievedAt: referenceTime,
+          retrievedAt: effectiveExecutedAt,
           sourceProvider: 'caller:historical-observations',
           isPrimarySourceVerified: false,
           usableForQuantitativeMethods: false,
@@ -3531,7 +5433,7 @@ export function assessCollectedEvidence(params: {
         publisher: sub.publisher,
         url: sub.url,
         publishedAt: sub.publishedAt,
-        retrievedAt: referenceTime,
+        retrievedAt: effectiveExecutedAt,
         sourceProvider: 'caller:historical-observations',
         isPrimarySourceVerified: sub.trust.isPrimarySourceVerified,
         usableForQuantitativeMethods: true,
@@ -3545,74 +5447,68 @@ export function assessCollectedEvidence(params: {
     }
 
     if (totalGlobalTrials > 0 && activeBinarySubmissionIds.length > 0) {
-      binaryTrialSuccesses = globalSuccesses;
-      binaryTrialFailures = globalFailures;
-      hasVerifiableEmpiricalData = true;
-      availableChannelSet.add('binary-trial-counts');
-      availableChannelSet.add('prior-hyperparameters');
-      supportedMethodSet.add('beta-binomial-conjugate');
+      validateBetaCountsAndPosterior(
+        referenceSub.prior,
+        globalSuccesses,
+        globalFailures,
+        `global binary-trials pool [${activeBinarySubmissionIds.join(', ')}]`,
+      );
 
-      const betaInput: BetaBinomialExecutionInput = Object.freeze({
-        methodId: 'beta-binomial-conjugate',
-        outcomeSpace,
+      const poolUrls = Object.freeze(allBinaryCitations.map((c) => c.url));
+      const poolIds = Object.freeze([...activeBinarySubmissionIds]);
+      betaContributions.push({
+        sourceKind: 'historical-observations-pool',
+        evidenceIds: poolIds,
+        sourceUrls: poolUrls,
         successOutcomeIndex: targetSuccessOutcomeIndex,
+        successes: globalSuccesses,
+        failures: globalFailures,
         prior: referenceSub.prior,
-        observed: Object.freeze({
-          successes: globalSuccesses,
-          failures: globalFailures,
-        }),
         ...(referenceSub.credibleIntervalLevel !== undefined
           ? { credibleIntervalLevel: referenceSub.credibleIntervalLevel }
           : {}),
       });
-      preparedMethodInputs.set('beta-binomial-conjugate', {
-        methodId: 'beta-binomial-conjugate',
-        executionInput: betaInput,
-        provenanceIds: Object.freeze(activeBinarySubmissionIds),
-        sourceUrls: Object.freeze(allBinaryCitations.map((c) => c.url)),
-      });
 
-      if (anyWeightedEnabled && canRunGlobalKish) {
-        let wSucc = 0;
-        let wFail = 0;
-        let sumSq = 0;
+      if (canRunGlobalKish) {
+        const succWeights: number[] = [];
+        const failWeights: number[] = [];
+        const sqWeights: number[] = [];
         for (let i = 0; i < totalGlobalTrials; i++) {
           const wi = globalWeights[i]!;
           if (globalOutcomes01[i] === 1) {
-            wSucc += wi;
+            succWeights.push(wi);
           } else {
-            wFail += wi;
+            failWeights.push(wi);
           }
-          sumSq += wi * wi;
+          sqWeights.push(wi * wi);
         }
-        const totalW = wSucc + wFail;
-        const nEff = sumSq > 0 ? (totalW * totalW) / sumSq : 0;
-        weightedSampleSize = totalGlobalTrials;
-        kishEffectiveSampleSize = nEff;
-        availableChannelSet.add('weighted-binary-trials');
-        availableChannelSet.add('kish-effective-sample-size');
-        supportedMethodSet.add('weighted-kish-effective-binomial');
-
-        const kishInput: WeightedKishExecutionInput = Object.freeze({
-          methodId: 'weighted-kish-effective-binomial',
-          outcomeSpace,
-          successOutcomeIndex: targetSuccessOutcomeIndex,
-          prior: referenceSub.prior,
-          observed: Object.freeze({
+        const wSucc = kahanNeumaierSum(succWeights);
+        const wFail = kahanNeumaierSum(failWeights);
+        const sumSq = kahanNeumaierSum(sqWeights);
+        const validatedKishPool = validateWeightedKishPayload(
+          {
             weightedSuccessMass: wSucc,
             weightedFailureMass: wFail,
             sumSquaredWeights: sumSq,
             observationCount: totalGlobalTrials,
-          }),
+            prior: referenceSub.prior,
+          },
+          `global weighted binary-trials pool [${activeBinarySubmissionIds.join(', ')}]`,
+        );
+
+        kishContributions.push({
+          sourceKind: 'historical-observations-pool',
+          evidenceIds: poolIds,
+          sourceUrls: poolUrls,
+          successOutcomeIndex: targetSuccessOutcomeIndex,
+          weightedSuccessMass: validatedKishPool.weightedSuccessMass,
+          weightedFailureMass: validatedKishPool.weightedFailureMass,
+          sumSquaredWeights: validatedKishPool.sumSquaredWeights,
+          observationCount: validatedKishPool.observationCount,
+          prior: validatedKishPool.prior,
           ...(referenceSub.credibleIntervalLevel !== undefined
             ? { credibleIntervalLevel: referenceSub.credibleIntervalLevel }
             : {}),
-        });
-        preparedMethodInputs.set('weighted-kish-effective-binomial', {
-          methodId: 'weighted-kish-effective-binomial',
-          executionInput: kishInput,
-          provenanceIds: Object.freeze(activeBinarySubmissionIds),
-          sourceUrls: Object.freeze(allBinaryCitations.map((c) => c.url)),
         });
       }
     }
@@ -3695,6 +5591,48 @@ export function assessCollectedEvidence(params: {
     }
 
     const referenceSub = pendingPoissonSubmissions[0]!;
+    const refCi =
+      referenceSub.credibleIntervalLevel ?? DEFAULT_CREDIBLE_INTERVAL_LEVEL;
+    for (let i = 1; i < pendingPoissonSubmissions.length; i++) {
+      const other = pendingPoissonSubmissions[i]!;
+      const otherCi =
+        other.credibleIntervalLevel ?? DEFAULT_CREDIBLE_INTERVAL_LEVEL;
+      if (other.eventOutcomeIndex !== referenceSub.eventOutcomeIndex) {
+        throw new ForecastPipelineRequestError(
+          `Conflicting poisson-arrivals eventOutcomeIndex across submissions '${referenceSub.evidenceId}' (${referenceSub.eventOutcomeIndex}) and '${other.evidenceId}' (${other.eventOutcomeIndex})`,
+        );
+      }
+      if (other.historicalExposureUnit !== referenceSub.historicalExposureUnit) {
+        throw new ForecastPipelineRequestError(
+          `Conflicting poisson-arrivals historicalExposure.exposureUnit across submissions '${referenceSub.evidenceId}' ('${referenceSub.historicalExposureUnit}') and '${other.evidenceId}' ('${other.historicalExposureUnit}')`,
+        );
+      }
+      if (
+        other.forecastExposureUnit !== referenceSub.forecastExposureUnit ||
+        Math.abs(
+          other.forecastExposureDuration -
+            referenceSub.forecastExposureDuration,
+        ) > 1e-12
+      ) {
+        throw new ForecastPipelineRequestError(
+          `Conflicting poisson-arrivals forecastExposure across submissions '${referenceSub.evidenceId}' and '${other.evidenceId}'`,
+        );
+      }
+      if (
+        Math.abs(other.prior.shape - referenceSub.prior.shape) > 1e-12 ||
+        Math.abs(other.prior.rate - referenceSub.prior.rate) > 1e-12
+      ) {
+        throw new ForecastPipelineRequestError(
+          `Conflicting poisson-arrivals prior hyperparameters across submissions '${referenceSub.evidenceId}' and '${other.evidenceId}'`,
+        );
+      }
+      if (Math.abs(otherCi - refCi) > 1e-12) {
+        throw new ForecastPipelineRequestError(
+          `Conflicting poisson-arrivals credibleIntervalLevel across submissions '${referenceSub.evidenceId}' (${refCi}) and '${other.evidenceId}' (${otherCi})`,
+        );
+      }
+    }
+
     let globalArrivalCount = 0;
     const allPoissonCitations: EvidenceSourceCitation[] = [];
     const seenGlobalUrls = new Set<string>();
@@ -3731,7 +5669,6 @@ export function assessCollectedEvidence(params: {
         }
       }
 
-      // If a submission had raw events but 0 survived strict validation/conflict check:
       const subConsistentCount = sub.canonicalEventKeys.filter(
         (k) => resolvedPoissonEvents.get(k)?.status === 'deduplicated-consistent',
       ).length;
@@ -3758,7 +5695,7 @@ export function assessCollectedEvidence(params: {
           publisher: sub.publisher,
           url: sub.url,
           publishedAt: sub.publishedAt,
-          retrievedAt: referenceTime,
+          retrievedAt: effectiveExecutedAt,
           sourceProvider: 'caller:historical-observations',
           isPrimarySourceVerified: false,
           usableForQuantitativeMethods: false,
@@ -3774,12 +5711,25 @@ export function assessCollectedEvidence(params: {
       }
 
       activePoissonSubmissionIds.push(sub.evidenceId);
-      if (!exposureDurationByWindowId.has(sub.exposureWindowId)) {
+      const existingWindowDuration = exposureDurationByWindowId.get(
+        sub.exposureWindowId,
+      );
+      if (existingWindowDuration !== undefined) {
+        if (
+          Math.abs(existingWindowDuration - sub.historicalExposureDuration) >
+          1e-12
+        ) {
+          throw new ForecastPipelineRequestError(
+            `Conflicting historicalExposure.exposureDuration values (${existingWindowDuration} vs ${sub.historicalExposureDuration}) reported for Poisson exposureWindowId '${sub.hasExplicitWindowId ? sub.exposureWindowId : 'default'}' across submissions`,
+          );
+        }
+      } else {
         exposureDurationByWindowId.set(
           sub.exposureWindowId,
           sub.historicalExposureDuration,
         );
       }
+
       if (!seenGlobalUrls.has(sub.baseCitation.url)) {
         seenGlobalUrls.add(sub.baseCitation.url);
         allPoissonCitations.unshift(sub.baseCitation);
@@ -3807,7 +5757,7 @@ export function assessCollectedEvidence(params: {
         publisher: sub.publisher,
         url: sub.url,
         publishedAt: sub.publishedAt,
-        retrievedAt: referenceTime,
+        retrievedAt: effectiveExecutedAt,
         sourceProvider: 'caller:historical-observations',
         isPrimarySourceVerified: sub.trust.isPrimarySourceVerified,
         usableForQuantitativeMethods: true,
@@ -3825,47 +5775,91 @@ export function assessCollectedEvidence(params: {
     }
 
     if (activePoissonSubmissionIds.length > 0) {
-      let totalExposureDuration = 0;
-      for (const dur of exposureDurationByWindowId.values()) {
-        totalExposureDuration += dur;
-      }
-      poissonEventCount = globalArrivalCount;
-      poissonExposureDuration = totalExposureDuration;
-      hasVerifiableEmpiricalData = true;
-      availableChannelSet.add('poisson-event-counts');
-      availableChannelSet.add('continuous-exposure-duration');
-      availableChannelSet.add('prior-hyperparameters');
-      supportedMethodSet.add('poisson-gamma-hazard');
+      const poolUrls = allPoissonCitations.map((c) => c.url);
+      let preVerifiedCombination:
+        | PoissonMethodContribution['preVerifiedCombination']
+        | undefined;
+      let poolAllowed = true;
 
-      const poissonInput: PoissonGammaExecutionInput = Object.freeze({
-        methodId: 'poisson-gamma-hazard',
-        outcomeSpace,
-        eventOutcomeIndex: referenceSub.eventOutcomeIndex,
-        prior: Object.freeze({
-          shape: referenceSub.prior.shape,
-          rate: referenceSub.prior.rate,
-          parameterization: 'shape-rate' as const,
-        }),
-        observed: Object.freeze({
-          eventCount: globalArrivalCount,
-          exposureDuration: totalExposureDuration,
-          exposureUnit: referenceSub.historicalExposureUnit,
-        }),
-        forecast: Object.freeze({
-          exposureDuration: referenceSub.forecastExposureDuration,
-          exposureUnit: referenceSub.forecastExposureUnit,
-        }),
-        exposureUnit: referenceSub.historicalExposureUnit,
-        ...(referenceSub.credibleIntervalLevel !== undefined
-          ? { credibleIntervalLevel: referenceSub.credibleIntervalLevel }
-          : {}),
-      });
-      preparedMethodInputs.set('poisson-gamma-hazard', {
-        methodId: 'poisson-gamma-hazard',
-        executionInput: poissonInput,
-        provenanceIds: Object.freeze(activePoissonSubmissionIds),
-        sourceUrls: Object.freeze(allPoissonCitations.map((c) => c.url)),
-      });
+      if (exposureDurationByWindowId.size > 1) {
+        const contributingSubs = activePoissonSubmissionIds
+          .map((id) => verifiedSubmissionById.get(id))
+          .filter((s): s is PipelineEvidenceSubmission => s !== undefined);
+        const gate = evaluateMultiSourceCombinationGate({
+          methodId: 'poisson-gamma-hazard',
+          expectedBasis: 'disjoint-poisson-exposure-windows',
+          allContributingIds: activePoissonSubmissionIds,
+          allContributingUrls: poolUrls,
+          contributingSubmissions: contributingSubs,
+          outcomeSpace,
+          referenceTime,
+          ...(multiSourceCombinationJustifications !== undefined
+            ? { justifications: multiSourceCombinationJustifications }
+            : {}),
+          ...(combinationVerifier !== undefined ? { combinationVerifier } : {}),
+        });
+        if (!gate.approved) {
+          poolAllowed = false;
+          rejectedMultiSourceCombinations.push(gate.rejection);
+          assessmentNotes.push(gate.rejection.explanation);
+          rejectedCombinationMessageByMethod.set(
+            'poisson-gamma-hazard',
+            gate.rejection.explanation,
+          );
+        } else {
+          preVerifiedCombination = {
+            justification: gate.justification,
+            verifiedByVerifierId: gate.verifiedByVerifierId,
+            verificationArtifactRef: gate.verificationArtifactRef,
+            verifierRationale: gate.verifierRationale,
+          };
+        }
+      }
+
+      if (poolAllowed) {
+        const totalExposureDuration = kahanNeumaierSum([
+          ...exposureDurationByWindowId.values(),
+        ]);
+        const validatedPoolPoisson = validatePoissonExposuresUnitsAndPosterior(
+          {
+            eventCount: globalArrivalCount,
+            exposureDuration: totalExposureDuration,
+            exposureUnit: referenceSub.historicalExposureUnit,
+            forecastExposureDuration: referenceSub.forecastExposureDuration,
+            forecastExposureUnit: referenceSub.forecastExposureUnit,
+            prior: referenceSub.prior,
+          },
+          `global poisson-arrivals pool [${activePoissonSubmissionIds.join(', ')}]`,
+        );
+
+        poissonContributions.push({
+          sourceKind: 'historical-observations-pool',
+          evidenceIds: Object.freeze([...activePoissonSubmissionIds]),
+          sourceUrls: Object.freeze(poolUrls),
+          eventOutcomeIndex: referenceSub.eventOutcomeIndex,
+          eventCount: validatedPoolPoisson.eventCount,
+          exposureDuration: validatedPoolPoisson.exposureDuration,
+          exposureUnit: validatedPoolPoisson.exposureUnit,
+          forecastExposureDuration: validatedPoolPoisson.forecastExposureDuration,
+          forecastExposureUnit: validatedPoolPoisson.forecastExposureUnit,
+          prior: validatedPoolPoisson.prior,
+          ...(referenceSub.credibleIntervalLevel !== undefined
+            ? { credibleIntervalLevel: referenceSub.credibleIntervalLevel }
+            : {}),
+          ...(preVerifiedCombination !== undefined
+            ? { preVerifiedCombination }
+            : {}),
+        });
+
+        if (
+          activePoissonSubmissionIds.length > 1 &&
+          preVerifiedCombination !== undefined
+        ) {
+          assessmentNotes.push(
+            `Pooled ${activePoissonSubmissionIds.length} disjoint Poisson exposure windows [${[...exposureDurationByWindowId.keys()].join(', ')}] into total exposure ${totalExposureDuration} ${validatedPoolPoisson.exposureUnit} (verified by '${preVerifiedCombination.verifiedByVerifierId}').`,
+          );
+        }
+      }
     }
   }
 
@@ -3948,6 +5942,29 @@ export function assessCollectedEvidence(params: {
     }
 
     const referenceSub = pendingMultinomialSubmissions[0]!;
+    const refCi =
+      referenceSub.credibleIntervalLevel ?? DEFAULT_CREDIBLE_INTERVAL_LEVEL;
+    for (let i = 1; i < pendingMultinomialSubmissions.length; i++) {
+      const other = pendingMultinomialSubmissions[i]!;
+      const otherCi =
+        other.credibleIntervalLevel ?? DEFAULT_CREDIBLE_INTERVAL_LEVEL;
+      if (
+        other.priorAlpha.length !== referenceSub.priorAlpha.length ||
+        other.priorAlpha.some(
+          (a, k) => Math.abs(a - referenceSub.priorAlpha[k]!) > 1e-12,
+        )
+      ) {
+        throw new ForecastPipelineRequestError(
+          `Conflicting multinomial-trials Dirichlet prior hyperparameters across submissions '${referenceSub.evidenceId}' and '${other.evidenceId}'`,
+        );
+      }
+      if (Math.abs(otherCi - refCi) > 1e-12) {
+        throw new ForecastPipelineRequestError(
+          `Conflicting multinomial-trials credibleIntervalLevel across submissions '${referenceSub.evidenceId}' (${refCi}) and '${other.evidenceId}' (${otherCi})`,
+        );
+      }
+    }
+
     const globalCounts = new Array<number>(outcomeCount).fill(0);
     const allMultinomialCitations: EvidenceSourceCitation[] = [];
     const seenGlobalUrls = new Set<string>();
@@ -3970,7 +5987,7 @@ export function assessCollectedEvidence(params: {
       }
     }
 
-    const totalGlobalMultinomial = globalCounts.reduce((a, b) => a + b, 0);
+    const totalGlobalMultinomial = kahanNeumaierSum(globalCounts);
 
     for (const sub of pendingMultinomialSubmissions) {
       const subCitations: EvidenceSourceCitation[] = [sub.baseCitation];
@@ -4016,7 +6033,7 @@ export function assessCollectedEvidence(params: {
           publisher: sub.publisher,
           url: sub.url,
           publishedAt: sub.publishedAt,
-          retrievedAt: referenceTime,
+          retrievedAt: effectiveExecutedAt,
           sourceProvider: 'caller:historical-observations',
           isPrimarySourceVerified: false,
           usableForQuantitativeMethods: false,
@@ -4059,7 +6076,7 @@ export function assessCollectedEvidence(params: {
         publisher: sub.publisher,
         url: sub.url,
         publishedAt: sub.publishedAt,
-        retrievedAt: referenceTime,
+        retrievedAt: effectiveExecutedAt,
         sourceProvider: 'caller:historical-observations',
         isPrimarySourceVerified: sub.trust.isPrimarySourceVerified,
         usableForQuantitativeMethods: true,
@@ -4078,8 +6095,647 @@ export function assessCollectedEvidence(params: {
     }
 
     if (totalGlobalMultinomial > 0 && activeMultinomialSubmissionIds.length > 0) {
-      multinomialOutcomeCounts = Object.freeze([...globalCounts]);
-      hasVerifiableEmpiricalData = true;
+      const validatedPoolMultinomial =
+        validateMultinomialDimensionCountsAndPosterior(
+          globalCounts,
+          { alpha: referenceSub.priorAlpha },
+          outcomeSpace,
+          `global multinomial-trials pool [${activeMultinomialSubmissionIds.join(', ')}]`,
+        );
+
+      dirichletContributions.push({
+        sourceKind: 'historical-observations-pool',
+        evidenceIds: Object.freeze([...activeMultinomialSubmissionIds]),
+        sourceUrls: Object.freeze(allMultinomialCitations.map((c) => c.url)),
+        counts: validatedPoolMultinomial.counts,
+        priorAlpha: validatedPoolMultinomial.prior.alpha,
+        ...(referenceSub.credibleIntervalLevel !== undefined
+          ? { credibleIntervalLevel: referenceSub.credibleIntervalLevel }
+          : {}),
+      });
+    }
+  }
+
+  /* -----------------------------------------------------------------------
+     Phase 3: Non-Overwriting Multi-Source Resolution per Method
+     (Fail-closed server-side combination verification)
+     ----------------------------------------------------------------------- */
+  if (betaContributions.length > 0) {
+    const firstBeta = betaContributions[0]!;
+    if (betaContributions.length === 1) {
+      binaryTrialSuccesses = firstBeta.successes;
+      binaryTrialFailures = firstBeta.failures;
+      availableChannelSet.add('binary-trial-counts');
+      availableChannelSet.add('prior-hyperparameters');
+      supportedMethodSet.add('beta-binomial-conjugate');
+
+      const betaInput: BetaBinomialExecutionInput = Object.freeze({
+        methodId: 'beta-binomial-conjugate',
+        outcomeSpace,
+        successOutcomeIndex: firstBeta.successOutcomeIndex,
+        prior: firstBeta.prior,
+        observed: Object.freeze({
+          successes: firstBeta.successes,
+          failures: firstBeta.failures,
+        }),
+        ...(firstBeta.credibleIntervalLevel !== undefined
+          ? { credibleIntervalLevel: firstBeta.credibleIntervalLevel }
+          : {}),
+      });
+      preparedMethodInputs.set('beta-binomial-conjugate', {
+        methodId: 'beta-binomial-conjugate',
+        executionInput: betaInput,
+        provenanceIds: firstBeta.evidenceIds,
+        sourceUrls: firstBeta.sourceUrls,
+      });
+
+      if (firstBeta.evidenceIds.length > 1) {
+        const rationale = `Collapsed ${firstBeta.evidenceIds.length} parallel binary-trials observation feeds via pipeline-wide canonical event deduplication without double-counting.`;
+        const diag: MultiSourceCombinationDiagnostic = Object.freeze({
+          methodId: 'beta-binomial-conjugate',
+          combinationMode: 'global-event-deduplication',
+          combinationBasis: 'event-level-global-deduplication',
+          contributingEvidenceIds: firstBeta.evidenceIds,
+          contributingSourceUrls: firstBeta.sourceUrls,
+          dependencePreserved: true,
+          verifiedByVerifierId: null,
+          verificationArtifactRef: null,
+          mathematicalRationale: rationale,
+          dependenceNote: `Merged ${firstBeta.evidenceIds.length} binary-trials observation feeds via pipeline-wide canonical event deduplication; overlapping event reports were collapsed without double-counting.`,
+        });
+        multiSourceCombinations.push(diag);
+        assessmentNotes.push(diag.dependenceNote);
+      }
+    } else {
+      const allIds: string[] = [];
+      const allUrls: string[] = [];
+      const seenUrl = new Set<string>();
+      for (const c of betaContributions) {
+        for (const id of c.evidenceIds) {
+          allIds.push(id);
+        }
+        for (const u of c.sourceUrls) {
+          if (!seenUrl.has(u)) {
+            seenUrl.add(u);
+            allUrls.push(u);
+          }
+        }
+      }
+      const contributingSubs = allIds
+        .map((id) => verifiedSubmissionById.get(id))
+        .filter((s): s is PipelineEvidenceSubmission => s !== undefined);
+
+      const gate = evaluateMultiSourceCombinationGate({
+        methodId: 'beta-binomial-conjugate',
+        expectedBasis: 'disjoint-exchangeable-cohorts',
+        allContributingIds: allIds,
+        allContributingUrls: allUrls,
+        contributingSubmissions: contributingSubs,
+        outcomeSpace,
+        referenceTime,
+        ...(multiSourceCombinationJustifications !== undefined
+          ? { justifications: multiSourceCombinationJustifications }
+          : {}),
+        ...(combinationVerifier !== undefined ? { combinationVerifier } : {}),
+      });
+
+      if (!gate.approved) {
+        rejectedMultiSourceCombinations.push(gate.rejection);
+        assessmentNotes.push(gate.rejection.explanation);
+        rejectedCombinationMessageByMethod.set(
+          'beta-binomial-conjugate',
+          gate.rejection.explanation,
+        );
+      } else {
+        const refAlpha0 =
+          firstBeta.successOutcomeIndex === 0
+            ? firstBeta.prior.alpha
+            : firstBeta.prior.beta;
+        const refBeta1 =
+          firstBeta.successOutcomeIndex === 0
+            ? firstBeta.prior.beta
+            : firstBeta.prior.alpha;
+        const refCi =
+          firstBeta.credibleIntervalLevel ?? DEFAULT_CREDIBLE_INTERVAL_LEVEL;
+
+        const succ0List: number[] = [];
+        const fail1List: number[] = [];
+        for (const c of betaContributions) {
+          const alpha0 =
+            c.successOutcomeIndex === 0 ? c.prior.alpha : c.prior.beta;
+          const beta1 =
+            c.successOutcomeIndex === 0 ? c.prior.beta : c.prior.alpha;
+          const ci =
+            c.credibleIntervalLevel ?? DEFAULT_CREDIBLE_INTERVAL_LEVEL;
+          if (
+            Math.abs(alpha0 - refAlpha0) > 1e-12 ||
+            Math.abs(beta1 - refBeta1) > 1e-12
+          ) {
+            throw new ForecastPipelineRequestError(
+              `Cannot combine multiple 'beta-binomial-conjugate' submissions [${allIds.join(', ')}] with incompatible Beta priors`,
+            );
+          }
+          if (Math.abs(ci - refCi) > 1e-12) {
+            throw new ForecastPipelineRequestError(
+              `Cannot combine multiple 'beta-binomial-conjugate' submissions [${allIds.join(', ')}] with conflicting credibleIntervalLevel (${refCi} vs ${ci})`,
+            );
+          }
+          succ0List.push(
+            c.successOutcomeIndex === 0 ? c.successes : c.failures,
+          );
+          fail1List.push(
+            c.successOutcomeIndex === 0 ? c.failures : c.successes,
+          );
+        }
+
+        const combinedSucc0 = kahanNeumaierSum(succ0List);
+        const combinedFail1 = kahanNeumaierSum(fail1List);
+        const canonicalPrior = Object.freeze({
+          alpha: refAlpha0,
+          beta: refBeta1,
+        });
+        validateBetaCountsAndPosterior(
+          canonicalPrior,
+          combinedSucc0,
+          combinedFail1,
+          `combined beta-binomial-conjugate submissions [${allIds.join(', ')}]`,
+        );
+
+        binaryTrialSuccesses = combinedSucc0;
+        binaryTrialFailures = combinedFail1;
+        availableChannelSet.add('binary-trial-counts');
+        availableChannelSet.add('prior-hyperparameters');
+        supportedMethodSet.add('beta-binomial-conjugate');
+
+        const betaInput: BetaBinomialExecutionInput = Object.freeze({
+          methodId: 'beta-binomial-conjugate',
+          outcomeSpace,
+          successOutcomeIndex: 0,
+          prior: canonicalPrior,
+          observed: Object.freeze({
+            successes: combinedSucc0,
+            failures: combinedFail1,
+          }),
+          ...(firstBeta.credibleIntervalLevel !== undefined
+            ? { credibleIntervalLevel: refCi }
+            : {}),
+        });
+        preparedMethodInputs.set('beta-binomial-conjugate', {
+          methodId: 'beta-binomial-conjugate',
+          executionInput: betaInput,
+          provenanceIds: Object.freeze(allIds),
+          sourceUrls: Object.freeze(allUrls),
+        });
+
+        const diag: MultiSourceCombinationDiagnostic = Object.freeze({
+          methodId: 'beta-binomial-conjugate',
+          combinationMode: 'mathematically-justified-disjoint-combination',
+          combinationBasis: gate.justification.basis,
+          contributingEvidenceIds: Object.freeze(allIds),
+          contributingSourceUrls: Object.freeze(allUrls),
+          dependencePreserved: true,
+          verifiedByVerifierId: gate.verifiedByVerifierId,
+          verificationArtifactRef: gate.verificationArtifactRef,
+          mathematicalRationale: gate.justification.mathematicalRationale,
+          dependenceNote: `Combined ${allIds.length} verified sources for 'beta-binomial-conjugate' under justified basis '${gate.justification.basis}' (total outcomes: [${combinedSucc0}, ${combinedFail1}]; verified by '${gate.verifiedByVerifierId}': ${gate.verifierRationale}). All source provenance IDs and URLs preserved.`,
+        });
+        multiSourceCombinations.push(diag);
+        assessmentNotes.push(diag.dependenceNote);
+      }
+    }
+  }
+
+  if (kishContributions.length > 0) {
+    const firstKish = kishContributions[0]!;
+    if (kishContributions.length === 1) {
+      const validatedSingle = validateWeightedKishPayload(
+        {
+          weightedSuccessMass: firstKish.weightedSuccessMass,
+          weightedFailureMass: firstKish.weightedFailureMass,
+          sumSquaredWeights: firstKish.sumSquaredWeights,
+          observationCount: firstKish.observationCount,
+          prior: firstKish.prior,
+        },
+        `weighted-kish-effective-binomial [${firstKish.evidenceIds.join(', ')}]`,
+      );
+      weightedSampleSize = validatedSingle.observationCount;
+      kishEffectiveSampleSize = validatedSingle.nEff;
+      availableChannelSet.add('weighted-binary-trials');
+      availableChannelSet.add('kish-effective-sample-size');
+      availableChannelSet.add('prior-hyperparameters');
+      supportedMethodSet.add('weighted-kish-effective-binomial');
+
+      const kishInput: WeightedKishExecutionInput = Object.freeze({
+        methodId: 'weighted-kish-effective-binomial',
+        outcomeSpace,
+        successOutcomeIndex: firstKish.successOutcomeIndex,
+        prior: firstKish.prior,
+        observed: Object.freeze({
+          weightedSuccessMass: firstKish.weightedSuccessMass,
+          weightedFailureMass: firstKish.weightedFailureMass,
+          sumSquaredWeights: firstKish.sumSquaredWeights,
+          observationCount: firstKish.observationCount,
+        }),
+        ...(firstKish.credibleIntervalLevel !== undefined
+          ? { credibleIntervalLevel: firstKish.credibleIntervalLevel }
+          : {}),
+      });
+      preparedMethodInputs.set('weighted-kish-effective-binomial', {
+        methodId: 'weighted-kish-effective-binomial',
+        executionInput: kishInput,
+        provenanceIds: firstKish.evidenceIds,
+        sourceUrls: firstKish.sourceUrls,
+      });
+
+      if (firstKish.evidenceIds.length > 1) {
+        const rationale = `Collapsed ${firstKish.evidenceIds.length} weighted binary-trials feeds via canonical event deduplication prior to Kish effective sample size computation.`;
+        const diag: MultiSourceCombinationDiagnostic = Object.freeze({
+          methodId: 'weighted-kish-effective-binomial',
+          combinationMode: 'global-event-deduplication',
+          combinationBasis: 'event-level-global-deduplication',
+          contributingEvidenceIds: firstKish.evidenceIds,
+          contributingSourceUrls: firstKish.sourceUrls,
+          dependencePreserved: true,
+          verifiedByVerifierId: null,
+          verificationArtifactRef: null,
+          mathematicalRationale: rationale,
+          dependenceNote: `Merged ${firstKish.evidenceIds.length} weighted binary-trials feeds via canonical event deduplication before computing Kish effective sample size (n=${validatedSingle.observationCount}, n_eff=${validatedSingle.nEff.toFixed(4)}).`,
+        });
+        multiSourceCombinations.push(diag);
+        assessmentNotes.push(diag.dependenceNote);
+      }
+    } else {
+      const allIds: string[] = [];
+      const allUrls: string[] = [];
+      const seenUrl = new Set<string>();
+      for (const c of kishContributions) {
+        for (const id of c.evidenceIds) {
+          allIds.push(id);
+        }
+        for (const u of c.sourceUrls) {
+          if (!seenUrl.has(u)) {
+            seenUrl.add(u);
+            allUrls.push(u);
+          }
+        }
+      }
+      const contributingSubs = allIds
+        .map((id) => verifiedSubmissionById.get(id))
+        .filter((s): s is PipelineEvidenceSubmission => s !== undefined);
+
+      const gate = evaluateMultiSourceCombinationGate({
+        methodId: 'weighted-kish-effective-binomial',
+        expectedBasis: 'disjoint-exogenous-weighted-cohorts',
+        allContributingIds: allIds,
+        allContributingUrls: allUrls,
+        contributingSubmissions: contributingSubs,
+        outcomeSpace,
+        referenceTime,
+        ...(multiSourceCombinationJustifications !== undefined
+          ? { justifications: multiSourceCombinationJustifications }
+          : {}),
+        ...(combinationVerifier !== undefined ? { combinationVerifier } : {}),
+      });
+
+      if (!gate.approved) {
+        rejectedMultiSourceCombinations.push(gate.rejection);
+        assessmentNotes.push(gate.rejection.explanation);
+        rejectedCombinationMessageByMethod.set(
+          'weighted-kish-effective-binomial',
+          gate.rejection.explanation,
+        );
+      } else {
+        const refAlpha0 =
+          firstKish.successOutcomeIndex === 0
+            ? firstKish.prior.alpha
+            : firstKish.prior.beta;
+        const refBeta1 =
+          firstKish.successOutcomeIndex === 0
+            ? firstKish.prior.beta
+            : firstKish.prior.alpha;
+        const refCi =
+          firstKish.credibleIntervalLevel ?? DEFAULT_CREDIBLE_INTERVAL_LEVEL;
+
+        const w0List: number[] = [];
+        const w1List: number[] = [];
+        const sumSqList: number[] = [];
+        const obsCountList: number[] = [];
+        for (const c of kishContributions) {
+          const alpha0 =
+            c.successOutcomeIndex === 0 ? c.prior.alpha : c.prior.beta;
+          const beta1 =
+            c.successOutcomeIndex === 0 ? c.prior.beta : c.prior.alpha;
+          const ci =
+            c.credibleIntervalLevel ?? DEFAULT_CREDIBLE_INTERVAL_LEVEL;
+          if (
+            Math.abs(alpha0 - refAlpha0) > 1e-12 ||
+            Math.abs(beta1 - refBeta1) > 1e-12
+          ) {
+            throw new ForecastPipelineRequestError(
+              `Cannot combine multiple 'weighted-kish-effective-binomial' submissions [${allIds.join(', ')}] with incompatible Beta priors`,
+            );
+          }
+          if (Math.abs(ci - refCi) > 1e-12) {
+            throw new ForecastPipelineRequestError(
+              `Cannot combine multiple 'weighted-kish-effective-binomial' submissions [${allIds.join(', ')}] with conflicting credibleIntervalLevel (${refCi} vs ${ci})`,
+            );
+          }
+          w0List.push(
+            c.successOutcomeIndex === 0
+              ? c.weightedSuccessMass
+              : c.weightedFailureMass,
+          );
+          w1List.push(
+            c.successOutcomeIndex === 0
+              ? c.weightedFailureMass
+              : c.weightedSuccessMass,
+          );
+          sumSqList.push(c.sumSquaredWeights);
+          obsCountList.push(c.observationCount);
+        }
+
+        const canonicalPrior = Object.freeze({
+          alpha: refAlpha0,
+          beta: refBeta1,
+        });
+        const combinedKish = validateWeightedKishPayload(
+          {
+            weightedSuccessMass: kahanNeumaierSum(w0List),
+            weightedFailureMass: kahanNeumaierSum(w1List),
+            sumSquaredWeights: kahanNeumaierSum(sumSqList),
+            observationCount: kahanNeumaierSum(obsCountList),
+            prior: canonicalPrior,
+          },
+          `combined weighted-kish-effective-binomial submissions [${allIds.join(', ')}]`,
+        );
+
+        weightedSampleSize = combinedKish.observationCount;
+        kishEffectiveSampleSize = combinedKish.nEff;
+        availableChannelSet.add('weighted-binary-trials');
+        availableChannelSet.add('kish-effective-sample-size');
+        availableChannelSet.add('prior-hyperparameters');
+        supportedMethodSet.add('weighted-kish-effective-binomial');
+
+        const kishInput: WeightedKishExecutionInput = Object.freeze({
+          methodId: 'weighted-kish-effective-binomial',
+          outcomeSpace,
+          successOutcomeIndex: 0,
+          prior: canonicalPrior,
+          observed: Object.freeze({
+            weightedSuccessMass: combinedKish.weightedSuccessMass,
+            weightedFailureMass: combinedKish.weightedFailureMass,
+            sumSquaredWeights: combinedKish.sumSquaredWeights,
+            observationCount: combinedKish.observationCount,
+          }),
+          ...(firstKish.credibleIntervalLevel !== undefined
+            ? { credibleIntervalLevel: refCi }
+            : {}),
+        });
+        preparedMethodInputs.set('weighted-kish-effective-binomial', {
+          methodId: 'weighted-kish-effective-binomial',
+          executionInput: kishInput,
+          provenanceIds: Object.freeze(allIds),
+          sourceUrls: Object.freeze(allUrls),
+        });
+
+        const diag: MultiSourceCombinationDiagnostic = Object.freeze({
+          methodId: 'weighted-kish-effective-binomial',
+          combinationMode: 'mathematically-justified-disjoint-combination',
+          combinationBasis: gate.justification.basis,
+          contributingEvidenceIds: Object.freeze(allIds),
+          contributingSourceUrls: Object.freeze(allUrls),
+          dependencePreserved: true,
+          verifiedByVerifierId: gate.verifiedByVerifierId,
+          verificationArtifactRef: gate.verificationArtifactRef,
+          mathematicalRationale: gate.justification.mathematicalRationale,
+          dependenceNote: `Combined ${allIds.length} weighted binomial sources under justified basis '${gate.justification.basis}' (n=${combinedKish.observationCount}, n_eff=${combinedKish.nEff.toFixed(4)}; verified by '${gate.verifiedByVerifierId}': ${gate.verifierRationale}). All source provenance IDs and URLs preserved.`,
+        });
+        multiSourceCombinations.push(diag);
+        assessmentNotes.push(diag.dependenceNote);
+      }
+    }
+  }
+
+  if (poissonContributions.length > 0) {
+    const firstPoisson = poissonContributions[0]!;
+    if (poissonContributions.length === 1) {
+      poissonEventCount = firstPoisson.eventCount;
+      poissonExposureDuration = firstPoisson.exposureDuration;
+      availableChannelSet.add('poisson-event-counts');
+      availableChannelSet.add('continuous-exposure-duration');
+      availableChannelSet.add('prior-hyperparameters');
+      supportedMethodSet.add('poisson-gamma-hazard');
+
+      const poissonInput: PoissonGammaExecutionInput = Object.freeze({
+        methodId: 'poisson-gamma-hazard',
+        outcomeSpace,
+        eventOutcomeIndex: firstPoisson.eventOutcomeIndex,
+        prior: Object.freeze({
+          shape: firstPoisson.prior.shape,
+          rate: firstPoisson.prior.rate,
+          parameterization: 'shape-rate' as const,
+        }),
+        observed: Object.freeze({
+          eventCount: firstPoisson.eventCount,
+          exposureDuration: firstPoisson.exposureDuration,
+          exposureUnit: firstPoisson.exposureUnit,
+        }),
+        forecast: Object.freeze({
+          exposureDuration: firstPoisson.forecastExposureDuration,
+          exposureUnit: firstPoisson.forecastExposureUnit,
+        }),
+        exposureUnit: firstPoisson.exposureUnit,
+        ...(firstPoisson.credibleIntervalLevel !== undefined
+          ? { credibleIntervalLevel: firstPoisson.credibleIntervalLevel }
+          : {}),
+      });
+      preparedMethodInputs.set('poisson-gamma-hazard', {
+        methodId: 'poisson-gamma-hazard',
+        executionInput: poissonInput,
+        provenanceIds: firstPoisson.evidenceIds,
+        sourceUrls: firstPoisson.sourceUrls,
+      });
+
+      if (firstPoisson.evidenceIds.length > 1) {
+        const preVerified = firstPoisson.preVerifiedCombination;
+        const diag: MultiSourceCombinationDiagnostic = Object.freeze({
+          methodId: 'poisson-gamma-hazard',
+          combinationMode:
+            preVerified !== undefined
+              ? 'mathematically-justified-disjoint-combination'
+              : 'global-event-deduplication',
+          combinationBasis:
+            preVerified !== undefined
+              ? preVerified.justification.basis
+              : 'event-level-global-deduplication',
+          contributingEvidenceIds: firstPoisson.evidenceIds,
+          contributingSourceUrls: firstPoisson.sourceUrls,
+          dependencePreserved: true,
+          verifiedByVerifierId: preVerified?.verifiedByVerifierId ?? null,
+          verificationArtifactRef: preVerified?.verificationArtifactRef ?? null,
+          mathematicalRationale:
+            preVerified !== undefined
+              ? preVerified.justification.mathematicalRationale
+              : `Collapsed ${firstPoisson.evidenceIds.length} Poisson arrival feeds sharing exposure window '${firstPoisson.exposureDuration} ${firstPoisson.exposureUnit}' via canonical event deduplication.`,
+          dependenceNote: `Aggregated ${firstPoisson.evidenceIds.length} Poisson arrival feeds (k=${firstPoisson.eventCount}, T=${firstPoisson.exposureDuration} ${firstPoisson.exposureUnit}${preVerified ? `; verified by '${preVerified.verifiedByVerifierId}'` : ''}) without overwriting provenance.`,
+        });
+        multiSourceCombinations.push(diag);
+        assessmentNotes.push(diag.dependenceNote);
+      }
+    } else {
+      const allIds: string[] = [];
+      const allUrls: string[] = [];
+      const seenUrl = new Set<string>();
+      for (const c of poissonContributions) {
+        for (const id of c.evidenceIds) {
+          allIds.push(id);
+        }
+        for (const u of c.sourceUrls) {
+          if (!seenUrl.has(u)) {
+            seenUrl.add(u);
+            allUrls.push(u);
+          }
+        }
+      }
+      const contributingSubs = allIds
+        .map((id) => verifiedSubmissionById.get(id))
+        .filter((s): s is PipelineEvidenceSubmission => s !== undefined);
+
+      const gate = evaluateMultiSourceCombinationGate({
+        methodId: 'poisson-gamma-hazard',
+        expectedBasis: 'disjoint-poisson-exposure-windows',
+        allContributingIds: allIds,
+        allContributingUrls: allUrls,
+        contributingSubmissions: contributingSubs,
+        outcomeSpace,
+        referenceTime,
+        ...(multiSourceCombinationJustifications !== undefined
+          ? { justifications: multiSourceCombinationJustifications }
+          : {}),
+        ...(combinationVerifier !== undefined ? { combinationVerifier } : {}),
+      });
+
+      if (!gate.approved) {
+        rejectedMultiSourceCombinations.push(gate.rejection);
+        assessmentNotes.push(gate.rejection.explanation);
+        rejectedCombinationMessageByMethod.set(
+          'poisson-gamma-hazard',
+          gate.rejection.explanation,
+        );
+      } else {
+        const refCi =
+          firstPoisson.credibleIntervalLevel ??
+          DEFAULT_CREDIBLE_INTERVAL_LEVEL;
+        const eventCounts: number[] = [];
+        const exposureDurations: number[] = [];
+        for (const c of poissonContributions) {
+          const ci =
+            c.credibleIntervalLevel ?? DEFAULT_CREDIBLE_INTERVAL_LEVEL;
+          if (c.eventOutcomeIndex !== firstPoisson.eventOutcomeIndex) {
+            throw new ForecastPipelineRequestError(
+              `Cannot combine multiple 'poisson-gamma-hazard' submissions [${allIds.join(', ')}] with conflicting eventOutcomeIndex`,
+            );
+          }
+          if (
+            c.exposureUnit !== firstPoisson.exposureUnit ||
+            c.forecastExposureUnit !== firstPoisson.forecastExposureUnit ||
+            Math.abs(
+              c.forecastExposureDuration -
+                firstPoisson.forecastExposureDuration,
+            ) > 1e-12
+          ) {
+            throw new ForecastPipelineRequestError(
+              `Cannot combine multiple 'poisson-gamma-hazard' submissions [${allIds.join(', ')}] with incompatible exposure units or forecast exposure horizons`,
+            );
+          }
+          if (
+            Math.abs(c.prior.shape - firstPoisson.prior.shape) > 1e-12 ||
+            Math.abs(c.prior.rate - firstPoisson.prior.rate) > 1e-12
+          ) {
+            throw new ForecastPipelineRequestError(
+              `Cannot combine multiple 'poisson-gamma-hazard' submissions [${allIds.join(', ')}] with incompatible Gamma priors`,
+            );
+          }
+          if (Math.abs(ci - refCi) > 1e-12) {
+            throw new ForecastPipelineRequestError(
+              `Cannot combine multiple 'poisson-gamma-hazard' submissions [${allIds.join(', ')}] with conflicting credibleIntervalLevel`,
+            );
+          }
+          eventCounts.push(c.eventCount);
+          exposureDurations.push(c.exposureDuration);
+        }
+
+        const combinedPoisson = validatePoissonExposuresUnitsAndPosterior(
+          {
+            eventCount: kahanNeumaierSum(eventCounts),
+            exposureDuration: kahanNeumaierSum(exposureDurations),
+            exposureUnit: firstPoisson.exposureUnit,
+            forecastExposureDuration: firstPoisson.forecastExposureDuration,
+            forecastExposureUnit: firstPoisson.forecastExposureUnit,
+            prior: firstPoisson.prior,
+          },
+          `combined poisson-gamma-hazard submissions [${allIds.join(', ')}]`,
+        );
+
+        poissonEventCount = combinedPoisson.eventCount;
+        poissonExposureDuration = combinedPoisson.exposureDuration;
+        availableChannelSet.add('poisson-event-counts');
+        availableChannelSet.add('continuous-exposure-duration');
+        availableChannelSet.add('prior-hyperparameters');
+        supportedMethodSet.add('poisson-gamma-hazard');
+
+        const poissonInput: PoissonGammaExecutionInput = Object.freeze({
+          methodId: 'poisson-gamma-hazard',
+          outcomeSpace,
+          eventOutcomeIndex: firstPoisson.eventOutcomeIndex,
+          prior: Object.freeze({
+            shape: firstPoisson.prior.shape,
+            rate: firstPoisson.prior.rate,
+            parameterization: 'shape-rate' as const,
+          }),
+          observed: Object.freeze({
+            eventCount: combinedPoisson.eventCount,
+            exposureDuration: combinedPoisson.exposureDuration,
+            exposureUnit: combinedPoisson.exposureUnit,
+          }),
+          forecast: Object.freeze({
+            exposureDuration: combinedPoisson.forecastExposureDuration,
+            exposureUnit: combinedPoisson.forecastExposureUnit,
+          }),
+          exposureUnit: combinedPoisson.exposureUnit,
+          ...(firstPoisson.credibleIntervalLevel !== undefined
+            ? { credibleIntervalLevel: refCi }
+            : {}),
+        });
+        preparedMethodInputs.set('poisson-gamma-hazard', {
+          methodId: 'poisson-gamma-hazard',
+          executionInput: poissonInput,
+          provenanceIds: Object.freeze(allIds),
+          sourceUrls: Object.freeze(allUrls),
+        });
+
+        const diag: MultiSourceCombinationDiagnostic = Object.freeze({
+          methodId: 'poisson-gamma-hazard',
+          combinationMode: 'mathematically-justified-disjoint-combination',
+          combinationBasis: gate.justification.basis,
+          contributingEvidenceIds: Object.freeze(allIds),
+          contributingSourceUrls: Object.freeze(allUrls),
+          dependencePreserved: true,
+          verifiedByVerifierId: gate.verifiedByVerifierId,
+          verificationArtifactRef: gate.verificationArtifactRef,
+          mathematicalRationale: gate.justification.mathematicalRationale,
+          dependenceNote: `Combined ${allIds.length} verified Poisson exposure sources under justified basis '${gate.justification.basis}' (k=${combinedPoisson.eventCount}, T=${combinedPoisson.exposureDuration} ${combinedPoisson.exposureUnit}; verified by '${gate.verifiedByVerifierId}': ${gate.verifierRationale}). All source provenance IDs and URLs preserved.`,
+        });
+        multiSourceCombinations.push(diag);
+        assessmentNotes.push(diag.dependenceNote);
+      }
+    }
+  }
+
+  if (dirichletContributions.length > 0) {
+    const firstDirichlet = dirichletContributions[0]!;
+    if (dirichletContributions.length === 1) {
+      multinomialOutcomeCounts = firstDirichlet.counts;
       availableChannelSet.add('multinomial-category-counts');
       availableChannelSet.add('prior-hyperparameters');
       supportedMethodSet.add('dirichlet-multinomial-symmetry');
@@ -4087,64 +6743,341 @@ export function assessCollectedEvidence(params: {
       const dirichletInput: DirichletMultinomialExecutionInput = Object.freeze({
         methodId: 'dirichlet-multinomial-symmetry',
         outcomeSpace,
-        prior: Object.freeze({
-          alpha: Object.freeze([...referenceSub.priorAlpha]),
-        }),
-        observed: Object.freeze({
-          counts: Object.freeze([...globalCounts]),
-        }),
-        ...(referenceSub.credibleIntervalLevel !== undefined
-          ? { credibleIntervalLevel: referenceSub.credibleIntervalLevel }
+        prior: Object.freeze({ alpha: firstDirichlet.priorAlpha }),
+        observed: Object.freeze({ counts: firstDirichlet.counts }),
+        ...(firstDirichlet.credibleIntervalLevel !== undefined
+          ? { credibleIntervalLevel: firstDirichlet.credibleIntervalLevel }
           : {}),
       });
       preparedMethodInputs.set('dirichlet-multinomial-symmetry', {
         methodId: 'dirichlet-multinomial-symmetry',
         executionInput: dirichletInput,
-        provenanceIds: Object.freeze(activeMultinomialSubmissionIds),
-        sourceUrls: Object.freeze(allMultinomialCitations.map((c) => c.url)),
+        provenanceIds: firstDirichlet.evidenceIds,
+        sourceUrls: firstDirichlet.sourceUrls,
       });
+
+      if (firstDirichlet.evidenceIds.length > 1) {
+        const rationale = `Collapsed ${firstDirichlet.evidenceIds.length} multinomial-trials observation feeds via pipeline-wide canonical event deduplication.`;
+        const diag: MultiSourceCombinationDiagnostic = Object.freeze({
+          methodId: 'dirichlet-multinomial-symmetry',
+          combinationMode: 'global-event-deduplication',
+          combinationBasis: 'event-level-global-deduplication',
+          contributingEvidenceIds: firstDirichlet.evidenceIds,
+          contributingSourceUrls: firstDirichlet.sourceUrls,
+          dependencePreserved: true,
+          verifiedByVerifierId: null,
+          verificationArtifactRef: null,
+          mathematicalRationale: rationale,
+          dependenceNote: `Merged ${firstDirichlet.evidenceIds.length} multinomial-trials observation feeds via global canonical event deduplication ([${firstDirichlet.counts.join(', ')}]).`,
+        });
+        multiSourceCombinations.push(diag);
+        assessmentNotes.push(diag.dependenceNote);
+      }
+    } else {
+      const allIds: string[] = [];
+      const allUrls: string[] = [];
+      const seenUrl = new Set<string>();
+      for (const c of dirichletContributions) {
+        for (const id of c.evidenceIds) {
+          allIds.push(id);
+        }
+        for (const u of c.sourceUrls) {
+          if (!seenUrl.has(u)) {
+            seenUrl.add(u);
+            allUrls.push(u);
+          }
+        }
+      }
+      const contributingSubs = allIds
+        .map((id) => verifiedSubmissionById.get(id))
+        .filter((s): s is PipelineEvidenceSubmission => s !== undefined);
+
+      const gate = evaluateMultiSourceCombinationGate({
+        methodId: 'dirichlet-multinomial-symmetry',
+        expectedBasis: 'disjoint-exchangeable-cohorts',
+        allContributingIds: allIds,
+        allContributingUrls: allUrls,
+        contributingSubmissions: contributingSubs,
+        outcomeSpace,
+        referenceTime,
+        ...(multiSourceCombinationJustifications !== undefined
+          ? { justifications: multiSourceCombinationJustifications }
+          : {}),
+        ...(combinationVerifier !== undefined ? { combinationVerifier } : {}),
+      });
+
+      if (!gate.approved) {
+        rejectedMultiSourceCombinations.push(gate.rejection);
+        assessmentNotes.push(gate.rejection.explanation);
+        rejectedCombinationMessageByMethod.set(
+          'dirichlet-multinomial-symmetry',
+          gate.rejection.explanation,
+        );
+      } else {
+        const refCi =
+          firstDirichlet.credibleIntervalLevel ??
+          DEFAULT_CREDIBLE_INTERVAL_LEVEL;
+        for (const c of dirichletContributions) {
+          const ci =
+            c.credibleIntervalLevel ?? DEFAULT_CREDIBLE_INTERVAL_LEVEL;
+          if (
+            c.priorAlpha.length !== firstDirichlet.priorAlpha.length ||
+            c.priorAlpha.some(
+              (a, k) => Math.abs(a - firstDirichlet.priorAlpha[k]!) > 1e-12,
+            )
+          ) {
+            throw new ForecastPipelineRequestError(
+              `Cannot combine multiple 'dirichlet-multinomial-symmetry' submissions [${allIds.join(', ')}] with incompatible Dirichlet priors`,
+            );
+          }
+          if (Math.abs(ci - refCi) > 1e-12) {
+            throw new ForecastPipelineRequestError(
+              `Cannot combine multiple 'dirichlet-multinomial-symmetry' submissions [${allIds.join(', ')}] with conflicting credibleIntervalLevel`,
+            );
+          }
+        }
+
+        const combinedCounts: number[] = [];
+        for (let k = 0; k < outcomeCount; k++) {
+          combinedCounts.push(
+            kahanNeumaierSum(dirichletContributions.map((c) => c.counts[k]!)),
+          );
+        }
+        const validatedCombinedDirichlet =
+          validateMultinomialDimensionCountsAndPosterior(
+            combinedCounts,
+            { alpha: firstDirichlet.priorAlpha },
+            outcomeSpace,
+            `combined dirichlet-multinomial-symmetry submissions [${allIds.join(', ')}]`,
+          );
+
+        multinomialOutcomeCounts = validatedCombinedDirichlet.counts;
+        availableChannelSet.add('multinomial-category-counts');
+        availableChannelSet.add('prior-hyperparameters');
+        supportedMethodSet.add('dirichlet-multinomial-symmetry');
+
+        const dirichletInput: DirichletMultinomialExecutionInput =
+          Object.freeze({
+            methodId: 'dirichlet-multinomial-symmetry',
+            outcomeSpace,
+            prior: Object.freeze({ alpha: firstDirichlet.priorAlpha }),
+            observed: Object.freeze({
+              counts: validatedCombinedDirichlet.counts,
+            }),
+            ...(firstDirichlet.credibleIntervalLevel !== undefined
+              ? { credibleIntervalLevel: refCi }
+              : {}),
+          });
+        preparedMethodInputs.set('dirichlet-multinomial-symmetry', {
+          methodId: 'dirichlet-multinomial-symmetry',
+          executionInput: dirichletInput,
+          provenanceIds: Object.freeze(allIds),
+          sourceUrls: Object.freeze(allUrls),
+        });
+
+        const diag: MultiSourceCombinationDiagnostic = Object.freeze({
+          methodId: 'dirichlet-multinomial-symmetry',
+          combinationMode: 'mathematically-justified-disjoint-combination',
+          combinationBasis: gate.justification.basis,
+          contributingEvidenceIds: Object.freeze(allIds),
+          contributingSourceUrls: Object.freeze(allUrls),
+          dependencePreserved: true,
+          verifiedByVerifierId: gate.verifiedByVerifierId,
+          verificationArtifactRef: gate.verificationArtifactRef,
+          mathematicalRationale: gate.justification.mathematicalRationale,
+          dependenceNote: `Combined ${allIds.length} verified multinomial sources under justified basis '${gate.justification.basis}' (counts=[${validatedCombinedDirichlet.counts.join(', ')}]; verified by '${gate.verifiedByVerifierId}': ${gate.verifierRationale}). All source provenance IDs and URLs preserved.`,
+        });
+        multiSourceCombinations.push(diag);
+        assessmentNotes.push(diag.dependenceNote);
+      }
     }
   }
 
-  // Handle structural-uniform-baseline symmetry premise when explicitly verified:
+  if (continuousContributions.length > 1) {
+    throw new ForecastPipelineRequestError(
+      `Multiple continuous diffusion/barrier submissions [${continuousContributions.map((c) => c.evidenceId).join(', ')}] cannot silently overwrite each other or be naively averaged across separate trajectory parameterizations`,
+    );
+  } else if (continuousContributions.length === 1) {
+    const c = continuousContributions[0]!;
+    continuousTrajectoryObservations = c.observationCount;
+    estimatedDrift = c.estimatedDrift;
+    estimatedScaleOrVolatility = c.estimatedScaleOrVolatility;
+    availableChannelSet.add('continuous-state-trajectory');
+    availableChannelSet.add('drift-and-scale-estimates');
+    if (c.degreesOfFreedom !== undefined) {
+      degreesOfFreedom = c.degreesOfFreedom;
+      availableChannelSet.add('tail-degrees-of-freedom');
+    }
+    if (c.initialStateLevel !== undefined) {
+      initialStateLevel = c.initialStateLevel;
+      if (
+        outcomeSpace.barrierLevel !== undefined &&
+        outcomeSpace.barrierDirection !== undefined
+      ) {
+        availableChannelSet.add('absorbing-barrier-specification');
+      }
+    }
+    for (const tm of c.targetMethodIds) {
+      supportedMethodSet.add(tm);
+    }
+  }
+
+  const EMPIRICAL_CHANNEL_SET: ReadonlySet<MethodDataChannelId> = new Set([
+    'binary-trial-counts',
+    'weighted-binary-trials',
+    'kish-effective-sample-size',
+    'poisson-event-counts',
+    'continuous-exposure-duration',
+    'multinomial-category-counts',
+    'continuous-state-trajectory',
+    'drift-and-scale-estimates',
+    'tail-degrees-of-freedom',
+  ]);
+  hasVerifiableEmpiricalData = [...availableChannelSet].some((ch) =>
+    EMPIRICAL_CHANNEL_SET.has(ch),
+  );
+
+  /* -----------------------------------------------------------------------
+     Phase 4: Formal StructuralSymmetryContract & Fail-Closed Verifier Gate
+     ----------------------------------------------------------------------- */
   if (
-    allowStructuralBaseline &&
-    isPlainObject(structuralSymmetryPremise) &&
-    structuralSymmetryPremise.partitionSymmetryVerified === true &&
-    typeof structuralSymmetryPremise.symmetryRationale === 'string' &&
-    structuralSymmetryPremise.symmetryRationale.trim().length > 0 &&
-    (outcomeSpace.kind === 'binary' ||
-      outcomeSpace.kind === 'categorical-exhaustive')
+    structuralSymmetryPremise !== undefined &&
+    structuralSymmetryContract === undefined
   ) {
-    availableChannelSet.add('outcome-partition-symmetry');
-    supportedMethodSet.add('structural-uniform-baseline');
-    const structInput: StructuralUniformExecutionInput = Object.freeze({
-      methodId: 'structural-uniform-baseline',
-      outcomeSpace,
-      symmetryPremise: Object.freeze({
-        partitionSymmetryVerified: true,
-        ...(structuralSymmetryPremise.exhaustiveMutuallyExclusiveVerified !==
-        undefined
-          ? {
-              exhaustiveMutuallyExclusiveVerified:
-                structuralSymmetryPremise.exhaustiveMutuallyExclusiveVerified,
-            }
-          : {}),
-        symmetryRationale: structuralSymmetryPremise.symmetryRationale.trim(),
-      }),
-    });
-    preparedMethodInputs.set('structural-uniform-baseline', {
-      methodId: 'structural-uniform-baseline',
-      executionInput: structInput,
-      provenanceIds: Object.freeze(['structural-symmetry-premise']),
-      sourceUrls: Object.freeze([]),
+    const msg =
+      "Rejected legacy boolean+rationale structuralSymmetryPremise without a mathematically valid StructuralSymmetryContract; unverified boolean symmetry claims never unlock 'structural-uniform-baseline' or emit a 50/50 baseline.";
+    assessmentNotes.push(msg);
+    structuralSymmetryVerification = Object.freeze({
+      status: 'rejected-legacy-premise-without-contract',
+      verifierId: null,
+      verificationArtifactRef: null,
+      contractBasisKind: null,
+      explanation: msg,
     });
   }
 
-  // Compute exact missing evidence requirements per registered method:
+  if (structuralSymmetryContract !== undefined) {
+    const symValidation = validateStructuralSymmetryContract(
+      structuralSymmetryContract,
+      outcomeSpace,
+    );
+    if (!symValidation.valid) {
+      throw new ForecastPipelineRequestError(
+        `Invalid structuralSymmetryContract: ${symValidation.reasons.join('; ')}`,
+        symValidation.reasons,
+      );
+    }
+
+    if (!allowStructuralBaseline) {
+      const msg =
+        "StructuralSymmetryContract passed mathematical schema validation, but assumptions.allowStructuralBaseline is not true; 'structural-uniform-baseline' remains disabled.";
+      assessmentNotes.push(msg);
+      structuralSymmetryVerification = Object.freeze({
+        status: 'rejected-baseline-not-opted-in',
+        verifierId: null,
+        verificationArtifactRef: null,
+        contractBasisKind: structuralSymmetryContract.basisKind,
+        explanation: msg,
+      });
+    } else {
+      // FAIL-CLOSED: never self-certify structural symmetry without an explicit
+      // trusted server-side symmetryVerifier returning verified=true.
+      let verifierApproved = false;
+      let verifierTag = '';
+
+      if (symmetryVerifier === undefined) {
+        const msg =
+          "Rejected StructuralSymmetryContract for 'structural-uniform-baseline' (fail-closed): no trusted server-side symmetryVerifier was configured. Caller-supplied formalInvariant, derivationReference, generatingPermutations, and microstateCountsPerOutcome do not self-verify physical partition symmetry.";
+        assessmentNotes.push(msg);
+        structuralSymmetryVerification = Object.freeze({
+          status: 'rejected-no-trusted-verifier',
+          verifierId: null,
+          verificationArtifactRef: null,
+          contractBasisKind: structuralSymmetryContract.basisKind,
+          explanation: msg,
+        });
+      } else {
+        const decision = symmetryVerifier({
+          question: question ?? '',
+          outcomeSpace,
+          contract: structuralSymmetryContract,
+          validation: symValidation,
+          referenceTime,
+        });
+        const vId =
+          isPlainObject(decision) && typeof decision.verifierId === 'string'
+            ? decision.verifierId.trim()
+            : '';
+        const vRat =
+          isPlainObject(decision) && typeof decision.rationale === 'string'
+            ? decision.rationale.trim()
+            : '';
+        const artifactRef =
+          isPlainObject(decision) &&
+          typeof decision.verificationArtifactRef === 'string' &&
+          decision.verificationArtifactRef.trim().length > 0
+            ? decision.verificationArtifactRef.trim()
+            : null;
+
+        if (vId.length === 0 || vRat.length === 0 || decision.verified !== true) {
+          verifierApproved = false;
+          const msg = `StructuralSymmetryContract was rejected by trusted symmetryVerifier ('${vId || 'invalid'}'): ${vRat || 'did not return verified=true with non-empty verifierId and rationale'}.`;
+          assessmentNotes.push(msg);
+          structuralSymmetryVerification = Object.freeze({
+            status: 'rejected-by-trusted-verifier',
+            verifierId: vId || null,
+            verificationArtifactRef: artifactRef,
+            contractBasisKind: structuralSymmetryContract.basisKind,
+            explanation: msg,
+          });
+        } else {
+          verifierApproved = true;
+          verifierTag = `; verified by '${vId}'${artifactRef ? ` (ref='${artifactRef}')` : ''}: ${vRat}`;
+          const msg = `StructuralSymmetryContract ('${structuralSymmetryContract.formalInvariant.groupName}') was independently verified by trusted symmetryVerifier '${vId}'${artifactRef ? ` (ref='${artifactRef}')` : ''}: ${vRat}.`;
+          structuralSymmetryVerification = Object.freeze({
+            status: 'verified',
+            verifierId: vId,
+            verificationArtifactRef: artifactRef,
+            contractBasisKind: structuralSymmetryContract.basisKind,
+            explanation: msg,
+          });
+        }
+      }
+
+      if (verifierApproved) {
+        availableChannelSet.add('outcome-partition-symmetry');
+        supportedMethodSet.add('structural-uniform-baseline');
+        const structInput: StructuralUniformExecutionInput = Object.freeze({
+          methodId: 'structural-uniform-baseline',
+          outcomeSpace,
+          symmetryPremise: Object.freeze({
+            partitionSymmetryVerified: true,
+            exhaustiveMutuallyExclusiveVerified: true,
+            symmetryRationale: `${structuralSymmetryContract.formalInvariant.groupName}: ${structuralSymmetryContract.formalInvariant.invariantObservable} (${structuralSymmetryContract.formalInvariant.derivationReference}) [Orbit=${symValidation.orbitSize}, generators=${structuralSymmetryContract.generatingPermutations.length}, microstateCounts=[${structuralSymmetryContract.microstateCountsPerOutcome.join(', ')}]${verifierTag}]`,
+          }),
+        });
+        preparedMethodInputs.set('structural-uniform-baseline', {
+          methodId: 'structural-uniform-baseline',
+          executionInput: structInput,
+          provenanceIds: Object.freeze(['structural-symmetry-contract']),
+          sourceUrls: Object.freeze([]),
+        });
+      }
+    }
+  }
+
+  /* -----------------------------------------------------------------------
+     Phase 5: Missing Requirements & Immutable Assessment Report
+     ----------------------------------------------------------------------- */
   const missingRequirementsByMethod: Record<string, readonly string[]> = {};
   for (const desc of registry.listAll()) {
     const missing: string[] = [];
+    const rejectedCombinationNote = rejectedCombinationMessageByMethod.get(
+      desc.methodId,
+    );
+    if (rejectedCombinationNote !== undefined) {
+      missing.push(rejectedCombinationNote);
+    }
     for (const reqCh of desc.requiredData.requiredInputChannels) {
       if (!availableChannelSet.has(reqCh)) {
         missing.push(
@@ -4165,7 +7098,9 @@ export function assessCollectedEvidence(params: {
       !preparedMethodInputs.has('structural-uniform-baseline')
     ) {
       missing.push(
-        "Method 'structural-uniform-baseline' requires an explicit verified structuralSymmetryPremise (partitionSymmetryVerified: true with non-empty symmetryRationale)",
+        structuralSymmetryVerification !== null
+          ? structuralSymmetryVerification.explanation
+          : "Method 'structural-uniform-baseline' requires assumptions.allowStructuralBaseline=true, a mathematically valid StructuralSymmetryContract, AND an explicit trusted server-side symmetryVerifier decision (verified=true)",
       );
     }
     missingRequirementsByMethod[desc.methodId] = Object.freeze(missing);
@@ -4221,6 +7156,11 @@ export function assessCollectedEvidence(params: {
     unsupportedOrUnverifiedClaims: Object.freeze(unsupportedOrUnverifiedClaims),
     invalidObservationDiagnostics: Object.freeze(invalidObservationDiagnostics),
     deduplicatedEventDiagnostics: Object.freeze(deduplicatedEventDiagnostics),
+    multiSourceCombinations: Object.freeze(multiSourceCombinations),
+    rejectedMultiSourceCombinations: Object.freeze(
+      rejectedMultiSourceCombinations,
+    ),
+    structuralSymmetryVerification,
     derivedAvailableEvidence,
     supportedMethodIds: Object.freeze([...supportedMethodSet]),
     missingRequirementsByMethod: Object.freeze(missingRequirementsByMethod),
@@ -4469,10 +7409,16 @@ export async function runScientificForecastPipeline(
     );
   }
 
-  const referenceTime: IsoDateTime =
-    request.referenceTime ??
-    dependencies.now?.() ??
-    new Date().toISOString().replace(/\.\d{3}Z$/, 'Z');
+  const executedAt: IsoDateTime =
+    dependencies.now?.() ?? new Date().toISOString().replace(/\.\d{3}Z$/, 'Z');
+
+  if (!isValidIsoDateTime(executedAt)) {
+    diagnostics.push(
+      `ForecastPipelineDependencies.now() must return a valid UTC ISO-8601 timestamp, received '${String(executedAt)}'`,
+    );
+  }
+
+  const referenceTime: IsoDateTime = request.referenceTime ?? executedAt;
 
   if (!isValidIsoDateTime(referenceTime)) {
     diagnostics.push(
@@ -4497,6 +7443,102 @@ export async function runScientificForecastPipeline(
     diagnostics.push(
       `ForecastPipelineRequest.subdomain must be a canonical kebab-case identifier, received '${String(request.subdomain)}'`,
     );
+  }
+
+  if (request.customWeightsByMethod !== undefined) {
+    if (!isPlainObject(request.customWeightsByMethod)) {
+      diagnostics.push(
+        'ForecastPipelineRequest.customWeightsByMethod must be a non-null plain object',
+      );
+    } else {
+      const weightEntries = Object.entries(request.customWeightsByMethod);
+      if (weightEntries.length === 0) {
+        diagnostics.push(
+          'ForecastPipelineRequest.customWeightsByMethod must not be empty',
+        );
+      } else {
+        const rawVals: number[] = [];
+        for (const [mId, w] of weightEntries) {
+          if (
+            !EXECUTABLE_SCIENTIFIC_METHOD_IDS.includes(
+              mId as ExecutableScientificMethodId,
+            ) ||
+            mId === 'structural-uniform-baseline'
+          ) {
+            diagnostics.push(
+              `ForecastPipelineRequest.customWeightsByMethod['${mId}'] must be an executable evidence-driven methodId (not 'structural-uniform-baseline' or unknown)`,
+            );
+          }
+          if (
+            typeof w !== 'number' ||
+            !Number.isFinite(w) ||
+            w <= 0 ||
+            w > 1
+          ) {
+            diagnostics.push(
+              `ForecastPipelineRequest.customWeightsByMethod['${mId}'] must be a finite number in (0, 1], received ${String(w)}`,
+            );
+          } else {
+            rawVals.push(w);
+          }
+        }
+        if (rawVals.length === weightEntries.length) {
+          const wSum = kahanNeumaierSum(rawVals);
+          if (!Number.isFinite(wSum) || Math.abs(wSum - 1) > 1e-12) {
+            diagnostics.push(
+              `ForecastPipelineRequest.customWeightsByMethod weights must sum to 1 within 1e-12, received ${wSum}`,
+            );
+          }
+        }
+      }
+    }
+  }
+
+  if (request.horizon !== undefined) {
+    if (!isPlainObject(request.horizon)) {
+      diagnostics.push(
+        'ForecastPipelineRequest.horizon must be a non-null plain object',
+      );
+    } else {
+      const hStarts = request.horizon.startsAt;
+      const hEnds = request.horizon.endsAt;
+      if (!isValidIsoDateTime(hStarts) || !isValidIsoDateTime(hEnds)) {
+        diagnostics.push(
+          `ForecastPipelineRequest.horizon startsAt and endsAt must be valid UTC ISO-8601 timestamps`,
+        );
+      } else {
+        const sMs = parseIsoDateTimeMs(hStarts)!;
+        const eMs = parseIsoDateTimeMs(hEnds)!;
+        if (eMs <= sMs) {
+          diagnostics.push(
+            `ForecastPipelineRequest.horizon endsAt (${hEnds}) must be strictly after startsAt (${hStarts})`,
+          );
+        }
+      }
+      if (request.horizon.referenceTime !== undefined) {
+        if (!isValidIsoDateTime(request.horizon.referenceTime)) {
+          diagnostics.push(
+            `ForecastPipelineRequest.horizon.referenceTime must be a valid UTC ISO-8601 timestamp`,
+          );
+        } else if (isValidIsoDateTime(hEnds)) {
+          const rMs = parseIsoDateTimeMs(request.horizon.referenceTime)!;
+          const eMs = parseIsoDateTimeMs(hEnds)!;
+          if (rMs >= eMs) {
+            diagnostics.push(
+              `ForecastPipelineRequest.horizon.referenceTime (${request.horizon.referenceTime}) must be strictly before endsAt (${hEnds})`,
+            );
+          }
+        }
+      }
+      if (
+        request.horizon.hasPositiveExposureScaling !== undefined &&
+        typeof request.horizon.hasPositiveExposureScaling !== 'boolean'
+      ) {
+        diagnostics.push(
+          `ForecastPipelineRequest.horizon.hasPositiveExposureScaling must be a boolean when provided`,
+        );
+      }
+    }
   }
 
   if (diagnostics.length > 0) {
@@ -4600,7 +7642,7 @@ export async function runScientificForecastPipeline(
       category: effectiveCategory,
       selectedProviders: Object.freeze([]),
       referenceTime,
-      executedAt: referenceTime,
+      executedAt,
       items: Object.freeze([]),
       discarded: Object.freeze([]),
       providerReports: Object.freeze([]),
@@ -4651,8 +7693,7 @@ export async function runScientificForecastPipeline(
      Step C: Evidence trust verification, strict validation & deduplication
      ----------------------------------------------------------------------- */
   const allowStructuralBaseline =
-    request.assumptions?.allowStructuralBaseline ??
-    request.structuralSymmetryPremise?.partitionSymmetryVerified === true;
+    request.assumptions?.allowStructuralBaseline === true;
 
   const {
     report: evidenceAssessment,
@@ -4663,13 +7704,30 @@ export async function runScientificForecastPipeline(
     submittedEvidence: request.submittedEvidence ?? [],
     outcomeSpace,
     referenceTime,
+    executedAt,
+    question: resolution.rawQuery,
+    ...(request.structuralSymmetryContract !== undefined
+      ? { structuralSymmetryContract: request.structuralSymmetryContract }
+      : {}),
     ...(request.structuralSymmetryPremise !== undefined
       ? { structuralSymmetryPremise: request.structuralSymmetryPremise }
       : {}),
     allowStructuralBaseline,
+    ...(request.multiSourceCombinationJustifications !== undefined
+      ? {
+          multiSourceCombinationJustifications:
+            request.multiSourceCombinationJustifications,
+        }
+      : {}),
     registry,
     ...(dependencies.evidenceVerifier !== undefined
       ? { evidenceVerifier: dependencies.evidenceVerifier }
+      : {}),
+    ...(dependencies.symmetryVerifier !== undefined
+      ? { symmetryVerifier: dependencies.symmetryVerifier }
+      : {}),
+    ...(dependencies.combinationVerifier !== undefined
+      ? { combinationVerifier: dependencies.combinationVerifier }
       : {}),
   });
 
@@ -4985,20 +8043,33 @@ export async function runScientificForecastPipeline(
   let effectiveCustomWeights = request.customWeightsByMethod;
   if (
     effectiveCustomWeights !== undefined &&
-    failedOrSkippedExecutableIds.size > 0 &&
     survivingEvidenceOutputs.length > 0
   ) {
-    const survivingIds = survivingEvidenceOutputs.map((o) => o.methodId);
-    const rawSurvivingWeights = survivingIds.map(
-      (id) => effectiveCustomWeights?.[id] ?? 0,
+    const originalApplicableIds = new Set<string>(
+      applicabilityPlan.evidenceDrivenApplicableMethodIds,
     );
-    const sumW = kahanNeumaierSum(rawSurvivingWeights);
-    if (sumW > 0 && rawSurvivingWeights.every((w) => w > 0)) {
-      const renorm: Record<string, number> = {};
-      for (let i = 0; i < survivingIds.length; i++) {
-        renorm[survivingIds[i]!] = rawSurvivingWeights[i]! / sumW;
+    const providedKeys = Object.keys(effectiveCustomWeights);
+    if (
+      providedKeys.length !== originalApplicableIds.size ||
+      !providedKeys.every((k) => originalApplicableIds.has(k))
+    ) {
+      throw new ForecastPipelineRequestError(
+        `customWeightsByMethod keys [${providedKeys.join(', ')}] do not match applicable evidence-driven methodIds [${[...originalApplicableIds].join(', ')}]`,
+      );
+    }
+    if (failedOrSkippedExecutableIds.size > 0) {
+      const survivingIds = survivingEvidenceOutputs.map((o) => o.methodId);
+      const rawSurvivingWeights = survivingIds.map(
+        (id) => effectiveCustomWeights?.[id] ?? 0,
+      );
+      const sumW = kahanNeumaierSum(rawSurvivingWeights);
+      if (sumW > 0 && rawSurvivingWeights.every((w) => w > 0)) {
+        const renorm: Record<string, number> = {};
+        for (let i = 0; i < survivingIds.length; i++) {
+          renorm[survivingIds[i]!] = rawSurvivingWeights[i]! / sumW;
+        }
+        effectiveCustomWeights = Object.freeze(renorm);
       }
-      effectiveCustomWeights = Object.freeze(renorm);
     }
   }
 
@@ -5119,7 +8190,7 @@ export async function runScientificForecastPipeline(
 
   const result: ForecastPipelineResult = {
     pipelineVersion: FORECAST_PIPELINE_VERSION,
-    executedAt: referenceTime,
+    executedAt,
     referenceTime,
     questionIdentity,
     outcomeSpace,
