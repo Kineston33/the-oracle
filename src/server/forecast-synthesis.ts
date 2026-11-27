@@ -60,12 +60,16 @@ import {
   CALIBRATION_VERIFICATION_STATUSES,
   EPISTEMOLOGICAL_TAG_BY_KIND,
   EVIDENTIAL_FOOTING_TIERS,
+  INDEPENDENCE_CERTIFICATION_VERIFICATION_STATUSES,
   assertCalibrationHonesty,
   validateOutcomeSpaceDescriptor,
   validateParametricIntervalField,
+  validateStatisticalIndependenceCertification,
   type AbstentionReason,
   type CalibrationVerificationStatus,
   type CategoryUncertaintyDecomposition,
+  type CertifiedIndependenceRelationship,
+  type CertifiedIndependentMethodGroup,
   type DependenceComponentWeightAllocation,
   type DualChannelProbability,
   type EffectiveIndependenceAssessment,
@@ -73,6 +77,8 @@ import {
   type EpistemologicalClaimKind,
   type EvidentialFootingTier,
   type ForecastDistributionOutput,
+  type IndependenceCertificationValidationContext,
+  type IndependenceCertificationVerificationStatus,
   type MethodApplicabilityResult,
   type MethodCategoryContribution,
   type MethodWeightingPolicyReport,
@@ -81,8 +87,19 @@ import {
   type ParametricIntervalField,
   type ScientificMethodId,
   type ScientificMethodOutput,
+  type StatisticalIndependenceCertification,
   type UnexecutedApplicableMethodReport,
 } from './forecast-types.ts';
+
+export {
+  INDEPENDENCE_CERTIFICATION_VERIFICATION_STATUSES,
+  validateStatisticalIndependenceCertification,
+  type CertifiedIndependenceRelationship,
+  type CertifiedIndependentMethodGroup,
+  type IndependenceCertificationValidationContext,
+  type IndependenceCertificationVerificationStatus,
+  type StatisticalIndependenceCertification,
+};
 import { PREDICTION_CATEGORIES } from './method-registry.ts';
 import type {
   MethodApplicabilityPlan,
@@ -150,17 +167,27 @@ export interface ForecastSynthesisInput {
    */
   readonly customWeightsByMethod?: Readonly<Record<string, number>>;
   /**
+   * Auditable statistical independence certification covering the exact
+   * participating evidence-driven methods and their certified independent
+   * groups and pairwise relationships. Required whenever
+   * `statisticalIndependenceVerified === true` or `verifiedIndependentMethodCount`
+   * is supplied.
+   */
+  readonly independenceCertification?: StatisticalIndependenceCertification;
+  /**
    * Whether statistical independence across participating evidence-driven
    * methods has been empirically or structurally certified. Defaults to `false`.
-   * When `false`, `effectiveIndependentMethodCount` is strictly `1` for
-   * evidence-driven forecasts and `0` for structural-only or abstaining outputs.
+   * Cannot be `true` unless a valid `independenceCertification` is supplied.
+   * When `false` (or omitted without certification), `effectiveIndependentMethodCount`
+   * is strictly `1` for evidence-driven forecasts and `0` for structural-only
+   * or abstaining outputs.
    */
   readonly statisticalIndependenceVerified?: boolean;
   /**
-   * Certified count of statistically independent methods when
-   * `statisticalIndependenceVerified === true`. Must lie in
-   * `[1, evidenceConnectedComponentCount]`. Forbidden when
-   * `statisticalIndependenceVerified !== true`.
+   * Certified count of statistically independent method groups when a valid
+   * `independenceCertification` is supplied. When provided, must match
+   * `independenceCertification.certifiedIndependentGroups.length` exactly.
+   * Forbidden when `independenceCertification` is omitted.
    */
   readonly verifiedIndependentMethodCount?: number;
   /**
@@ -1106,6 +1133,16 @@ export function synthesizeForecastDistribution(
         'statisticalIndependenceVerified cannot be true when no eligible executable methods exist',
       );
     }
+    if (rawInput.verifiedIndependentMethodCount !== undefined) {
+      throw new RangeError(
+        'verifiedIndependentMethodCount cannot be supplied when no eligible executable methods exist',
+      );
+    }
+    if (rawInput.independenceCertification !== undefined) {
+      throw new RangeError(
+        'independenceCertification cannot be supplied when no eligible executable methods exist',
+      );
+    }
 
     const footingTier: EvidentialFootingTier = 'insufficient-basis-abstain';
     assertCalibrationHonesty(footingTier, calibrationStatus);
@@ -1215,6 +1252,11 @@ export function synthesizeForecastDistribution(
     if (rawInput.verifiedIndependentMethodCount !== undefined) {
       throw new RangeError(
         'verifiedIndependentMethodCount is not permitted for a structural-symmetry-baseline-only forecast',
+      );
+    }
+    if (rawInput.independenceCertification !== undefined) {
+      throw new RangeError(
+        'independenceCertification is not permitted for a structural-symmetry-baseline-only forecast',
       );
     }
 
@@ -1367,37 +1409,73 @@ export function synthesizeForecastDistribution(
         | undefined,
     );
 
-  // Determine honest effectiveIndependentMethodCount:
-  const statisticalIndependenceVerified =
-    rawInput.statisticalIndependenceVerified === true;
+  // Determine honest effectiveIndependentMethodCount & validate auditable certification:
+  let statisticalIndependenceVerified = false;
   let effectiveIndependentMethodCount = 1;
-  if (statisticalIndependenceVerified) {
-    if (rawInput.verifiedIndependentMethodCount === undefined) {
+  let validatedIndependenceCertification:
+    | StatisticalIndependenceCertification
+    | undefined;
+
+  if (rawInput.independenceCertification === undefined) {
+    if (rawInput.statisticalIndependenceVerified === true) {
       throw new RangeError(
-        'verifiedIndependentMethodCount must be explicitly supplied when statisticalIndependenceVerified === true',
+        'statisticalIndependenceVerified cannot be true without a valid auditable independenceCertification record',
       );
     }
-    const vCount = rawInput.verifiedIndependentMethodCount;
-    const maxAllowedIndependent = Math.min(
-      eligibleEvidenceMethodIds.length,
-      weightingPolicy.evidenceConnectedComponentCount,
-    );
-    if (
-      typeof vCount !== 'number' ||
-      !Number.isFinite(vCount) ||
-      Number.isNaN(vCount) ||
-      vCount < 1 ||
-      vCount > maxAllowedIndependent
-    ) {
+    if (rawInput.verifiedIndependentMethodCount !== undefined) {
       throw new RangeError(
-        `verifiedIndependentMethodCount (${String(vCount)}) must lie in [1, ${maxAllowedIndependent}] (bounded by active evidence connected components = ${weightingPolicy.evidenceConnectedComponentCount} and participating methods = ${eligibleEvidenceMethodIds.length})`,
+        'verifiedIndependentMethodCount cannot be supplied without a valid auditable independenceCertification record',
       );
     }
-    effectiveIndependentMethodCount = vCount;
-  } else if (rawInput.verifiedIndependentMethodCount !== undefined) {
-    throw new RangeError(
-      'verifiedIndependentMethodCount cannot be supplied unless statisticalIndependenceVerified === true',
-    );
+  } else {
+    if (rawInput.statisticalIndependenceVerified === false) {
+      throw new RangeError(
+        'statisticalIndependenceVerified cannot be false when independenceCertification is supplied',
+      );
+    }
+
+    const correlatedMethodSets: Array<readonly ScientificMethodId[]> = [];
+    for (const comp of plan.dependenceDiagnostics.connectedComponents) {
+      correlatedMethodSets.push(comp.applicableMethodIds);
+    }
+    if (plan.dependenceDiagnostics.binaryBetaDirichletEquivalence !== undefined) {
+      correlatedMethodSets.push([
+        'beta-binomial-conjugate',
+        'dirichlet-multinomial-symmetry',
+      ]);
+    }
+    for (const comp of weightingPolicy.componentAllocations) {
+      correlatedMethodSets.push(comp.memberMethodIds);
+    }
+
+    validatedIndependenceCertification =
+      validateStatisticalIndependenceCertification(
+        rawInput.independenceCertification,
+        {
+          expectedParticipatingMethodIds: eligibleEvidenceMethodIds,
+          correlatedMethodSets,
+          maxIndependentComponents:
+            weightingPolicy.evidenceConnectedComponentCount,
+        },
+      );
+
+    const certifiedGroupCount =
+      validatedIndependenceCertification.certifiedIndependentGroups.length;
+    if (rawInput.verifiedIndependentMethodCount !== undefined) {
+      const vCount = rawInput.verifiedIndependentMethodCount;
+      if (
+        typeof vCount !== 'number' ||
+        !Number.isSafeInteger(vCount) ||
+        vCount !== certifiedGroupCount
+      ) {
+        throw new RangeError(
+          `verifiedIndependentMethodCount (${String(vCount)}) must match independenceCertification.certifiedIndependentGroups.length (${certifiedGroupCount})`,
+        );
+      }
+    }
+
+    statisticalIndependenceVerified = true;
+    effectiveIndependentMethodCount = certifiedGroupCount;
   }
 
   const participatingOutputs = eligibleEvidenceMethodIds.map(
@@ -1518,9 +1596,11 @@ export function synthesizeForecastDistribution(
   }
 
   if (!isSingleEvidenceMethod) {
-    addLimitation(
-      `Independence caveat: ${participatingOutputs.length} evidence-driven methods across ${weightingPolicy.evidenceConnectedComponentCount} declared dependence component(s) were combined via linear pooling [HDO], but cross-method statistical independence is not established (effectiveIndependentMethodCount = ${effectiveIndependentMethodCount}). Between-method disagreement (JSD_w = ${entropyDecomposition.jensenShannonDivergenceNats.toExponential(4)} nats) reflects structural model divergence, not independent empirical corroboration.`,
-    );
+    if (!statisticalIndependenceVerified) {
+      addLimitation(
+        `Independence caveat: ${participatingOutputs.length} evidence-driven methods across ${weightingPolicy.evidenceConnectedComponentCount} declared dependence component(s) were combined via linear pooling [HDO], but cross-method statistical independence is not established (effectiveIndependentMethodCount = ${effectiveIndependentMethodCount}). Between-method disagreement (JSD_w = ${entropyDecomposition.jensenShannonDivergenceNats.toExponential(4)} nats) reflects structural model divergence, not independent empirical corroboration.`,
+      );
+    }
     addLimitation(
       'Parametric intervals are omitted for the multi-method mixture because averaging marginal credible-interval endpoints across distinct models is mathematically invalid.',
     );
@@ -1544,8 +1624,11 @@ export function synthesizeForecastDistribution(
       weightingPolicy.evidenceConnectedComponentCount,
     statisticalIndependenceVerified,
     effectiveIndependentMethodCount,
+    ...(validatedIndependenceCertification !== undefined
+      ? { independenceCertification: validatedIndependenceCertification }
+      : {}),
     explanation: statisticalIndependenceVerified
-      ? `Statistical independence was explicitly certified across ${effectiveIndependentMethodCount} method(s) (bounded by ${weightingPolicy.evidenceConnectedComponentCount} declared evidence component(s)).`
+      ? `Statistical independence was explicitly certified (certificationId: '${validatedIndependenceCertification!.certificationId}', status: '${validatedIndependenceCertification!.verificationStatus}') across ${effectiveIndependentMethodCount} independent method group(s) (bounded by ${weightingPolicy.evidenceConnectedComponentCount} declared evidence component(s)).`
       : `Statistical independence across the ${eligibleEvidenceMethodIds.length} participating evidence-driven method(s) (${weightingPolicy.evidenceConnectedComponentCount} declared dependence component(s)) is not established; effectiveIndependentMethodCount is conservatively fixed at 1 so correlated or unverified methods are never counted as multiple independent votes.`,
   });
 
@@ -1561,6 +1644,9 @@ export function synthesizeForecastDistribution(
     weightingPolicy,
     dependenceDiagnostics: plan.dependenceDiagnostics,
     statisticalIndependenceVerified,
+    ...(validatedIndependenceCertification !== undefined
+      ? { independenceCertification: validatedIndependenceCertification }
+      : {}),
     effectiveIndependentMethodCount,
     independenceSemantics,
     entropyDecomposition,

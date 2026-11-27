@@ -98,10 +98,17 @@ export {
 export {
   EVIDENCE_DRIVEN_FOOTING_TIERS,
   FORECAST_SYNTHESIS_VERSION,
+  INDEPENDENCE_CERTIFICATION_VERIFICATION_STATUSES,
   assertCanonicalOutcomeSpaceEquality,
   computeDependenceAwareMethodWeights,
   synthesizeForecastDistribution,
+  validateStatisticalIndependenceCertification,
+  type CertifiedIndependenceRelationship,
+  type CertifiedIndependentMethodGroup,
   type ForecastSynthesisInput,
+  type IndependenceCertificationValidationContext,
+  type IndependenceCertificationVerificationStatus,
+  type StatisticalIndependenceCertification,
 } from './forecast-synthesis.ts';
 
 export interface StartOracleServerOptions {

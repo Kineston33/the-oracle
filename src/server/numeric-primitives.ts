@@ -14,6 +14,7 @@ import {
   assertCalibrationHonesty,
   validateOutcomeSpaceDescriptor,
   validateParametricIntervalField,
+  validateStatisticalIndependenceCertification,
   type AbstentionReason,
   type Binary64ProbabilityStatus,
   type CalibrationVerificationStatus,
@@ -27,12 +28,14 @@ import {
   type MethodCategoryContribution,
   type NumericEvaluationOptions,
   type ParametricIntervalField,
+  type ScientificMethodId,
 } from './forecast-types.ts';
 
 export {
   assertCalibrationHonesty,
   validateOutcomeSpaceDescriptor,
   validateParametricIntervalField,
+  validateStatisticalIndependenceCertification,
 };
 
 /* -------------------------------------------------------------------------
@@ -3984,11 +3987,126 @@ function shannonEntropyFromDistribution(outcomes: readonly DualChannelProbabilit
   return terms.length === 0 ? 0 : Math.max(0, kahanNeumaierSum(terms));
 }
 
+function shannonEntropyFromWeights(normalizedWeights: readonly number[]): {
+  readonly weightEntropyNats: number;
+  readonly positiveWeightCount: number;
+} {
+  const terms: number[] = [];
+  let positiveWeightCount = 0;
+  for (let m = 0; m < normalizedWeights.length; m++) {
+    const w = normalizedWeights[m]!;
+    if (w > 0) {
+      positiveWeightCount += 1;
+      const logW = Math.log(w);
+      if (logW < 0) {
+        terms.push(-w * logW);
+      }
+    }
+  }
+  const rawEntropy = terms.length === 0 ? 0 : kahanNeumaierSum(terms);
+  if (!Number.isFinite(rawEntropy) || Number.isNaN(rawEntropy) || rawEntropy < -1e-15) {
+    throw new RangeError(
+      `Invalid Shannon weight entropy H(w) = ${String(rawEntropy)}`,
+    );
+  }
+  return {
+    weightEntropyNats: rawEntropy <= 0 ? 0 : rawEntropy,
+    positiveWeightCount,
+  };
+}
+
+const WEIGHT_ENTROPY_NEGLIGIBLE_THRESHOLD_NATS = 1e-15;
+const JSD_BOUND_TOLERANCE_NATS = 1e-12;
+
+function computeNormalizedWeightedJsdIndex(
+  jensenShannonDivergenceNats: number,
+  weightEntropyNats: number,
+  positiveWeightCount: number,
+  callerName: string,
+): number {
+  if (
+    !Number.isFinite(jensenShannonDivergenceNats) ||
+    Number.isNaN(jensenShannonDivergenceNats) ||
+    jensenShannonDivergenceNats < 0
+  ) {
+    throw new RangeError(
+      `${callerName}: jensenShannonDivergenceNats must be finite and non-negative, received ${String(jensenShannonDivergenceNats)}`,
+    );
+  }
+  if (
+    !Number.isFinite(weightEntropyNats) ||
+    Number.isNaN(weightEntropyNats) ||
+    weightEntropyNats < 0
+  ) {
+    throw new RangeError(
+      `${callerName}: weightEntropyNats H(w) must be finite and non-negative, received ${String(weightEntropyNats)}`,
+    );
+  }
+
+  // Single participating method (or at most one positive weight -> H(w) = 0)
+  if (positiveWeightCount <= 1) {
+    if (jensenShannonDivergenceNats > JSD_BOUND_TOLERANCE_NATS) {
+      throw new RangeError(
+        `${callerName}: jensenShannonDivergenceNats (${jensenShannonDivergenceNats}) must be 0 when positiveWeightCount (${positiveWeightCount}) <= 1`,
+      );
+    }
+    return 0;
+  }
+
+  // Numerically negligible weight entropy H(w) <= 1e-15
+  if (weightEntropyNats <= WEIGHT_ENTROPY_NEGLIGIBLE_THRESHOLD_NATS) {
+    if (
+      jensenShannonDivergenceNats >
+      weightEntropyNats + JSD_BOUND_TOLERANCE_NATS
+    ) {
+      throw new RangeError(
+        `${callerName}: jensenShannonDivergenceNats (${jensenShannonDivergenceNats}) exceeds negligible weight entropy H(w) (${weightEntropyNats}) beyond numerical tolerance`,
+      );
+    }
+    return 0;
+  }
+
+  // General weighted ensemble with H(w) > 1e-15: theoretical upper bound is H(w)
+  const maxAllowedJsd =
+    weightEntropyNats +
+    Math.max(JSD_BOUND_TOLERANCE_NATS, 1e-12 * weightEntropyNats);
+  if (jensenShannonDivergenceNats > maxAllowedJsd) {
+    throw new RangeError(
+      `${callerName}: jensenShannonDivergenceNats (${jensenShannonDivergenceNats}) exceeds theoretical upper bound H(w) (${weightEntropyNats})`,
+    );
+  }
+
+  if (jensenShannonDivergenceNats === 0) {
+    return 0;
+  }
+
+  const rawRatio = jensenShannonDivergenceNats / weightEntropyNats;
+  if (
+    !Number.isFinite(rawRatio) ||
+    Number.isNaN(rawRatio) ||
+    rawRatio < -1e-12 ||
+    rawRatio > 1 + 1e-12
+  ) {
+    throw new RangeError(
+      `${callerName}: normalized disagreement ratio JSD_w / H(w) (${String(rawRatio)}) is outside valid [0, 1] bounds`,
+    );
+  }
+
+  if (rawRatio >= 1) {
+    return 1;
+  }
+  if (rawRatio <= 0) {
+    return 0;
+  }
+  return rawRatio;
+}
+
 /**
  * Computes the exact Shannon entropy and weighted Jensen-Shannon divergence
  * decomposition across `M` method distributions over `K >= 2` exhaustive outcomes [IME]:
  *
  *   `H(p_bar) = H_within + JSD_w`
+ *   `normalizedDisagreementIndex = JSD_w / H(w)` where `H(w) = -sum_m w_m ln(w_m)`
  *
  * Validates that:
  *   1. All weights are finite, non-negative, `<= 1`, and sum to `1` within `1e-12`.
@@ -4036,19 +4154,30 @@ export function decomposeEnsembleEntropy(
   for (let k = 0; k < outcomeCount; k++) {
     const logProbsK: number[] = [];
     const logCompsK: number[] = [];
+    let firstPositiveEntry: DualChannelProbability | undefined;
+    let allIdenticalForK = true;
     for (let m = 0; m < validatedMethods.length; m++) {
       const w = normalizedWeights[m]!;
       if (w > 0) {
-        const logW = Math.log(w);
         const entry = validatedMethods[m]![k]!;
+        if (firstPositiveEntry === undefined) {
+          firstPositiveEntry = entry;
+        } else if (
+          entry.logProbability !== firstPositiveEntry.logProbability ||
+          entry.logComplementProbability !==
+            firstPositiveEntry.logComplementProbability
+        ) {
+          allIdenticalForK = false;
+        }
+        const logW = Math.log(w);
         logProbsK.push(logW + entry.logProbability);
         logCompsK.push(logW + entry.logComplementProbability);
       }
     }
-    computedMixture[k] = createWeightedMixtureDualChannelProbability(
-      logProbsK,
-      logCompsK,
-    );
+    computedMixture[k] =
+      allIdenticalForK && firstPositiveEntry !== undefined
+        ? firstPositiveEntry
+        : createWeightedMixtureDualChannelProbability(logProbsK, logCompsK);
   }
 
   if (ensembleDistribution !== undefined) {
@@ -4102,18 +4231,30 @@ export function decomposeEnsembleEntropy(
     }
   }
 
-  const withinMethodExpectedEntropyNats = Math.max(0, kahanNeumaierSum(withinTerms));
-  const jensenShannonDivergenceNats = Math.max(
-    0,
-    jsdTerms.length === 0 ? 0 : kahanNeumaierSum(jsdTerms),
+  const rawWithin = withinTerms.length === 0 ? 0 : kahanNeumaierSum(withinTerms);
+  if (!Number.isFinite(rawWithin) || Number.isNaN(rawWithin) || rawWithin < -JSD_BOUND_TOLERANCE_NATS) {
+    throw new RangeError(
+      `decomposeEnsembleEntropy: computed withinMethodExpectedEntropyNats (${String(rawWithin)}) is invalid`,
+    );
+  }
+  const withinMethodExpectedEntropyNats = rawWithin <= 0 ? 0 : rawWithin;
+
+  const rawJsd = jsdTerms.length === 0 ? 0 : kahanNeumaierSum(jsdTerms);
+  if (!Number.isFinite(rawJsd) || Number.isNaN(rawJsd) || rawJsd < -JSD_BOUND_TOLERANCE_NATS) {
+    throw new RangeError(
+      `decomposeEnsembleEntropy: computed JSD_w (${String(rawJsd)}) is negative beyond numerical rounding tolerance`,
+    );
+  }
+  const jensenShannonDivergenceNats = rawJsd <= 0 ? 0 : rawJsd;
+
+  const { weightEntropyNats, positiveWeightCount } =
+    shannonEntropyFromWeights(normalizedWeights);
+  const normalizedDisagreementIndex = computeNormalizedWeightedJsdIndex(
+    jensenShannonDivergenceNats,
+    weightEntropyNats,
+    positiveWeightCount,
+    'decomposeEnsembleEntropy',
   );
-  const normalizedDisagreementIndex =
-    validatedMethods.length >= 2
-      ? Math.min(
-          1,
-          Math.max(0, jensenShannonDivergenceNats / Math.log(validatedMethods.length)),
-        )
-      : 0;
   const closureResidualNats = Math.abs(
     totalPredictiveEntropyNats - (withinMethodExpectedEntropyNats + jensenShannonDivergenceNats),
   );
@@ -4292,10 +4433,10 @@ export function validateCategoryUncertaintyDecomposition(
  *      and length matching `expectedOutcomeCount` (when provided, or `>= 2` otherwise).
  *   2. `executedMethodCount` (when provided) is a positive safe integer `>= 1`.
  *   3. All entropy and divergence components are finite, non-negative, and within
- *      their theoretical `[0, ln(K)]` / `[0, ln(M)]` / `[0, 1]` ranges.
+ *      their theoretical `[0, ln(K)]` / `[0, H(w)]` / `[0, 1]` ranges.
  *   4. Independent recomputation of the Shannon entropy `H(p_bar)` of `outcomes`,
  *      the closure residual `|H(p_bar) - (H_within + JSD_w)| <= 1e-12`, and the
- *      normalized disagreement index `JSD_w / ln(M)` without trusting the declared
+ *      normalized disagreement index `JSD_w / H(w)` without trusting the declared
  *      `closureResidualNats` field [IME].
  */
 export function validateEntropyDecomposition(
@@ -4303,6 +4444,7 @@ export function validateEntropyDecomposition(
   outcomes: unknown,
   executedMethodCount?: number,
   expectedOutcomeCount?: number,
+  weights?: readonly number[],
 ): EntropyDecomposition {
   if (typeof value !== 'object' || value === null || Array.isArray(value)) {
     throw new RangeError('EntropyDecomposition must be a non-null object');
@@ -4381,13 +4523,39 @@ export function validateEntropyDecomposition(
     );
   }
 
-  // 3. Check JSD_w and normalizedDisagreementIndex against executedMethodCount (or JSD_w === 0)
+  // 3. Check JSD_w and normalizedDisagreementIndex against weights H(w) or executedMethodCount
   if (jensenShannonDivergenceNats <= 1e-15 && normalizedDisagreementIndex > 1e-12) {
     throw new RangeError(
       `EntropyDecomposition.normalizedDisagreementIndex (${normalizedDisagreementIndex}) must be 0 when jensenShannonDivergenceNats is 0`,
     );
   }
-  if (executedMethodCount !== undefined) {
+  if (weights !== undefined) {
+    if (!Array.isArray(weights) || weights.length === 0) {
+      throw new RangeError('validateEntropyDecomposition requires a non-empty weights array');
+    }
+    if (executedMethodCount !== undefined && weights.length !== executedMethodCount) {
+      throw new RangeError(
+        `validateEntropyDecomposition weights length (${weights.length}) does not match executedMethodCount (${executedMethodCount})`,
+      );
+    }
+    const normalizedWeights = validateAndNormalizeEnsembleWeights(
+      weights,
+      'validateEntropyDecomposition',
+    );
+    const { weightEntropyNats, positiveWeightCount } =
+      shannonEntropyFromWeights(normalizedWeights);
+    const expectedNormalizedIndex = computeNormalizedWeightedJsdIndex(
+      jensenShannonDivergenceNats,
+      weightEntropyNats,
+      positiveWeightCount,
+      'validateEntropyDecomposition',
+    );
+    if (Math.abs(normalizedDisagreementIndex - expectedNormalizedIndex) > 1e-12) {
+      throw new RangeError(
+        `EntropyDecomposition.normalizedDisagreementIndex (${normalizedDisagreementIndex}) does not match JSD_w / H(w) (${expectedNormalizedIndex})`,
+      );
+    }
+  } else if (executedMethodCount !== undefined) {
     if (executedMethodCount === 1) {
       if (jensenShannonDivergenceNats > 1e-12 || normalizedDisagreementIndex > 1e-12) {
         throw new RangeError(
@@ -4401,13 +4569,15 @@ export function validateEntropyDecomposition(
           `EntropyDecomposition.jensenShannonDivergenceNats (${jensenShannonDivergenceNats}) exceeds ln(M) (${logM})`,
         );
       }
-      const expectedNormalizedIndex = Math.min(
+      // Since 0 < H(w) <= ln(M) for any weight distribution over M methods,
+      // JSD_w / ln(M) <= JSD_w / H(w) <= 1.
+      const minNormalizedIndex = Math.min(
         1,
         Math.max(0, jensenShannonDivergenceNats / logM),
       );
-      if (Math.abs(normalizedDisagreementIndex - expectedNormalizedIndex) > 1e-12) {
+      if (normalizedDisagreementIndex + 1e-12 < minNormalizedIndex) {
         throw new RangeError(
-          `EntropyDecomposition.normalizedDisagreementIndex (${normalizedDisagreementIndex}) does not match JSD_w / ln(M) (${expectedNormalizedIndex})`,
+          `EntropyDecomposition.normalizedDisagreementIndex (${normalizedDisagreementIndex}) is below lower bound JSD_w / ln(M) (${minNormalizedIndex})`,
         );
       }
     }
@@ -4620,6 +4790,20 @@ export function validateForecastDistributionContract(
         `ForecastDistributionOutput with footingTier 'insufficient-basis-abstain' must have effectiveIndependentMethodCount === 0, received ${effectiveIndependentMethodCount}`,
       );
     }
+    if (contrastReport.statisticalIndependenceVerified === true) {
+      throw new RangeError(
+        "ForecastDistributionOutput with footingTier 'insufficient-basis-abstain' cannot have statisticalIndependenceVerified === true",
+      );
+    }
+    if (
+      contrastReport.independenceCertification !== undefined ||
+      (contrastReport.independenceSemantics as Record<string, unknown> | undefined)
+        ?.independenceCertification !== undefined
+    ) {
+      throw new RangeError(
+        "ForecastDistributionOutput with footingTier 'insufficient-basis-abstain' cannot include an independenceCertification",
+      );
+    }
     if (categoryDecompositions.length !== 0) {
       throw new RangeError(
         "ForecastDistributionOutput with footingTier 'insufficient-basis-abstain' must have empty categoryDecompositions = []",
@@ -4715,26 +4899,121 @@ export function validateForecastDistributionContract(
     'validateForecastDistributionContract[weightsByMethod]',
   );
 
+  const rawSemantics = contrastReport.independenceSemantics as
+    | Record<string, unknown>
+    | undefined;
+  const rawCert =
+    contrastReport.independenceCertification ??
+    rawSemantics?.independenceCertification;
+
   if (footingTier === 'structural-symmetry-baseline-only') {
     if (effectiveIndependentMethodCount !== 0) {
       throw new RangeError(
         `ForecastDistributionOutput with footingTier 'structural-symmetry-baseline-only' must have effectiveIndependentMethodCount === 0 (zero empirical evidence), received ${effectiveIndependentMethodCount}`,
       );
     }
+    if (contrastReport.statisticalIndependenceVerified === true) {
+      throw new RangeError(
+        "ForecastDistributionOutput with footingTier 'structural-symmetry-baseline-only' cannot have statisticalIndependenceVerified === true",
+      );
+    }
+    if (rawCert !== undefined) {
+      throw new RangeError(
+        "ForecastDistributionOutput with footingTier 'structural-symmetry-baseline-only' cannot include an independenceCertification",
+      );
+    }
   } else {
     const independenceVerified = contrastReport.statisticalIndependenceVerified === true;
     if (!independenceVerified) {
+      if (rawCert !== undefined) {
+        throw new RangeError(
+          'contrastReport.independenceCertification must not be present when statisticalIndependenceVerified is not true',
+        );
+      }
       if (Math.abs(effectiveIndependentMethodCount - 1) > 1e-12) {
         throw new RangeError(
           `contrastReport.effectiveIndependentMethodCount (${String(effectiveIndependentMethodCount)}) must equal 1 when statisticalIndependenceVerified is not true`,
         );
       }
-    } else if (
-      effectiveIndependentMethodCount < 1 - 1e-12 ||
-      effectiveIndependentMethodCount > ensembleSet.size + 1e-12
+    } else {
+      if (rawCert === undefined) {
+        throw new RangeError(
+          'contrastReport.independenceCertification is required when statisticalIndependenceVerified === true',
+        );
+      }
+
+      const correlatedMethodSets: Array<readonly ScientificMethodId[]> = [];
+      const depDiag = contrastReport.dependenceDiagnostics as
+        | {
+            readonly connectedComponents?: readonly {
+              readonly applicableMethodIds: readonly ScientificMethodId[];
+            }[];
+            readonly binaryBetaDirichletEquivalence?: unknown;
+          }
+        | undefined;
+      if (depDiag !== undefined) {
+        if (Array.isArray(depDiag.connectedComponents)) {
+          for (const g of depDiag.connectedComponents) {
+            if (Array.isArray(g.applicableMethodIds)) {
+              correlatedMethodSets.push(g.applicableMethodIds);
+            }
+          }
+        }
+        if (depDiag.binaryBetaDirichletEquivalence !== undefined) {
+          correlatedMethodSets.push([
+            'beta-binomial-conjugate',
+            'dirichlet-multinomial-symmetry',
+          ]);
+        }
+      }
+      const wPolicy = contrastReport.weightingPolicy as
+        | {
+            readonly evidenceConnectedComponentCount?: number;
+            readonly componentAllocations?: readonly {
+              readonly memberMethodIds: readonly ScientificMethodId[];
+            }[];
+          }
+        | undefined;
+      if (wPolicy !== undefined && Array.isArray(wPolicy.componentAllocations)) {
+        for (const comp of wPolicy.componentAllocations) {
+          if (Array.isArray(comp.memberMethodIds)) {
+            correlatedMethodSets.push(comp.memberMethodIds);
+          }
+        }
+      }
+
+      const validatedCert = validateStatisticalIndependenceCertification(rawCert, {
+        expectedParticipatingMethodIds: [...ensembleSet] as ScientificMethodId[],
+        correlatedMethodSets,
+        ...(typeof wPolicy?.evidenceConnectedComponentCount === 'number'
+          ? { maxIndependentComponents: wPolicy.evidenceConnectedComponentCount }
+          : {}),
+      });
+
+      const certifiedGroupCount = validatedCert.certifiedIndependentGroups.length;
+      if (Math.abs(effectiveIndependentMethodCount - certifiedGroupCount) > 1e-12) {
+        throw new RangeError(
+          `contrastReport.effectiveIndependentMethodCount (${String(effectiveIndependentMethodCount)}) does not match certifiedIndependentGroups.length (${certifiedGroupCount})`,
+        );
+      }
+    }
+  }
+
+  if (rawSemantics !== undefined) {
+    if (
+      rawSemantics.statisticalIndependenceVerified !==
+      (contrastReport.statisticalIndependenceVerified === true)
     ) {
       throw new RangeError(
-        `contrastReport.effectiveIndependentMethodCount (${String(effectiveIndependentMethodCount)}) must lie in [1, ${ensembleSet.size}]`,
+        'contrastReport.independenceSemantics.statisticalIndependenceVerified is inconsistent with contrastReport.statisticalIndependenceVerified',
+      );
+    }
+    if (
+      rawSemantics.effectiveIndependentMethodCount !==
+      effectiveIndependentMethodCount
+    ) {
+      throw new RangeError(
+        'contrastReport.independenceSemantics.effectiveIndependentMethodCount is inconsistent with contrastReport.effectiveIndependentMethodCount',
       );
     }
   }
@@ -4759,6 +5038,8 @@ export function validateForecastDistributionContract(
     contrastReport.entropyDecomposition,
     outcomes,
     ensembleSet.size,
+    outcomeCount,
+    orderedWeights,
   );
 
   return value as ForecastDistributionOutput;

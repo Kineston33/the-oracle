@@ -24,9 +24,12 @@ import {
 import {
   EVIDENCE_DRIVEN_FOOTING_TIERS,
   FORECAST_SYNTHESIS_VERSION,
+  INDEPENDENCE_CERTIFICATION_VERIFICATION_STATUSES,
   assertCanonicalOutcomeSpaceEquality,
   computeDependenceAwareMethodWeights,
   synthesizeForecastDistribution,
+  validateStatisticalIndependenceCertification,
+  type StatisticalIndependenceCertification,
 } from './forecast-synthesis.ts';
 import type {
   OutcomeSpaceDescriptor,
@@ -192,6 +195,12 @@ describe('Stage 2A-2.3 — Dependence-Aware Multi-Method Aggregation & Forecast 
       );
       expect(serverIndex.assertCanonicalOutcomeSpaceEquality).toBe(
         assertCanonicalOutcomeSpaceEquality,
+      );
+      expect(serverIndex.validateStatisticalIndependenceCertification).toBe(
+        validateStatisticalIndependenceCertification,
+      );
+      expect(serverIndex.INDEPENDENCE_CERTIFICATION_VERIFICATION_STATUSES).toEqual(
+        INDEPENDENCE_CERTIFICATION_VERIFICATION_STATUSES,
       );
     });
   });
@@ -367,6 +376,13 @@ describe('Stage 2A-2.3 — Dependence-Aware Multi-Method Aggregation & Forecast 
         'first-passage-barrier-diffusion',
       ]);
 
+      // 8. Weighted JSD normalization uses Shannon entropy of weights H(w) = -3*(1/6)*ln(1/6) - (1/2)*ln(1/2) = 0.5*ln(12):
+      const expectedWeightEntropyNats = 0.5 * Math.log(12);
+      const ent = result.contrastReport.entropyDecomposition!;
+      expect(ent.normalizedDisagreementIndex).toBeCloseTo(
+        ent.jensenShannonDivergenceNats / expectedWeightEntropyNats,
+        14,
+      );
       assertDeeplyFrozen(result);
     });
 
@@ -1117,7 +1133,7 @@ describe('Stage 2A-2.3 — Dependence-Aware Multi-Method Aggregation & Forecast 
         }),
       ).toThrow(/must be a finite positive number in \(0, 1\]/);
 
-      // Rejects unverified statistical independence count > 1:
+      // Rejects unsupported boolean or numeric independence assertions without an auditable certification:
       expect(() =>
         synthesizeForecastDistribution({
           plan,
@@ -1125,7 +1141,7 @@ describe('Stage 2A-2.3 — Dependence-Aware Multi-Method Aggregation & Forecast 
           footingTier: 'methodologically-sound-moderate-evidence',
           verifiedIndependentMethodCount: 2,
         }),
-      ).toThrow(/verifiedIndependentMethodCount cannot be supplied unless statisticalIndependenceVerified === true/);
+      ).toThrow(/verifiedIndependentMethodCount cannot be supplied without a valid auditable independenceCertification record/);
 
       expect(() =>
         synthesizeForecastDistribution({
@@ -1133,9 +1149,18 @@ describe('Stage 2A-2.3 — Dependence-Aware Multi-Method Aggregation & Forecast 
           methodOutputs: allFour,
           footingTier: 'methodologically-sound-moderate-evidence',
           statisticalIndependenceVerified: true,
-          verifiedIndependentMethodCount: 3, // > 2 active components!
         }),
-      ).toThrow(/verifiedIndependentMethodCount \(3\) must lie in \[1, 2\]/);
+      ).toThrow(/statisticalIndependenceVerified cannot be true without a valid auditable independenceCertification record/);
+
+      expect(() =>
+        synthesizeForecastDistribution({
+          plan,
+          methodOutputs: allFour,
+          footingTier: 'methodologically-sound-moderate-evidence',
+          statisticalIndependenceVerified: true,
+          verifiedIndependentMethodCount: 2,
+        }),
+      ).toThrow(/statisticalIndependenceVerified cannot be true without a valid auditable independenceCertification record/);
 
       // Rejects null / non-object input:
       expect(() => synthesizeForecastDistribution(null)).toThrow(RangeError);
@@ -1192,6 +1217,346 @@ describe('Stage 2A-2.3 — Dependence-Aware Multi-Method Aggregation & Forecast 
           reason: expect.stringContaining('custom:inhomogeneous-hawkes-hazard'),
         },
       ]);
+    });
+
+    it('accepts a valid auditable StatisticalIndependenceCertification and rejects malformed, incomplete, mismatched, or unsupported certification records', () => {
+      const plan = planMethodApplicability(
+        createAllBinaryApplicablePlanningInput(false),
+      );
+      const allFour = executeAllFourBinaryEvidenceMethods();
+
+      const validCertification: StatisticalIndependenceCertification = {
+        certificationId: 'CERT-IND-2026-GEOPOL-001',
+        evidenceReference:
+          'audit://oracle/2026/disjoint-cohort-and-continuous-hazard-telemetry-v1',
+        participatingMethodIds: [
+          'beta-binomial-conjugate',
+          'weighted-kish-effective-binomial',
+          'poisson-gamma-hazard',
+          'dirichlet-multinomial-symmetry',
+        ],
+        certifiedIndependentGroups: [
+          {
+            groupId: 'discrete-binomial-multinomial-cohort',
+            methodIds: [
+              'beta-binomial-conjugate',
+              'weighted-kish-effective-binomial',
+              'dirichlet-multinomial-symmetry',
+            ],
+            evidenceDatasetOrChannelRef:
+              'dataset://oracle/geopolitics/historical-treaty-outcomes-v1',
+          },
+          {
+            groupId: 'continuous-poisson-hazard-telemetry',
+            methodIds: ['poisson-gamma-hazard'],
+            evidenceDatasetOrChannelRef:
+              'dataset://oracle/geopolitics/independent-incident-telemetry-v1',
+          },
+        ],
+        certifiedRelationships: [
+          {
+            groupIdA: 'discrete-binomial-multinomial-cohort',
+            groupIdB: 'continuous-poisson-hazard-telemetry',
+            evidenceBasis:
+              'Disjoint data collection pipelines and verified out-of-sample residual orthogonality (|rho_res| <= 0.03).',
+            maxAbsResidualDependenceMetric: 0.03,
+          },
+        ],
+        methodologicalJustification:
+          'The discrete historical treaty cohort and the continuous incident-rate telemetry stream are collected from disjoint institutional sensors with verified orthogonal prediction residuals.',
+        verificationStatus: 'empirically-verified-orthogonal-residuals',
+      };
+
+      // 1. Valid auditable certification succeeds and sets effectiveIndependentMethodCount = 2:
+      const certifiedResult = synthesizeForecastDistribution({
+        plan,
+        methodOutputs: allFour,
+        footingTier: 'methodologically-sound-moderate-evidence',
+        independenceCertification: validCertification,
+        statisticalIndependenceVerified: true,
+        verifiedIndependentMethodCount: 2,
+      });
+      expect(
+        certifiedResult.contrastReport.statisticalIndependenceVerified,
+      ).toBe(true);
+      expect(
+        certifiedResult.contrastReport.effectiveIndependentMethodCount,
+      ).toBe(2);
+      expect(
+        certifiedResult.contrastReport.independenceCertification,
+      ).toEqual(validCertification);
+      expect(
+        certifiedResult.contrastReport.independenceSemantics
+          ?.independenceCertification,
+      ).toEqual(validCertification);
+      expect(
+        validateForecastDistributionContract(certifiedResult),
+      ).toBe(certifiedResult);
+      assertDeeplyFrozen(certifiedResult);
+
+      // 2. Rejects validateForecastDistributionContract when statisticalIndependenceVerified === true without certification:
+      expect(() =>
+        validateForecastDistributionContract({
+          ...certifiedResult,
+          contrastReport: {
+            ...certifiedResult.contrastReport,
+            independenceCertification: undefined,
+            independenceSemantics: {
+              ...certifiedResult.contrastReport.independenceSemantics!,
+              independenceCertification: undefined,
+            },
+          },
+        }),
+      ).toThrow(/independenceCertification is required when statisticalIndependenceVerified === true/);
+
+      // 3. Rejects empty or whitespace-padded certificationId, evidenceReference, or methodologicalJustification:
+      expect(() =>
+        synthesizeForecastDistribution({
+          plan,
+          methodOutputs: allFour,
+          footingTier: 'methodologically-sound-moderate-evidence',
+          independenceCertification: {
+            ...validCertification,
+            certificationId: '  ',
+          },
+        }),
+      ).toThrow(/independenceCertification\.certificationId/);
+
+      expect(() =>
+        synthesizeForecastDistribution({
+          plan,
+          methodOutputs: allFour,
+          footingTier: 'methodologically-sound-moderate-evidence',
+          independenceCertification: {
+            ...validCertification,
+            evidenceReference: '',
+          },
+        }),
+      ).toThrow(/independenceCertification\.evidenceReference/);
+
+      expect(() =>
+        synthesizeForecastDistribution({
+          plan,
+          methodOutputs: allFour,
+          footingTier: 'methodologically-sound-moderate-evidence',
+          independenceCertification: {
+            ...validCertification,
+            methodologicalJustification: ' leading-space',
+          },
+        }),
+      ).toThrow(/independenceCertification\.methodologicalJustification/);
+
+      // 4. Rejects unsupported or unverified verificationStatus:
+      expect(() =>
+        synthesizeForecastDistribution({
+          plan,
+          methodOutputs: allFour,
+          footingTier: 'methodologically-sound-moderate-evidence',
+          independenceCertification: {
+            ...validCertification,
+            verificationStatus:
+              'unverified-assumed-independent' as StatisticalIndependenceCertification['verificationStatus'],
+          },
+        }),
+      ).toThrow(/independenceCertification\.verificationStatus/);
+
+      // 5. Rejects participatingMethodIds that omit a method, include an extra method, or include structural-uniform-baseline:
+      expect(() =>
+        synthesizeForecastDistribution({
+          plan,
+          methodOutputs: allFour,
+          footingTier: 'methodologically-sound-moderate-evidence',
+          independenceCertification: {
+            ...validCertification,
+            participatingMethodIds: [
+              'beta-binomial-conjugate',
+              'poisson-gamma-hazard',
+            ],
+          },
+        }),
+      ).toThrow(/participatingMethodIds.*must match participating evidence-driven methods/);
+
+      expect(() =>
+        synthesizeForecastDistribution({
+          plan,
+          methodOutputs: allFour,
+          footingTier: 'methodologically-sound-moderate-evidence',
+          independenceCertification: {
+            ...validCertification,
+            participatingMethodIds: [
+              ...validCertification.participatingMethodIds,
+              'structural-uniform-baseline',
+            ],
+          },
+        }),
+      ).toThrow(/cannot include 'structural-uniform-baseline'/);
+
+      // 6. Rejects certifiedIndependentGroups that split correlated/equivalent methods across distinct independent groups:
+      expect(() =>
+        synthesizeForecastDistribution({
+          plan,
+          methodOutputs: allFour,
+          footingTier: 'methodologically-sound-moderate-evidence',
+          independenceCertification: {
+            ...validCertification,
+            certifiedIndependentGroups: [
+              {
+                groupId: 'group-a',
+                methodIds: ['beta-binomial-conjugate', 'poisson-gamma-hazard'],
+                evidenceDatasetOrChannelRef: 'dataset://a',
+              },
+              {
+                groupId: 'group-b',
+                methodIds: [
+                  'weighted-kish-effective-binomial',
+                  'dirichlet-multinomial-symmetry',
+                ],
+                evidenceDatasetOrChannelRef: 'dataset://b',
+              },
+            ],
+            certifiedRelationships: [
+              {
+                groupIdA: 'group-a',
+                groupIdB: 'group-b',
+                evidenceBasis: 'Invalid split of correlated binomial family',
+              },
+            ],
+          },
+        }),
+      ).toThrow(/cannot place correlated\/equivalent methods/);
+
+      // 7. Rejects certifiedIndependentGroups that fail to partition participatingMethodIds or have < 2 groups:
+      expect(() =>
+        synthesizeForecastDistribution({
+          plan,
+          methodOutputs: allFour,
+          footingTier: 'methodologically-sound-moderate-evidence',
+          independenceCertification: {
+            ...validCertification,
+            certifiedIndependentGroups: [
+              {
+                groupId: 'single-group-only',
+                methodIds: validCertification.participatingMethodIds,
+                evidenceDatasetOrChannelRef: 'dataset://all',
+              },
+            ],
+            certifiedRelationships: [],
+          },
+        }),
+      ).toThrow(/must be an array of at least 2 independent method groups/);
+
+      expect(() =>
+        synthesizeForecastDistribution({
+          plan,
+          methodOutputs: allFour,
+          footingTier: 'methodologically-sound-moderate-evidence',
+          independenceCertification: {
+            ...validCertification,
+            certifiedIndependentGroups: [
+              {
+                groupId: 'discrete-binomial-multinomial-cohort',
+                methodIds: [
+                  'beta-binomial-conjugate',
+                  'weighted-kish-effective-binomial',
+                ],
+                evidenceDatasetOrChannelRef: 'dataset://a',
+              },
+              {
+                groupId: 'continuous-poisson-hazard-telemetry',
+                methodIds: ['poisson-gamma-hazard'],
+                evidenceDatasetOrChannelRef: 'dataset://b',
+              },
+            ],
+          },
+        }),
+      ).toThrow(/must cover all participatingMethodIds; missing \[dirichlet-multinomial-symmetry\]/);
+
+      // 8. Rejects incomplete, self-referential, unknown-group, or invalid-metric certifiedRelationships:
+      expect(() =>
+        synthesizeForecastDistribution({
+          plan,
+          methodOutputs: allFour,
+          footingTier: 'methodologically-sound-moderate-evidence',
+          independenceCertification: {
+            ...validCertification,
+            certifiedRelationships: [],
+          },
+        }),
+      ).toThrow(/certifiedRelationships must contain exactly 1 pairwise relationship/);
+
+      expect(() =>
+        synthesizeForecastDistribution({
+          plan,
+          methodOutputs: allFour,
+          footingTier: 'methodologically-sound-moderate-evidence',
+          independenceCertification: {
+            ...validCertification,
+            certifiedRelationships: [
+              {
+                groupIdA: 'discrete-binomial-multinomial-cohort',
+                groupIdB: 'discrete-binomial-multinomial-cohort',
+                evidenceBasis: 'Self-loop',
+              },
+            ],
+          },
+        }),
+      ).toThrow(/cannot relate group .* to itself/);
+
+      expect(() =>
+        synthesizeForecastDistribution({
+          plan,
+          methodOutputs: allFour,
+          footingTier: 'methodologically-sound-moderate-evidence',
+          independenceCertification: {
+            ...validCertification,
+            certifiedRelationships: [
+              {
+                groupIdA: 'discrete-binomial-multinomial-cohort',
+                groupIdB: 'unknown-group',
+                evidenceBasis: 'Unknown group reference',
+              },
+            ],
+          },
+        }),
+      ).toThrow(/references unknown groupId/);
+
+      expect(() =>
+        synthesizeForecastDistribution({
+          plan,
+          methodOutputs: allFour,
+          footingTier: 'methodologically-sound-moderate-evidence',
+          independenceCertification: {
+            ...validCertification,
+            certifiedRelationships: [
+              {
+                ...validCertification.certifiedRelationships[0]!,
+                maxAbsResidualDependenceMetric: 1.5,
+              },
+            ],
+          },
+        }),
+      ).toThrow(/maxAbsResidualDependenceMetric must be a finite number in \[0, 1\]/);
+
+      // 9. Rejects mismatch between verifiedIndependentMethodCount and certifiedIndependentGroups.length, or contradictory statisticalIndependenceVerified: false:
+      expect(() =>
+        synthesizeForecastDistribution({
+          plan,
+          methodOutputs: allFour,
+          footingTier: 'methodologically-sound-moderate-evidence',
+          independenceCertification: validCertification,
+          verifiedIndependentMethodCount: 3,
+        }),
+      ).toThrow(/verifiedIndependentMethodCount \(3\) must match independenceCertification\.certifiedIndependentGroups\.length \(2\)/);
+
+      expect(() =>
+        synthesizeForecastDistribution({
+          plan,
+          methodOutputs: allFour,
+          footingTier: 'methodologically-sound-moderate-evidence',
+          independenceCertification: validCertification,
+          statisticalIndependenceVerified: false,
+        }),
+      ).toThrow(/statisticalIndependenceVerified cannot be false when independenceCertification is supplied/);
     });
   });
 });
