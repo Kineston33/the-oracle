@@ -55,8 +55,8 @@ Any other static host requires an equivalent rewrite rule:
   files subset by `unicode-range` and fetched on demand. `og-image.png` is
   148 kB and is fetched by social crawlers only.
 - **No frontend secrets**: the browser build reads no database credentials or
-  API keys; `DATABASE_URL` and `NEON_API_KEY` must never be exposed to `VITE_*`
-  client variables.
+  API keys; `DATABASE_URL`, `NEON_API_KEY`, and `GEMINI_API_KEY` must never be
+  exposed to `VITE_*` client variables.
 
 ### Before the first public frontend deploy
 
@@ -213,20 +213,33 @@ When started via `npm start` (`node build/server/index.js`) or
   requests, drains in-flight connections, closes the PostgreSQL connection pool
   (`pool.end()`), and exits with code `0`.
 - **No secret leakage in logs**: startup and shutdown logs redact any
-  `postgres://` / `postgresql://` URIs and `password=` tokens via
-  `redactSecrets()`.
+  `postgres://` / `postgresql://` URIs, `password=` tokens, bearer tokens, and
+  Google/Gemini API keys via `redactSecrets()` and `redactProviderSecrets()`.
+- **Server-side AI question interpretation (`GEMINI_API_KEY`, `GEMINI_MODEL`)**:
+  - `POST /v1/forecasts` uses `@google/genai` strictly on the Node.js server to
+    decompose natural-language questions into canonical proposition candidates
+    and never allows Gemini to invent evidence, observations, or probabilities.
+  - When `GEMINI_API_KEY` is unset, the server **still starts safely**, serves
+    all archive/deterministic routes and the SPA, reports `aiInterpretation.configured: false`
+    on `GET /v1/health` and `GET /v1/forecasts/status`, and returns HTTP `503`
+    (`outcomeKind: "provider-unavailable"`) on `POST /v1/forecasts` rather than
+    crashing or pretending Gemini is active.
 
 ---
 
 ## 3. Environment variables & secrets reference
 
 Never hardcode, log, or commit real credentials. The table below lists the
-variables used across the backend runtime, migrations, and CI workflows using
-placeholder formats only:
+variables used across the backend runtime, Render AI configuration, migrations,
+and CI workflows using placeholder formats only:
 
 | Scope | Variable / Secret | Required? | Purpose & placeholder format |
 |---|---|---|---|
 | Backend runtime (`src/server/index.ts`) | `DATABASE_URL` | Required when running backend | PostgreSQL 16+ connection string for the restricted `oracle_app` runtime role, e.g. `postgresql://oracle_app:<password>@<host>/<dbname>?sslmode=require` |
+| Backend runtime (`src/server/gemini-provider.ts`) | `GEMINI_API_KEY` | Optional (required for AI question interpretation on `POST /v1/forecasts`) | Server-only Google Gemini API key (`<your-gemini-api-key>`). Set on Render **Environment** as a secret variable; never prefix with `VITE_` or commit real keys. When unset, archive/deterministic features continue running safely and AI forecasting explicitly reports unavailable |
+| Backend runtime (`src/server/gemini-provider.ts`) | `GEMINI_MODEL` | Optional (default `gemini-2.5-flash`) | Gemini model identifier for canonical question parsing, e.g. `gemini-2.5-flash` or `gemini-2.5-pro` |
+| Backend runtime (`src/server/gemini-provider.ts`) | `GEMINI_TIMEOUT_MS` | Optional (default `12000`, clamped `1000..30000`) | Per-request timeout in milliseconds for server-side Gemini calls |
+| Backend runtime (`src/server/gemini-provider.ts`) | `GEMINI_MAX_ATTEMPTS` | Optional (default `2`, clamped `1..3`) | Maximum SDK retry attempts per Gemini request |
 | Backend runtime (`src/server/index.ts`) | `PORT` | Optional (default `3001`) | TCP port for the Node.js HTTP read API & static SPA server |
 | Backend runtime (`src/server/index.ts`) | `HOST` | Optional (default `0.0.0.0`) | Bind address for the Node.js HTTP read API & static SPA server |
 | Backend runtime (`src/server/index.ts`) | `ORACLE_PUBLICATION_TOKEN` | Optional (fail-closed if unset) | High-entropy bearer secret (>= 16 chars) authorizing trusted server-side calls to `POST /v1/publications` and `POST /v1/predictions/:id/events` |

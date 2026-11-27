@@ -1,13 +1,15 @@
 /**
  * HTTP API & Unified Static SPA Server for THE ORACLE (Official Publication Protocol v1.10).
  *
- * Public read & canonical question endpoints:
+ * Public read, canonical resolution & AI-assisted scientific forecast endpoints:
  *   · `GET  /v1/health`
  *   · `GET  /v1/predictions`
  *   · `GET  /v1/predictions/:id`
  *   · `GET  /v1/predictions/:id/events`
  *   · `GET  /v1/questions/resolve?q=...`
  *   · `POST /v1/questions/resolve`
+ *   · `GET  /v1/forecasts` / `GET /v1/forecasts/status`
+ *   · `POST /v1/forecasts`
  *
  * Trusted operator write endpoints (fail-closed; require `Authorization: Bearer <ORACLE_PUBLICATION_TOKEN>`):
  *   · `POST /v1/publications`
@@ -60,6 +62,7 @@ import {
   sortByPublication,
 } from '../data/records.ts';
 import type {
+  IsoDateTime,
   PredictionCategory,
   PredictionRecord,
   PredictionStatus,
@@ -69,10 +72,20 @@ import {
   publishedLinkProblems,
   recomputeDeclaredDigest,
 } from '../data/validate.ts';
+import { FORECAST_PIPELINE_VERSION } from './forecast-pipeline.ts';
+import {
+  executeForecastApiRequest,
+  type ForecastServiceDeps,
+} from './forecast-service.ts';
+import { createGeminiQuestionInterpreterFromEnv } from './gemini-provider.ts';
 import type {
   PostgresPublicationRegistry,
   PredictionEventsVerification,
 } from './postgres-registry.ts';
+import type {
+  QuestionInterpretationProviderMetadata,
+  QuestionInterpreterProvider,
+} from './question-interpreter.ts';
 
 export interface OracleApiServerDeps {
   registry: PostgresPublicationRegistry;
@@ -99,11 +112,85 @@ export interface OracleApiServerDeps {
    * Defaults to the monotonic system wall clock on the server.
    */
   now?: () => string;
+  /**
+   * Optional AI question interpreter provider (defaults to Gemini constructed
+   * lazily from `GEMINI_API_KEY` / `GEMINI_MODEL`).
+   */
+  questionInterpreter?: QuestionInterpreterProvider;
+  /**
+   * Optional override for `runScientificForecastPipeline` invocation.
+   */
+  forecastPipelineRunner?: ForecastServiceDeps['pipelineRunner'];
+  /**
+   * Optional server-side scientific pipeline dependencies (e.g., evidence
+   * harvester or trusted verifiers). Never exposed to or overrideable by
+   * untrusted HTTP callers.
+   */
+  forecastPipelineDependencies?: ForecastServiceDeps['pipelineDependencies'];
+  /**
+   * Optional server-side defaults passed to `EvidenceHarvester`.
+   */
+  forecastHarvestDefaults?: ForecastServiceDeps['serverHarvestDefaults'];
+  /**
+   * Optional server-side pipeline request defaults (testing / server config only).
+   */
+  serverPipelineRequestDefaults?: ForecastServiceDeps['serverPipelineRequestDefaults'];
+  /**
+   * Maximum concurrent `POST /v1/forecasts` executions per server instance.
+   * Defaults to 4 to protect Render Free Tier memory and Gemini quotas.
+   */
+  maxConcurrentForecasts?: number;
 }
 
 const VALID_CATEGORIES = new Set<string>(['all', ...CATEGORY_ORDER]);
 const VALID_STATUSES = new Set<string>(['all', 'open', 'resolved', 'annulled']);
 const MAX_JSON_BODY_BYTES = 256 * 1024;
+const MAX_FORECAST_JSON_BODY_BYTES = 16 * 1024;
+const DEFAULT_MAX_CONCURRENT_FORECASTS = 4;
+
+const forecastConcurrencyByDeps = new WeakMap<OracleApiServerDeps, { active: number }>();
+
+function resolveQuestionInterpreterState(deps: OracleApiServerDeps): {
+  provider: QuestionInterpreterProvider | null;
+  status: QuestionInterpretationProviderMetadata;
+} {
+  if (deps.questionInterpreter) {
+    return {
+      provider: deps.questionInterpreter,
+      status: deps.questionInterpreter.getStatus(),
+    };
+  }
+  try {
+    const gemini = createGeminiQuestionInterpreterFromEnv();
+    return {
+      provider: gemini,
+      status: gemini.getStatus(),
+    };
+  } catch (err) {
+    return {
+      provider: null,
+      status: Object.freeze({
+        providerId: 'gemini',
+        model: null,
+        configured: false,
+        status: 'unconfigured',
+        reason:
+          err instanceof Error
+            ? err.message
+            : 'Invalid Gemini provider configuration on server.',
+      }),
+    };
+  }
+}
+
+class PayloadTooLargeError extends Error {
+  constructor(limitBytes: number) {
+    super(
+      `Request body exceeds maximum allowed size (${Math.round(limitBytes / 1024)} KB).`,
+    );
+    this.name = 'PayloadTooLargeError';
+  }
+}
 
 let lastServerTimestampMs = 0;
 
@@ -217,16 +304,27 @@ function isAuthorizedPublicationRequest(
   return timingSafeEqual(expectedDigest, suppliedDigest);
 }
 
-async function readJsonBody(req: IncomingMessage): Promise<unknown> {
+async function readJsonBody(
+  req: IncomingMessage,
+  maxBytes: number = MAX_JSON_BODY_BYTES,
+): Promise<unknown> {
   return new Promise((resolveBody, rejectBody) => {
     const chunks: Buffer[] = [];
     let totalBytes = 0;
+    let settled = false;
+
+    const fail = (err: Error) => {
+      if (settled) return;
+      settled = true;
+      rejectBody(err);
+    };
 
     req.on('data', (chunk: Buffer | string) => {
+      if (settled) return;
       const buf = typeof chunk === 'string' ? Buffer.from(chunk, 'utf8') : chunk;
       totalBytes += buf.length;
-      if (totalBytes > MAX_JSON_BODY_BYTES) {
-        rejectBody(new Error('Request body exceeds maximum allowed size (256 KB).'));
+      if (totalBytes > maxBytes) {
+        fail(new PayloadTooLargeError(maxBytes));
         req.destroy();
         return;
       }
@@ -234,8 +332,10 @@ async function readJsonBody(req: IncomingMessage): Promise<unknown> {
     });
 
     req.on('end', () => {
+      if (settled) return;
       try {
         const raw = Buffer.concat(chunks).toString('utf8').trim();
+        settled = true;
         if (!raw) {
           resolveBody({});
           return;
@@ -247,7 +347,7 @@ async function readJsonBody(req: IncomingMessage): Promise<unknown> {
     });
 
     req.on('error', (err) => {
-      rejectBody(err);
+      fail(err);
     });
   });
 }
@@ -884,6 +984,192 @@ export async function handleOracleApiRequest(
     }
 
     // ------------------------------------------------------------------------
+    // AI-Assisted Question Interpretation + Scientific Forecast Pipeline
+    //   · `GET  /v1/forecasts` & `GET /v1/forecasts/status`
+    //   · `POST /v1/forecasts`
+    // ------------------------------------------------------------------------
+    if (pathname === '/v1/forecasts' || pathname === '/v1/forecasts/status') {
+      if (pathname === '/v1/forecasts/status') {
+        if (method !== 'GET' && method !== 'HEAD') {
+          sendJson(
+            res,
+            405,
+            {
+              error: 'method_not_allowed',
+              message: `Method ${method} is not allowed on /v1/forecasts/status.`,
+            },
+            { Allow: 'GET, HEAD', ...corsHeaders },
+          );
+          return;
+        }
+        const { status: aiStatus } = resolveQuestionInterpreterState(deps);
+        sendJson(
+          res,
+          200,
+          {
+            endpoint: 'POST /v1/forecasts',
+            aiInterpretation: aiStatus,
+            scientificPipeline: {
+              version: FORECAST_PIPELINE_VERSION,
+              available: true,
+            },
+          },
+          corsHeaders,
+        );
+        return;
+      }
+
+      if (method === 'GET' || method === 'HEAD') {
+        const { status: aiStatus } = resolveQuestionInterpreterState(deps);
+        sendJson(
+          res,
+          200,
+          {
+            endpoint: 'POST /v1/forecasts',
+            method: 'POST',
+            aiInterpretation: aiStatus,
+            scientificPipeline: {
+              version: FORECAST_PIPELINE_VERSION,
+              available: true,
+            },
+            note: 'Send POST /v1/forecasts with JSON {"question": "..."} to run AI canonical interpretation + THE ORACLE scientific forecasting pipeline.',
+          },
+          corsHeaders,
+        );
+        return;
+      }
+
+      if (method !== 'POST') {
+        sendJson(
+          res,
+          405,
+          {
+            error: 'method_not_allowed',
+            message: `Method ${method} is not allowed on /v1/forecasts.`,
+          },
+          { Allow: 'GET, HEAD, POST', ...corsHeaders },
+        );
+        return;
+      }
+
+      const contentLengthHeader = req.headers['content-length'];
+      if (contentLengthHeader !== undefined) {
+        const declaredLen = Number(contentLengthHeader);
+        if (Number.isFinite(declaredLen) && declaredLen > MAX_FORECAST_JSON_BODY_BYTES) {
+          sendJson(
+            res,
+            413,
+            {
+              outcomeKind: 'invalid-question',
+              error: 'payload_too_large',
+              message: `Request body exceeds maximum allowed size (${Math.round(MAX_FORECAST_JSON_BODY_BYTES / 1024)} KB).`,
+              pipelineInvoked: false,
+            },
+            corsHeaders,
+          );
+          return;
+        }
+      }
+
+      let rawBody: unknown;
+      try {
+        rawBody = await readJsonBody(req, MAX_FORECAST_JSON_BODY_BYTES);
+      } catch (err) {
+        const isTooLarge = err instanceof PayloadTooLargeError;
+        sendJson(
+          res,
+          isTooLarge ? 413 : 400,
+          {
+            outcomeKind: 'invalid-question',
+            error: isTooLarge ? 'payload_too_large' : 'invalid_json',
+            message: err instanceof Error ? err.message : 'Invalid JSON body.',
+            pipelineInvoked: false,
+          },
+          corsHeaders,
+        );
+        return;
+      }
+
+      const { provider: interpreterProvider, status: providerStatus } =
+        resolveQuestionInterpreterState(deps);
+      if (!interpreterProvider) {
+        sendJson(
+          res,
+          503,
+          {
+            outcomeKind: 'provider-unavailable',
+            error: 'ai_provider_unconfigured',
+            message:
+              providerStatus.reason ??
+              'AI-assisted forecasting is unavailable because the server AI provider is not properly configured.',
+            aiInterpretation: {
+              invoked: false,
+              provider: providerStatus,
+            },
+            pipelineInvoked: false,
+          },
+          corsHeaders,
+        );
+        return;
+      }
+
+      let concurrencyState = forecastConcurrencyByDeps.get(deps);
+      if (!concurrencyState) {
+        concurrencyState = { active: 0 };
+        forecastConcurrencyByDeps.set(deps, concurrencyState);
+      }
+      const maxConcurrent =
+        deps.maxConcurrentForecasts !== undefined && deps.maxConcurrentForecasts >= 1
+          ? Math.trunc(deps.maxConcurrentForecasts)
+          : DEFAULT_MAX_CONCURRENT_FORECASTS;
+
+      if (concurrencyState.active >= maxConcurrent) {
+        sendJson(
+          res,
+          429,
+          {
+            outcomeKind: 'provider-failure',
+            error: 'server_busy',
+            retryable: true,
+            message:
+              'Too many concurrent forecast requests are currently executing; retry shortly.',
+            pipelineInvoked: false,
+          },
+          { 'Retry-After': '5', ...corsHeaders },
+        );
+        return;
+      }
+
+      concurrencyState.active += 1;
+      try {
+        const forecastClock = deps.now
+          ? (): IsoDateTime => deps.now!()
+          : undefined;
+        const resultPayload = await executeForecastApiRequest(rawBody, {
+          questionInterpreter: interpreterProvider,
+          registry: deps.registry,
+          ...(deps.forecastPipelineRunner !== undefined
+            ? { pipelineRunner: deps.forecastPipelineRunner }
+            : {}),
+          ...(deps.forecastPipelineDependencies !== undefined
+            ? { pipelineDependencies: deps.forecastPipelineDependencies }
+            : {}),
+          ...(deps.forecastHarvestDefaults !== undefined
+            ? { serverHarvestDefaults: deps.forecastHarvestDefaults }
+            : {}),
+          ...(deps.serverPipelineRequestDefaults !== undefined
+            ? { serverPipelineRequestDefaults: deps.serverPipelineRequestDefaults }
+            : {}),
+          ...(forecastClock !== undefined ? { now: forecastClock } : {}),
+        });
+        sendJson(res, resultPayload.statusCode, resultPayload.body, corsHeaders);
+        return;
+      } finally {
+        concurrencyState.active = Math.max(0, concurrencyState.active - 1);
+      }
+    }
+
+    // ------------------------------------------------------------------------
     // Static Frontend SPA Serving for Non-`/v1` GET/HEAD Requests
     // ------------------------------------------------------------------------
     if (
@@ -911,6 +1197,7 @@ export async function handleOracleApiRequest(
 
     // 0. GET /v1/health
     if (pathname === '/v1/health') {
+      const { status: aiStatus } = resolveQuestionInterpreterState(deps);
       sendJson(
         res,
         200,
@@ -920,6 +1207,11 @@ export async function handleOracleApiRequest(
           protocolVersion: '1.10',
           runtimeRole: 'oracle_app',
           demoRecordsAvailable: predictionRecords.length,
+          aiInterpretation: aiStatus,
+          scientificPipeline: {
+            version: FORECAST_PIPELINE_VERSION,
+            available: true,
+          },
         },
         corsHeaders,
       );
