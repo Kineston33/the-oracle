@@ -2506,4 +2506,269 @@ describe('Stage 2B-2A — Gemini Question Interpreter & Scientific Forecast Back
       expect(distinctThreshold.resolution.existingOfficialRecord).toBeNull();
     });
   });
+
+  describe('5. Stage 2B-2A.2: Symmetric Non-Quantitative Condition Type Validation', () => {
+    function buildNonQuantInterpretation(
+      conditionOverride: Partial<QuestionInterpretation['condition']>,
+    ): QuestionInterpretation {
+      return validateQuestionInterpretationPayload(
+        buildValidGeminiJsonPayload({
+          subject: {
+            id: 'grid-storage-deployment',
+            label: 'Grid storage deployment',
+            namespace: 'subject',
+            resolved: true,
+            ambiguityNote: null,
+          },
+          event: {
+            id: 'milestone-verification',
+            label: 'Milestone verification',
+            namespace: 'event',
+            resolved: true,
+            ambiguityNote: null,
+          },
+          condition: {
+            id: 'binary-occurrence',
+            label: 'Milestone occurs',
+            operator: 'binary-occurrence',
+            thresholdValue: null,
+            unit: null,
+            resolved: true,
+            ambiguityNote: null,
+            ...conditionOverride,
+          },
+        }),
+        {
+          question: 'Will the regional offshore wind milestone occur by 2030 per IEA?',
+          referenceTime: FIXED_NOW,
+          providerId: 'gemini',
+        },
+      );
+    }
+
+    it('rejects binary-occurrence + categorical-* and categorical + binary-occurrence-* symmetrically while preserving fail-closed diagnostics', async () => {
+      const symmetricCrossTypeCases: Array<{
+        desc: string;
+        operator: 'binary-occurrence' | 'categorical';
+        id: string;
+        expectedDiagnosticSubstring: string;
+      }> = [
+        {
+          desc: 'binary-occurrence + categorical-* (prefixed)',
+          operator: 'binary-occurrence',
+          id: 'categorical-winning-coalition',
+          expectedDiagnosticSubstring:
+            "indicates categorical condition while operator is 'binary-occurrence'",
+        },
+        {
+          desc: 'binary-occurrence + categorical_* (normalized to categorical-*)',
+          operator: 'binary-occurrence',
+          id: 'categorical_outcome',
+          expectedDiagnosticSubstring:
+            "indicates categorical condition while operator is 'binary-occurrence'",
+        },
+        {
+          desc: 'categorical + binary-occurrence-* (prefixed)',
+          operator: 'categorical',
+          id: 'binary-occurrence-phase-3',
+          expectedDiagnosticSubstring:
+            "indicates binary-occurrence while operator is 'categorical'",
+        },
+        {
+          desc: 'categorical + binary_occurrence_* (normalized to binary-occurrence-*)',
+          operator: 'categorical',
+          id: 'binary_occurrence_milestone',
+          expectedDiagnosticSubstring:
+            "indicates binary-occurrence while operator is 'categorical'",
+        },
+        {
+          desc: 'binary-occurrence + exact categorical (cross-type exact)',
+          operator: 'binary-occurrence',
+          id: 'categorical',
+          expectedDiagnosticSubstring:
+            "indicates categorical condition while operator is 'binary-occurrence'",
+        },
+        {
+          desc: 'categorical + exact binary-occurrence (cross-type exact)',
+          operator: 'categorical',
+          id: 'binary-occurrence',
+          expectedDiagnosticSubstring:
+            "indicates binary-occurrence while operator is 'categorical'",
+        },
+      ];
+
+      for (const tc of symmetricCrossTypeCases) {
+        const direct = validateAndCanonicalizeCondition({
+          id: tc.id,
+          label: tc.desc,
+          operator: tc.operator,
+          thresholdValue: null,
+          unit: null,
+          resolved: true,
+          ambiguityNote: null,
+        });
+        expect(direct.valid, tc.desc).toBe(false);
+        expect(direct.demoted, tc.desc).toBe(true);
+        expect(direct.kind, tc.desc).toBe('unresolved');
+        expect(direct.canonicalId, tc.desc).toBeNull();
+        expect(direct.condition.resolved, tc.desc).toBe(false);
+        expect(direct.condition.id, tc.desc).toBeNull();
+        expect(direct.diagnostic, tc.desc).toContain(
+          tc.expectedDiagnosticSubstring,
+        );
+
+        const payloadValidated = buildNonQuantInterpretation({
+          id: tc.id,
+          operator: tc.operator,
+          thresholdValue: null,
+          unit: null,
+        });
+        expect(payloadValidated.condition.resolved, tc.desc).toBe(false);
+        expect(payloadValidated.condition.id, tc.desc).toBeNull();
+        expect(payloadValidated.missingComponents, tc.desc).toContain('condition');
+        expect(
+          payloadValidated.ambiguousComponents.some(
+            (entry) =>
+              entry.component === 'condition' &&
+              entry.reason.includes(tc.expectedDiagnosticSubstring),
+          ),
+          tc.desc,
+        ).toBe(true);
+
+        // Bypass payload validator straight into service resolver
+        const unvalidatedInterp: QuestionInterpretation = {
+          ...buildNonQuantInterpretation({
+            id: 'binary-occurrence',
+            operator: 'binary-occurrence',
+          }),
+          condition: {
+            id: tc.id,
+            label: tc.desc,
+            operator: tc.operator,
+            thresholdValue: null,
+            unit: null,
+            resolved: true,
+            ambiguityNote: null,
+          },
+        };
+        const resolved = await resolveCanonicalWithInterpretation({
+          rawQuestion: 'Will the regional offshore wind milestone occur by 2030 per IEA?',
+          referenceTime: FIXED_NOW,
+          interpretation: unvalidatedInterp,
+          providerId: 'custom-provider',
+          includeDemo: false,
+        });
+        expect(resolved.resolution.identity.condition, tc.desc).toEqual({
+          namespace: 'condition',
+          id: 'unknown',
+          unresolved: true,
+        });
+        expect(resolved.resolution.unresolvedComponents, tc.desc).toContain(
+          'condition',
+        );
+        expect(resolved.resolution.abstentionReasons.join(' '), tc.desc).toContain(
+          tc.expectedDiagnosticSubstring,
+        );
+      }
+    });
+
+    it('accepts valid custom binary-occurrence and categorical identifiers (including same-type prefixes) while leaving quantitative normalization intact', async () => {
+      const validNonQuantCases: Array<{
+        operator: 'binary-occurrence' | 'categorical';
+        id: string;
+        expectedCanonicalId: string;
+      }> = [
+        {
+          operator: 'binary-occurrence',
+          id: 'binary-occurrence',
+          expectedCanonicalId: 'binary-occurrence',
+        },
+        {
+          operator: 'binary-occurrence',
+          id: 'binary-occurrence-phase-3',
+          expectedCanonicalId: 'binary-occurrence-phase-3',
+        },
+        {
+          operator: 'binary-occurrence',
+          id: 'phase-3-regulatory-approval',
+          expectedCanonicalId: 'phase-3-regulatory-approval',
+        },
+        {
+          operator: 'binary-occurrence',
+          id: 'non-categorical-event',
+          expectedCanonicalId: 'non-categorical-event',
+        },
+        {
+          operator: 'categorical',
+          id: 'categorical',
+          expectedCanonicalId: 'categorical',
+        },
+        {
+          operator: 'categorical',
+          id: 'categorical-winning-coalition',
+          expectedCanonicalId: 'categorical-winning-coalition',
+        },
+        {
+          operator: 'categorical',
+          id: 'winning-party-coalition',
+          expectedCanonicalId: 'winning-party-coalition',
+        },
+        {
+          operator: 'categorical',
+          id: 'multi-binary-outcome',
+          expectedCanonicalId: 'multi-binary-outcome',
+        },
+      ];
+
+      for (const tc of validNonQuantCases) {
+        const direct = validateAndCanonicalizeCondition({
+          id: tc.id,
+          label: `Valid ${tc.operator}`,
+          operator: tc.operator,
+          thresholdValue: null,
+          unit: null,
+          resolved: true,
+          ambiguityNote: null,
+        });
+        expect(direct.valid, tc.id).toBe(true);
+        expect(direct.demoted, tc.id).toBe(false);
+        expect(direct.kind, tc.id).toBe(tc.operator);
+        expect(direct.canonicalId, tc.id).toBe(tc.expectedCanonicalId);
+        expect(direct.condition.resolved, tc.id).toBe(true);
+        expect(direct.diagnostic, tc.id).toBeNull();
+
+        const resolved = await resolveCanonicalWithInterpretation({
+          rawQuestion: 'Will the regional offshore wind milestone occur by 2030 per IEA?',
+          referenceTime: FIXED_NOW,
+          interpretation: buildNonQuantInterpretation({
+            id: tc.id,
+            operator: tc.operator,
+            thresholdValue: null,
+            unit: null,
+          }),
+          providerId: 'gemini',
+          includeDemo: false,
+        });
+        expect(resolved.resolution.identityComplete, tc.id).toBe(true);
+        expect(resolved.resolution.identity.condition, tc.id).toEqual({
+          namespace: 'condition',
+          id: tc.expectedCanonicalId,
+        });
+      }
+
+      // Quantitative canonicalization remains completely unchanged
+      const quantCheck = validateAndCanonicalizeCondition({
+        id: 'gt-1-000-gigawatts',
+        label: 'Exceeds 1,000 GW',
+        operator: 'gt',
+        thresholdValue: '1e3',
+        unit: 'GW',
+        resolved: true,
+        ambiguityNote: null,
+      });
+      expect(quantCheck.valid).toBe(true);
+      expect(quantCheck.kind).toBe('quantitative');
+      expect(quantCheck.canonicalId).toBe('gt-1000-gw');
+    });
+  });
 });

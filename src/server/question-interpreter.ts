@@ -903,6 +903,15 @@ function validateQuantitativeConditionId(
   return { ok: true };
 }
 
+function matchesConditionTypePrefix(
+  normalizedId: string,
+  typePrefix: 'binary-occurrence' | 'categorical',
+): boolean {
+  return (
+    normalizedId === typePrefix || normalizedId.startsWith(`${typePrefix}-`)
+  );
+}
+
 /**
  * Deterministically validates and canonicalizes an AI-interpreted condition across
  * `id`, `operator`, `thresholdValue`, and `unit`.
@@ -914,8 +923,10 @@ function validateQuantitativeConditionId(
  *     and reject any contradictory `id` (never silently accepting mismatches or
  *     inventing missing thresholds/units).
  *   - `binary-occurrence` and `categorical` conditions reject quantitative
- *     `thresholdValue`/`unit` fields or comparator-encoded IDs while preserving
- *     valid non-quantitative slugs without forcing quantitative fields onto them.
+ *     `thresholdValue`/`unit` fields or comparator-encoded IDs, enforce symmetric
+ *     cross-type rejection (`categorical` / `categorical-*` vs `binary-occurrence`
+ *     / `binary-occurrence-*`), and preserve valid non-quantitative slugs without
+ *     forcing quantitative fields onto them.
  */
 export function validateAndCanonicalizeCondition(
   input: InterpretedConditionTerm,
@@ -1082,9 +1093,12 @@ export function validateAndCanonicalizeCondition(
     );
   }
 
+  const nonQuantOp: 'binary-occurrence' | 'categorical' =
+    op === 'categorical' ? 'categorical' : 'binary-occurrence';
+
   if (
-    op === 'binary-occurrence' &&
-    (normNonQuantId === 'categorical' || normNonQuantId.startsWith('categorical-'))
+    nonQuantOp === 'binary-occurrence' &&
+    matchesConditionTypePrefix(normNonQuantId, 'categorical')
   ) {
     return makeDemoted(
       `Condition integrity violation: condition.id ('${input.id}') indicates categorical condition while operator is 'binary-occurrence'.`,
@@ -1092,15 +1106,15 @@ export function validateAndCanonicalizeCondition(
     );
   }
 
-  if (op === 'categorical' && normNonQuantId === 'binary-occurrence') {
+  if (
+    nonQuantOp === 'categorical' &&
+    matchesConditionTypePrefix(normNonQuantId, 'binary-occurrence')
+  ) {
     return makeDemoted(
       `Condition integrity violation: condition.id ('${input.id}') indicates binary-occurrence while operator is 'categorical'.`,
       true,
     );
   }
-
-  const nonQuantOp: 'binary-occurrence' | 'categorical' =
-    op === 'categorical' ? 'categorical' : 'binary-occurrence';
 
   const validCond: InterpretedConditionTerm = Object.freeze({
     id: normNonQuantId,
