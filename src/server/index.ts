@@ -10,8 +10,13 @@ import type { Server } from 'node:http';
 import { basename, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import pg from 'pg';
-import { createOracleApiServer } from './api.ts';
+import { createOracleApiServer, type OracleApiServerDeps } from './api.ts';
+import {
+  createGeminiQuestionInterpreterFromEnv,
+  redactProviderSecrets,
+} from './gemini-provider.ts';
 import { PostgresPublicationRegistry } from './postgres-registry.ts';
+import type { QuestionInterpreterProvider } from './question-interpreter.ts';
 
 export {
   createOracleApiServer,
@@ -178,6 +183,62 @@ export {
   type SufficientStatisticsPayload,
   type UnsupportedOrUnverifiedClaimSubmission,
 } from './forecast-pipeline.ts';
+export {
+  CONDITION_OPERATORS,
+  QUANTITATIVE_CONDITION_OPERATORS,
+  QUESTION_INTERPRETATION_JSON_SCHEMA,
+  QUESTION_INTERPRETATION_SYSTEM_INSTRUCTION,
+  QUESTION_INTERPRETER_SCHEMA_VERSION,
+  QuestionInterpretationError,
+  buildQuestionInterpretationUserPrompt,
+  normalizeConditionNumber,
+  normalizeConditionUnit,
+  validateAndCanonicalizeCondition,
+  validateQuestionInterpretationPayload,
+  type ConditionOperator,
+  type ConditionValidationOutcome,
+  type InterpretedAmbiguityItem,
+  type InterpretedComponentTerm,
+  type InterpretedConditionTerm,
+  type InterpretedHorizon,
+  type InterpretedResolutionDate,
+  type QuantitativeConditionOperator,
+  type QuestionInterpretation,
+  type QuestionInterpretationErrorCode,
+  type QuestionInterpretationProviderMetadata,
+  type QuestionInterpretationRequest,
+  type QuestionInterpretationResult,
+  type QuestionInterpretationTokenUsage,
+  type QuestionInterpreterProvider,
+} from './question-interpreter.ts';
+export {
+  DEFAULT_GEMINI_MAX_ATTEMPTS,
+  DEFAULT_GEMINI_MAX_OUTPUT_TOKENS,
+  DEFAULT_GEMINI_MODEL,
+  DEFAULT_GEMINI_TIMEOUT_MS,
+  GeminiQuestionInterpreter,
+  MAX_GEMINI_MAX_ATTEMPTS,
+  MAX_GEMINI_RESPONSE_CHARS,
+  MAX_GEMINI_TIMEOUT_MS,
+  MIN_GEMINI_TIMEOUT_MS,
+  createGeminiQuestionInterpreterFromEnv,
+  normalizeGeminiModelName,
+  readGeminiConfigFromEnv,
+  redactProviderSecrets,
+  type GeminiClientLike,
+  type GeminiGenerateContentResultLike,
+  type GeminiModelsClientLike,
+  type GeminiProviderConfig,
+  type GeminiQuestionInterpreterOptions,
+} from './gemini-provider.ts';
+export {
+  FORECAST_OUTCOME_KINDS,
+  executeForecastApiRequest,
+  resolveCanonicalWithInterpretation,
+  type ForecastApiOutcomeKind,
+  type ForecastHttpResponsePayload,
+  type ForecastServiceDeps,
+} from './forecast-service.ts';
 
 export interface StartOracleServerOptions {
   /**
@@ -212,12 +273,23 @@ export interface StartOracleServerOptions {
    * Defaults to the monotonic system wall clock on the server.
    */
   now?: () => string;
+  /**
+   * Optional AI question interpreter provider (defaults to Gemini constructed
+   * safely from `GEMINI_API_KEY` / `GEMINI_MODEL`).
+   */
+  questionInterpreter?: QuestionInterpreterProvider;
+  forecastPipelineRunner?: OracleApiServerDeps['forecastPipelineRunner'];
+  forecastPipelineDependencies?: OracleApiServerDeps['forecastPipelineDependencies'];
+  forecastHarvestDefaults?: OracleApiServerDeps['forecastHarvestDefaults'];
+  serverPipelineRequestDefaults?: OracleApiServerDeps['serverPipelineRequestDefaults'];
+  maxConcurrentForecasts?: number;
 }
 
 export interface RunningOracleServer {
   server: Server;
   pool: pg.Pool;
   registry: PostgresPublicationRegistry;
+  questionInterpreter: QuestionInterpreterProvider | null;
   port: number;
   close: () => Promise<void>;
 }
@@ -406,6 +478,18 @@ export async function startOracleServer(
           ? defaultDistDir
           : null;
 
+    let resolvedInterpreter: QuestionInterpreterProvider | null =
+      options?.questionInterpreter ?? null;
+    if (!resolvedInterpreter) {
+      try {
+        resolvedInterpreter = createGeminiQuestionInterpreterFromEnv();
+      } catch {
+        // Keep boot non-fatal if optional GEMINI_MODEL env var is malformed;
+        // /v1/health and /v1/forecasts report AI interpretation as unavailable.
+        resolvedInterpreter = null;
+      }
+    }
+
     const registry = new PostgresPublicationRegistry({ pool });
     const server = createOracleApiServer({
       registry,
@@ -413,6 +497,24 @@ export async function startOracleServer(
       staticDir: resolvedStaticDir,
       corsOrigin: options?.corsOrigin,
       now: options?.now,
+      ...(resolvedInterpreter !== null
+        ? { questionInterpreter: resolvedInterpreter }
+        : {}),
+      ...(options?.forecastPipelineRunner !== undefined
+        ? { forecastPipelineRunner: options.forecastPipelineRunner }
+        : {}),
+      ...(options?.forecastPipelineDependencies !== undefined
+        ? { forecastPipelineDependencies: options.forecastPipelineDependencies }
+        : {}),
+      ...(options?.forecastHarvestDefaults !== undefined
+        ? { forecastHarvestDefaults: options.forecastHarvestDefaults }
+        : {}),
+      ...(options?.serverPipelineRequestDefaults !== undefined
+        ? { serverPipelineRequestDefaults: options.serverPipelineRequestDefaults }
+        : {}),
+      ...(options?.maxConcurrentForecasts !== undefined
+        ? { maxConcurrentForecasts: options.maxConcurrentForecasts }
+        : {}),
     });
     const host = options?.host ?? process.env.HOST ?? '0.0.0.0';
     const requestedPort = options?.port ?? Number(process.env.PORT ?? 3001);
@@ -455,6 +557,7 @@ export async function startOracleServer(
       server,
       pool,
       registry,
+      questionInterpreter: resolvedInterpreter,
       port: boundPort,
       close,
     };
@@ -465,13 +568,15 @@ export async function startOracleServer(
 }
 
 /**
- * Redact connection strings and password tokens from any log or error text so
- * credentials can never leak to stdout/stderr.
+ * Redact connection strings, password tokens, and AI provider keys from any
+ * log or error text so credentials can never leak to stdout/stderr.
  */
 export function redactSecrets(input: string): string {
-  return input
-    .replace(/postgres(?:ql)?:\/\/[^\s'")]+/gi, 'postgresql://[REDACTED]')
-    .replace(/(password\s*=\s*)[^\s'")]*/gi, '$1[REDACTED]');
+  return redactProviderSecrets(
+    input
+      .replace(/postgres(?:ql)?:\/\/[^\s'")]+/gi, 'postgresql://[REDACTED]')
+      .replace(/(password\s*=\s*)[^\s'")]*/gi, '$1[REDACTED]'),
+  );
 }
 
 export interface RunOracleServerCliOptions extends StartOracleServerOptions {
@@ -513,6 +618,16 @@ export async function runOracleServerCli(
     logger.info(
       `[the-oracle] Read API server listening on http://${host}:${running.port} (runtime role: oracle_app)`,
     );
+    const aiStatus = running.questionInterpreter?.getStatus();
+    if (aiStatus?.configured) {
+      logger.info(
+        `[the-oracle] AI question interpretation (${aiStatus.providerId}): configured (model=${aiStatus.model ?? 'default'})`,
+      );
+    } else {
+      logger.info(
+        `[the-oracle] AI question interpretation (${aiStatus?.providerId ?? 'gemini'}): unavailable (${aiStatus?.reason ?? 'GEMINI_API_KEY not configured'})`,
+      );
+    }
 
     let shuttingDown: Promise<void> | null = null;
 

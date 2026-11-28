@@ -18,6 +18,7 @@ requirements:
 > **Current deployment status**:
 > - **Neon Production PostgreSQL 16**: Migration `0001_oracle_ledger_v1_10.sql` has been applied to the Neon `production` branch (`wispy-cell-45340306`), with `oracle_ledger` tables, append-only triggers, `SECURITY DEFINER` RPCs, and restricted `oracle_app` runtime permissions verified.
 > - **Render Web Service (`npm run build` → `npm start`)**: Deployed and live with `DATABASE_URL` connected as `oracle_app`. When `dist/index.html` is built (`npm run build`), the Node.js server in `src/server/index.ts` serves both the `/v1/*` JSON API and the public React SPA (`dist/`) with client-side route fallback from a single free Render service (`$0/month`).
+> - **Stage 2B-2A backend vs. pending frontend Explore integration**: The Node.js server now exposes `POST /v1/forecasts` and `GET /v1/forecasts/status` backed by server-side Gemini interpretation (`gemini-3.8-flash` by default) and the deterministic scientific pipeline (`runScientificForecastPipeline`). Connecting the frontend Explore UI (`src/pages/Explore.tsx`) to `POST /v1/forecasts` remains a separate pending stage; until that stage lands, `/explore` continues to run local deterministic exploration only.
 
 ---
 
@@ -55,8 +56,8 @@ Any other static host requires an equivalent rewrite rule:
   files subset by `unicode-range` and fetched on demand. `og-image.png` is
   148 kB and is fetched by social crawlers only.
 - **No frontend secrets**: the browser build reads no database credentials or
-  API keys; `DATABASE_URL` and `NEON_API_KEY` must never be exposed to `VITE_*`
-  client variables.
+  API keys; `DATABASE_URL`, `NEON_API_KEY`, and `GEMINI_API_KEY` must never be
+  exposed to `VITE_*` client variables.
 
 ### Before the first public frontend deploy
 
@@ -213,20 +214,44 @@ When started via `npm start` (`node build/server/index.js`) or
   requests, drains in-flight connections, closes the PostgreSQL connection pool
   (`pool.end()`), and exits with code `0`.
 - **No secret leakage in logs**: startup and shutdown logs redact any
-  `postgres://` / `postgresql://` URIs and `password=` tokens via
-  `redactSecrets()`.
+  `postgres://` / `postgresql://` URIs, `password=` tokens, bearer tokens, and
+  Google/Gemini API keys via `redactSecrets()` and `redactProviderSecrets()`.
+- **Server-side AI question interpretation (`GEMINI_API_KEY`, `GEMINI_MODEL`)**:
+  - `POST /v1/forecasts` uses `@google/genai` strictly on the Node.js server
+    (default model `gemini-3.8-flash`, configurable via `GEMINI_MODEL`) via
+    `models.generateContent` with `responseMimeType: "application/json"` and
+    `responseJsonSchema` to decompose natural-language questions into canonical
+    proposition candidates and never allows Gemini to invent evidence,
+    observations, or probabilities.
+  - **No silent model fallback**: if `GEMINI_MODEL` (or default
+    `gemini-3.8-flash`) is unavailable, unknown, deprecated, or rejects
+    `generateContent` structured JSON schema output, the server never falls back
+    to an older model and returns an explicit provider failure (`HTTP 502`,
+    `outcomeKind: "provider-failure"`, `error: "provider_model_unavailable"`).
+  - **Pending frontend integration**: frontend Explore integration
+    (`src/pages/Explore.tsx` invoking `POST /v1/forecasts`) remains a separate
+    pending stage.
+  - When `GEMINI_API_KEY` is unset, the server **still starts safely**, serves
+    all archive/deterministic routes and the SPA, reports `aiInterpretation.configured: false`
+    on `GET /v1/health` and `GET /v1/forecasts/status`, and returns HTTP `503`
+    (`outcomeKind: "provider-unavailable"`) on `POST /v1/forecasts` rather than
+    crashing or pretending Gemini is active.
 
 ---
 
 ## 3. Environment variables & secrets reference
 
 Never hardcode, log, or commit real credentials. The table below lists the
-variables used across the backend runtime, migrations, and CI workflows using
-placeholder formats only:
+variables used across the backend runtime, Render AI configuration, migrations,
+and CI workflows using placeholder formats only:
 
 | Scope | Variable / Secret | Required? | Purpose & placeholder format |
 |---|---|---|---|
 | Backend runtime (`src/server/index.ts`) | `DATABASE_URL` | Required when running backend | PostgreSQL 16+ connection string for the restricted `oracle_app` runtime role, e.g. `postgresql://oracle_app:<password>@<host>/<dbname>?sslmode=require` |
+| Backend runtime (`src/server/gemini-provider.ts`) | `GEMINI_API_KEY` | Optional (required for AI question interpretation on `POST /v1/forecasts`) | Server-only Google Gemini API key (`<your-gemini-api-key>`). Set on Render **Environment** as a secret variable; never prefix with `VITE_` or commit real keys. When unset, archive/deterministic features continue running safely and AI forecasting explicitly reports unavailable |
+| Backend runtime (`src/server/gemini-provider.ts`) | `GEMINI_MODEL` | Optional (default `gemini-3.8-flash`) | Gemini model identifier supporting `generateContent` + structured JSON schema output for canonical question parsing, e.g. `gemini-3.8-flash`. No silent fallback to older models occurs if the configured model is unavailable |
+| Backend runtime (`src/server/gemini-provider.ts`) | `GEMINI_TIMEOUT_MS` | Optional (default `12000`, clamped `1000..30000`) | Per-request timeout in milliseconds for server-side Gemini calls |
+| Backend runtime (`src/server/gemini-provider.ts`) | `GEMINI_MAX_ATTEMPTS` | Optional (default `2`, clamped `1..3`) | Maximum SDK retry attempts per Gemini request |
 | Backend runtime (`src/server/index.ts`) | `PORT` | Optional (default `3001`) | TCP port for the Node.js HTTP read API & static SPA server |
 | Backend runtime (`src/server/index.ts`) | `HOST` | Optional (default `0.0.0.0`) | Bind address for the Node.js HTTP read API & static SPA server |
 | Backend runtime (`src/server/index.ts`) | `ORACLE_PUBLICATION_TOKEN` | Optional (fail-closed if unset) | High-entropy bearer secret (>= 16 chars) authorizing trusted server-side calls to `POST /v1/publications` and `POST /v1/predictions/:id/events` |
